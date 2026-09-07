@@ -67,7 +67,7 @@ fn runtimeAlignedAlloc(allocator: Allocator, comptime T: type, n: usize, alignme
     if (!isPow2(alignment)) return error.InvalidAlignment;
     if (n == 0) return emptySlice(T);
     const byte_count = try mulChecked(n, @sizeOf(T));
-    const log2a: u8 = @intCast(std.math.log2_int(usize, alignment));
+    const log2a = std.mem.Alignment.fromByteUnits(alignment);
     const raw = allocator.rawAlloc(byte_count, log2a, @returnAddress()) orelse return error.OutOfMemory;
     const typed: [*]T = @ptrCast(@alignCast(raw));
     return typed[0..n];
@@ -1876,7 +1876,7 @@ pub fn intersectMemory(allocator: Allocator, a: []const u8, b: []const u8) ![]u8
             try list.append(c);
         }
     }
-    return try list.toOwnedSlice(allocator);
+    return try list.toOwnedSlice();
 }
 
 pub fn unionMemory(allocator: Allocator, a: []const u8, b: []const u8) ![]u8 {
@@ -1912,7 +1912,7 @@ pub fn differenceMemory(allocator: Allocator, a: []const u8, b: []const u8) ![]u
             try list.append(c);
         }
     }
-    return try list.toOwnedSlice(allocator);
+    return try list.toOwnedSlice();
 }
 
 pub fn isSubsetMemory(allocator: Allocator, a: []const u8, b: []const u8) !bool {
@@ -2162,28 +2162,40 @@ pub fn protectMemory(addr: *anyopaque, size: usize, prot: u32) !void {
     try std.posix.mprotect(p[0..aligned_size], prot);
 }
 
+fn pageLockErrno(code: std.os.linux.E) anyerror {
+    return switch (code) {
+        .AGAIN => error.SystemResources,
+        .NOMEM => error.OutOfMemory,
+        .PERM => error.PermissionDenied,
+        .INVAL => error.InvalidSize,
+        else => error.Unexpected,
+    };
+}
+
 pub fn lockMemory(addr: *anyopaque, size: usize) !void {
-    if (builtin.os.tag == .windows) return error.Unsupported;
+    if (builtin.os.tag != .linux) return error.Unsupported;
     if (size == 0) return error.InvalidSize;
     const base_addr = @intFromPtr(addr);
     const aligned_addr = mem.alignBackward(usize, base_addr, PageSize);
     const delta = base_addr - aligned_addr;
     const span = try addChecked(size, delta);
     const aligned_size = mem.alignForward(usize, span, PageSize);
-    const p: [*]align(PageSize) u8 = @ptrFromInt(aligned_addr);
-    try std.posix.mlock(p[0..aligned_size]);
+    const rc = std.os.linux.syscall2(.mlock, aligned_addr, aligned_size);
+    const code = std.os.linux.E.init(rc);
+    if (code != .SUCCESS) return pageLockErrno(code);
 }
 
 pub fn unlockMemory(addr: *anyopaque, size: usize) !void {
-    if (builtin.os.tag == .windows) return error.Unsupported;
+    if (builtin.os.tag != .linux) return error.Unsupported;
     if (size == 0) return;
     const base_addr = @intFromPtr(addr);
     const aligned_addr = mem.alignBackward(usize, base_addr, PageSize);
     const delta = base_addr - aligned_addr;
     const span = try addChecked(size, delta);
     const aligned_size = mem.alignForward(usize, span, PageSize);
-    const p: [*]align(PageSize) u8 = @ptrFromInt(aligned_addr);
-    try std.posix.munlock(p[0..aligned_size]);
+    const rc = std.os.linux.syscall2(.munlock, aligned_addr, aligned_size);
+    const code = std.os.linux.E.init(rc);
+    if (code != .SUCCESS) return pageLockErrno(code);
 }
 
 pub fn adviseMemory(addr: *anyopaque, size: usize, advice: u32) !void {
@@ -2232,7 +2244,7 @@ pub fn splitMemory(allocator: Allocator, data: []const u8, delim: u8) ![][]const
         }
     }
     try parts.append(data[start..]);
-    return try parts.toOwnedSlice(allocator);
+    return try parts.toOwnedSlice();
 }
 
 pub fn branchlessSelect(cond: bool, true_val: usize, false_val: usize) usize {
@@ -2280,7 +2292,7 @@ pub fn compressMemory(data: []const u8, allocator: Allocator) ![]u8 {
         try out.append(value);
         i += run;
     }
-    return try out.toOwnedSlice(allocator);
+    return try out.toOwnedSlice();
 }
 
 pub fn decompressMemory(data: []const u8, allocator: Allocator) ![]u8 {
@@ -2291,9 +2303,9 @@ pub fn decompressMemory(data: []const u8, allocator: Allocator) ![]u8 {
     while (i < data.len) : (i += 2) {
         const run = data[i];
         const value = data[i + 1];
-        try out.appendNTimes(allocator, value, run);
+        try out.appendNTimes(value, run);
     }
-    return try out.toOwnedSlice(allocator);
+    return try out.toOwnedSlice();
 }
 
 const AEAD = std.crypto.aead.chacha_poly.ChaCha20Poly1305;

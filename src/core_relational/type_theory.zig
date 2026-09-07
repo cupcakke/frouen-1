@@ -2677,6 +2677,11 @@ pub const Morphism = struct {
     pub fn canCompose(self: *const Self, other: *const Self) bool {
         return self.target.equals(other.source);
     }
+
+    pub fn equals(self: *const Self, other: *const Self) bool {
+        if (self.id == other.id) return true;
+        return self.source.equals(other.source) and self.target.equals(other.target);
+    }
 };
 
 pub const Category = struct {

@@ -859,10 +859,25 @@ pub const SymmetryPattern = struct {
     }
 };
 
+const UndoEdgeWeight = struct {
+    source: []const u8,
+    target: []const u8,
+    index: usize,
+    weight: f64,
+    fractal_dimension: f64,
+};
+
+const UndoNodeState = struct {
+    id: []const u8,
+    phase: f64,
+    qubit_a: Complex(f64),
+    qubit_b: Complex(f64),
+};
+
 const UndoLog = struct {
     move_type: usize,
-    edge_weights: ArrayList(struct { source: []const u8, target: []const u8, index: usize, weight: f64, fractal_dimension: f64 }),
-    node_states: ArrayList(struct { id: []const u8, phase: f64, qubit_a: Complex(f64), qubit_b: Complex(f64) }),
+    edge_weights: ArrayList(UndoEdgeWeight),
+    node_states: ArrayList(UndoNodeState),
     added_entanglements: ArrayList(NodePairKey),
     old_graph: ?*SelfSimilarRelationalGraph,
     allocator: Allocator,
@@ -870,8 +885,8 @@ const UndoLog = struct {
     pub fn init(allocator: Allocator) UndoLog {
         return .{
             .move_type = 0,
-            .edge_weights = ArrayList(struct { source: []const u8, target: []const u8, index: usize, weight: f64, fractal_dimension: f64 }).init(allocator),
-            .node_states = ArrayList(struct { id: []const u8, phase: f64, qubit_a: Complex(f64), qubit_b: Complex(f64) }).init(allocator),
+            .edge_weights = ArrayList(UndoEdgeWeight).init(allocator),
+            .node_states = ArrayList(UndoNodeState).init(allocator),
             .added_entanglements = ArrayList(NodePairKey).init(allocator),
             .old_graph = null,
             .allocator = allocator,
@@ -1287,20 +1302,18 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
                             try log.node_states.append(.{ .id = entry.key_ptr.*, .phase = node.phase, .qubit_a = node.qubit.a, .qubit_b = node.qubit.b });
 
                             const transformed_a = transform.applyToQuantumState(&QuantumState{
-                                .amplitude_real = node.qubit.a.re,
-                                .amplitude_imag = node.qubit.a.im,
+                                .amplitudes = .{ node.qubit.a, Complex(f64).init(0.0, 0.0) },
                                 .phase = node.phase,
                                 .entanglement_degree = 0.0,
                             });
                             const transformed_b = transform.applyToQuantumState(&QuantumState{
-                                .amplitude_real = node.qubit.b.re,
-                                .amplitude_imag = node.qubit.b.im,
+                                .amplitudes = .{ node.qubit.b, Complex(f64).init(0.0, 0.0) },
                                 .phase = node.phase,
                                 .entanglement_degree = 0.0,
                             });
 
-                            node.qubit.a = Complex(f64).init(transformed_a.amplitude_real, transformed_a.amplitude_imag);
-                            node.qubit.b = Complex(f64).init(transformed_b.amplitude_real, transformed_b.amplitude_imag);
+                            node.qubit.a = transformed_a.amplitudes[0];
+                            node.qubit.b = transformed_b.amplitudes[0];
 
                             const sx = @sin(transformed_a.phase) + @sin(transformed_b.phase);
                             const cx = @cos(transformed_a.phase) + @cos(transformed_b.phase);
@@ -1460,7 +1473,7 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
             try new_graph.removeEdge(existing_source, existing_target);
         } else {
             const weight = self.prng.random().float(f64);
-            var edge = Edge.init(self.allocator, n1, n2, .coherent, weight, Complex(f64).init(0.0, 0.0), 1.5);
+            var edge = try Edge.init(self.allocator, n1, n2, .coherent, weight, Complex(f64).init(0.0, 0.0), 1.5);
             var edge_added = false;
             errdefer if (!edge_added) edge.deinit();
             try new_graph.addEdge(n1, n2, edge);
@@ -1939,7 +1952,7 @@ pub fn defaultGraphObjective(state: *const OptimizationState) f64 {
     while (edge_iter.next()) |entry| {
         for (entry.value_ptr.items) |edge| {
             total_energy += edge.weight * edge.fractal_dimension;
-            total_energy += edge.quantum_correlation.abs();
+            total_energy += std.math.complex.abs(edge.quantum_correlation);
         }
     }
 
@@ -2006,7 +2019,7 @@ pub fn quantumCoherenceObjective(state: *const OptimizationState) f64 {
     var edge_iter = graph.edges.iterator();
     while (edge_iter.next()) |entry| {
         for (entry.value_ptr.items) |edge| {
-            total_correlation += edge.quantum_correlation.abs();
+            total_correlation += std.math.complex.abs(edge.quantum_correlation);
             edge_count += 1;
         }
     }

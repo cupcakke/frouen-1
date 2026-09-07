@@ -97,7 +97,12 @@ pub const QuantumConfig = struct {
     pub const DEFAULT_LEARNING_RATE: f64 = 0.1;
     pub const JOB_WAIT_TIMEOUT_MS: i64 = 60000;
     pub const POLL_INTERVAL_MS: u64 = 100;
-    pub const SIMULATOR_QUBITS: u32 = 32;
+    pub const SIMULATOR_QUBITS: u32 = 20;
+    pub const RUNTIME_API_BASE_URL: []const u8 = "https://api.quantum-computing.ibm.com/runtime";
+    pub const IAM_TOKEN_URL: []const u8 = "https://iam.cloud.ibm.com/identity/token";
+    pub const IAM_GRANT_TYPE: []const u8 = "urn:ibm:params:oauth:grant-type:apikey";
+    pub const JOB_POLL_ATTEMPTS: usize = 600;
+    pub const TOKEN_REFRESH_MARGIN_MS: i64 = 60000;
     pub const HERON_QUBITS: u32 = 133;
     pub const EAGLE_QUBITS: u32 = 127;
 };
@@ -132,7 +137,7 @@ pub const IBMDocumentedBackendSpecs = struct {
     ecr_gate_error_mean: f64,
     ecr_gate_error_stddev: f64,
 
-    pub fn getForBackendType(backend_type: QuantumBackendType) IBMDocumentedBackendSpecs {
+    pub fn getForBackendType(backend_type: QuantumBackendType) ?IBMDocumentedBackendSpecs {
         return switch (backend_type) {
             .HARDWARE_HERON => .{
                 .t1_mean_ns = IBMBackendSpecs.HERON_T1_MEAN_NS,
@@ -184,32 +189,20 @@ pub const IBMDocumentedBackendSpecs = struct {
                 .ecr_gate_error_mean = IBMBackendSpecs.CONDOR_ECR_GATE_ERROR_MEAN,
                 .ecr_gate_error_stddev = IBMBackendSpecs.CONDOR_ECR_GATE_ERROR_STDDEV,
             },
-            .SIMULATOR_STATEVECTOR, .SIMULATOR_MPS, .SIMULATOR_STABILIZER => unreachable,
+            .SIMULATOR_STATEVECTOR, .SIMULATOR_MPS, .SIMULATOR_STABILIZER => null,
         };
     }
 };
 
-pub var mock_mode: bool = false;
-
-pub fn enableMockMode() void {
-    mock_mode = true;
-}
-
-pub fn disableMockMode() void {
-    mock_mode = false;
-}
-
-pub fn isMockMode() bool {
-    return mock_mode;
-}
-
 pub fn integrateHardwareWithInference(
     allocator: Allocator,
+    crn: []const u8,
+    api_key: []const u8,
     backend_name: []const u8,
     circuit_depth: u32,
     two_qubit_gates: u32,
 ) !f64 {
-    var client = try IBMQuantumClient.init(allocator, "crn:v1:bluemix:public:quantum-computing:us-east:a/test:test::", "");
+    const client = try IBMQuantumClient.init(allocator, crn, api_key);
     defer client.deinit();
     const backend = client.getBackend(backend_name) orelse return error.BackendNotFound;
     return backend.estimateFidelity(circuit_depth, two_qubit_gates);
@@ -220,9 +213,8 @@ pub fn fetchIBMQuantumCalibration(
     backend_name: []const u8,
     api_key: []const u8,
 ) !?IBMBackendCalibrationData {
-    if (mock_mode) {
-        return generateDocumentedCalibration(allocator, .HARDWARE_HERON, 133);
-    }
+    if (api_key.len == 0) return error.MissingApiKey;
+    if (backend_name.len == 0) return error.InvalidBackendName;
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -230,8 +222,8 @@ pub fn fetchIBMQuantumCalibration(
     var url_buf: [QuantumConfig.URL_BUFFER_SIZE]u8 = undefined;
     const url = std.fmt.bufPrint(
         &url_buf,
-        "https://cloud.ibm.com/api/quantum/v1/backends/{s}",
-        .{backend_name},
+        "{s}/backends/{s}/properties",
+        .{ QuantumConfig.RUNTIME_API_BASE_URL, backend_name },
     ) catch return null;
 
     const uri = std.Uri.parse(url) catch return null;
@@ -253,7 +245,7 @@ pub fn fetchIBMQuantumCalibration(
     req.send() catch return null;
     req.wait() catch return null;
 
-    if (req.status != .ok) return null;
+    if (req.response.status != .ok) return null;
 
     const body = req.reader().readAllAlloc(
         allocator,
@@ -390,7 +382,8 @@ pub fn generateDocumentedCalibration(
     num_qubits: u32,
 ) !IBMBackendCalibrationData {
     if (num_qubits == 0) return error.ZeroQubits;
-    const specs = IBMDocumentedBackendSpecs.getForBackendType(backend_type);
+    const specs = IBMDocumentedBackendSpecs.getForBackendType(backend_type) orelse
+        return error.NoDocumentedSpecsForBackend;
 
     const t1 = try allocator.alloc(f64, num_qubits);
     errdefer allocator.free(t1);
@@ -399,21 +392,13 @@ pub fn generateDocumentedCalibration(
     const readout_err = try allocator.alloc(f64, num_qubits);
     errdefer allocator.free(readout_err);
 
-    var prng = std.Random.DefaultPrng.init(@as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))));
-    const random = prng.random();
+    const nominal_t1 = @max(1000.0, specs.t1_mean_ns);
+    const nominal_t2 = @max(1000.0, specs.t2_mean_ns);
+    const nominal_readout = @max(QuantumConfig.MIN_READOUT_ERROR, specs.readout_error_mean);
 
-    var qubit_idx: usize = 0;
-    while (qubit_idx < num_qubits) : (qubit_idx += 1) {
-        const t1_variation = @as(f64, @floatFromInt(random.intRangeAtMost(usize, 0, 1000))) / 1000.0 - 0.5;
-        const t2_variation = @as(f64, @floatFromInt(random.intRangeAtMost(usize, 0, 1000))) / 1000.0 - 0.5;
-        const readout_variation = @as(f64, @floatFromInt(random.intRangeAtMost(usize, 0, 1000))) / 1000.0 - 0.5;
-        t1[qubit_idx] = @max(1000.0, specs.t1_mean_ns + t1_variation * specs.t1_stddev_ns);
-        t2[qubit_idx] = @max(1000.0, specs.t2_mean_ns + t2_variation * specs.t2_stddev_ns);
-        readout_err[qubit_idx] = @max(
-            QuantumConfig.MIN_READOUT_ERROR,
-            specs.readout_error_mean + readout_variation * specs.readout_error_stddev,
-        );
-    }
+    @memset(t1, nominal_t1);
+    @memset(t2, nominal_t2);
+    @memset(readout_err, nominal_readout);
 
     var edge_count: usize = 0;
     var count_idx: usize = 0;
@@ -439,14 +424,7 @@ pub fn generateDocumentedCalibration(
 
     const gate_err = try allocator.alloc(f64, edge_count);
     errdefer allocator.free(gate_err);
-    var gate_idx: usize = 0;
-    while (gate_idx < edge_count) : (gate_idx += 1) {
-        const edge_variation = @as(f64, @floatFromInt(random.intRangeAtMost(usize, 0, 1000))) / 1000.0 - 0.5;
-        gate_err[gate_idx] = @max(
-            QuantumConfig.MIN_GATE_ERROR,
-            specs.ecr_gate_error_mean + edge_variation * specs.ecr_gate_error_stddev,
-        );
-    }
+    @memset(gate_err, @max(QuantumConfig.MIN_GATE_ERROR, specs.ecr_gate_error_mean));
 
     return IBMBackendCalibrationData{
         .t1_times_ns = t1,
@@ -626,15 +604,18 @@ pub const QuantumBackend = struct {
         api_key: []const u8,
     ) !*Self {
         if (fetchIBMQuantumCalibration(allocator, name, api_key)) |api_calibration| {
-            var calib = api_calibration;
-            defer calib.deinit();
-            return initHardwareWithCalibration(
-                allocator,
-                name,
-                backend_type,
-                num_qubits,
-                calib,
-            );
+            if (api_calibration) |calibration| {
+                var calib = calibration;
+                defer calib.deinit();
+                return initHardwareWithCalibration(
+                    allocator,
+                    name,
+                    backend_type,
+                    num_qubits,
+                    calib,
+                );
+            }
+            return initHardwareWithCalibration(allocator, name, backend_type, num_qubits, null);
         } else |_| {
             return initHardwareWithCalibration(allocator, name, backend_type, num_qubits, null);
         }
@@ -682,28 +663,25 @@ pub const QuantumBackend = struct {
         const readout_err = try allocator.alloc(f64, num_qubits);
         errdefer allocator.free(readout_err);
 
+        const specs = IBMDocumentedBackendSpecs.getForBackendType(backend_type) orelse
+            return error.NoDocumentedSpecsForBackend;
+
         var qubit_idx: usize = 0;
         while (qubit_idx < num_qubits) : (qubit_idx += 1) {
-            if (qubit_idx < calibration.t1_times_ns.len) {
-                t1[qubit_idx] = calibration.t1_times_ns[qubit_idx];
-            } else {
-                const specs = IBMDocumentedBackendSpecs.getForBackendType(backend_type);
-                t1[qubit_idx] = specs.t1_mean_ns;
-            }
+            t1[qubit_idx] = if (qubit_idx < calibration.t1_times_ns.len)
+                calibration.t1_times_ns[qubit_idx]
+            else
+                specs.t1_mean_ns;
 
-            if (qubit_idx < calibration.t2_times_ns.len) {
-                t2[qubit_idx] = calibration.t2_times_ns[qubit_idx];
-            } else {
-                const specs = IBMDocumentedBackendSpecs.getForBackendType(backend_type);
-                t2[qubit_idx] = specs.t2_mean_ns;
-            }
+            t2[qubit_idx] = if (qubit_idx < calibration.t2_times_ns.len)
+                calibration.t2_times_ns[qubit_idx]
+            else
+                specs.t2_mean_ns;
 
-            if (qubit_idx < calibration.readout_errors.len) {
-                readout_err[qubit_idx] = calibration.readout_errors[qubit_idx];
-            } else {
-                const specs = IBMDocumentedBackendSpecs.getForBackendType(backend_type);
-                readout_err[qubit_idx] = specs.readout_error_mean;
-            }
+            readout_err[qubit_idx] = if (qubit_idx < calibration.readout_errors.len)
+                calibration.readout_errors[qubit_idx]
+            else
+                specs.readout_error_mean;
         }
 
         const coupling = try allocator.alloc([2]u32, calibration.coupling_map.len);
@@ -1500,6 +1478,20 @@ pub const Observable = struct {
     }
 };
 
+fn newUuidV4(allocator: Allocator) ![]u8 {
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    return std.fmt.allocPrint(allocator, "{s}-{s}-{s}-{s}-{s}", .{
+        std.fmt.fmtSliceHexLower(bytes[0..4]),
+        std.fmt.fmtSliceHexLower(bytes[4..6]),
+        std.fmt.fmtSliceHexLower(bytes[6..8]),
+        std.fmt.fmtSliceHexLower(bytes[8..10]),
+        std.fmt.fmtSliceHexLower(bytes[10..16]),
+    });
+}
+
 pub const IBMQuantumClient = struct {
     allocator: Allocator,
     credentials: *IBMQuantumCredentials,
@@ -1603,28 +1595,118 @@ pub const IBMQuantumClient = struct {
         self.allocator.destroy(self);
     }
 
+    fn percentEncode(allocator: Allocator, raw: []const u8) ![]u8 {
+        var encoded = std.ArrayList(u8).init(allocator);
+        errdefer encoded.deinit();
+        for (raw) |byte| {
+            const unreserved = (byte >= 'A' and byte <= 'Z') or
+                (byte >= 'a' and byte <= 'z') or
+                (byte >= '0' and byte <= '9') or
+                byte == '-' or byte == '_' or byte == '.' or byte == '~';
+            if (unreserved) {
+                try encoded.append(byte);
+            } else {
+                try encoded.writer().print("%{X:0>2}", .{byte});
+            }
+        }
+        return encoded.toOwnedSlice();
+    }
+
+    fn httpRequest(
+        self: *Self,
+        method: std.http.Method,
+        url: []const u8,
+        headers: []const std.http.Header,
+        content_type: ?[]const u8,
+        body: ?[]const u8,
+    ) ![]u8 {
+        var http_client = std.http.Client{ .allocator = self.allocator };
+        defer http_client.deinit();
+
+        const uri = try std.Uri.parse(url);
+        const header_buffer = try self.allocator.alloc(u8, QuantumConfig.HEADER_BUFFER_SIZE);
+        defer self.allocator.free(header_buffer);
+
+        var request = try http_client.open(method, uri, .{
+            .server_header_buffer = header_buffer,
+            .extra_headers = headers,
+            .headers = .{
+                .content_type = if (content_type) |value| .{ .override = value } else .default,
+            },
+        });
+        defer request.deinit();
+
+        if (body) |payload| {
+            request.transfer_encoding = .{ .content_length = payload.len };
+        }
+
+        try request.send();
+        if (body) |payload| {
+            try request.writeAll(payload);
+            try request.finish();
+        }
+        try request.wait();
+
+        const response_body = try request.reader().readAllAlloc(self.allocator, QuantumConfig.MAX_RESPONSE_SIZE);
+        errdefer self.allocator.free(response_body);
+
+        switch (request.response.status) {
+            .ok, .created, .accepted, .no_content => return response_body,
+            .unauthorized, .forbidden => return error.QuantumAuthenticationRejected,
+            .not_found => return error.QuantumResourceNotFound,
+            .too_many_requests => return error.QuantumRateLimited,
+            else => return error.QuantumRequestFailed,
+        }
+    }
+
     pub fn authenticate(self: *Self) !void {
-        var prng = std.Random.DefaultPrng.init(@as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))));
-        const random = prng.random();
+        if (self.credentials.api_key.len == 0) return error.MissingApiKey;
 
-        var token_buf: [QuantumConfig.TOKEN_LENGTH]u8 = undefined;
-        for (&token_buf) |*b| {
-            const chars = QuantumConfig.ALPHA_NUM_CHARS;
-            b.* = chars[random.intRangeAtMost(usize, 0, chars.len - 1)];
-        }
+        const encoded_key = try percentEncode(self.allocator, self.credentials.api_key);
+        defer self.allocator.free(encoded_key);
+        const encoded_grant = try percentEncode(self.allocator, QuantumConfig.IAM_GRANT_TYPE);
+        defer self.allocator.free(encoded_grant);
 
+        const form_body = try std.fmt.allocPrint(
+            self.allocator,
+            "grant_type={s}&apikey={s}",
+            .{ encoded_grant, encoded_key },
+        );
+        defer self.allocator.free(form_body);
+
+        const response_body = try self.httpRequest(
+            .POST,
+            QuantumConfig.IAM_TOKEN_URL,
+            &[_]std.http.Header{.{ .name = "Accept", .value = "application/json" }},
+            "application/x-www-form-urlencoded",
+            form_body,
+        );
+        defer self.allocator.free(response_body);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{});
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return error.QuantumInvalidResponse;
+        const token_value = parsed.value.object.get("access_token") orelse return error.QuantumInvalidResponse;
+        if (token_value != .string) return error.QuantumInvalidResponse;
+
+        const expires_in_ms: i64 = blk: {
+            const expires = parsed.value.object.get("expires_in") orelse break :blk QuantumConfig.TOKEN_VALIDITY_MS;
+            break :blk switch (expires) {
+                .integer => |seconds| seconds * 1000,
+                .float => |seconds| @intFromFloat(seconds * 1000.0),
+                else => QuantumConfig.TOKEN_VALIDITY_MS,
+            };
+        };
+
+        const new_token = try self.allocator.dupe(u8, token_value.string);
         if (self.access_token) |old_token| self.allocator.free(old_token);
-        self.access_token = try self.allocator.dupe(u8, &token_buf);
-        self.token_expiry = std.time.milliTimestamp() + QuantumConfig.TOKEN_VALIDITY_MS;
+        self.access_token = new_token;
+        self.token_expiry = std.time.milliTimestamp() + expires_in_ms - QuantumConfig.TOKEN_REFRESH_MARGIN_MS;
 
-        var session_buf: [QuantumConfig.SESSION_ID_LENGTH]u8 = undefined;
-        for (&session_buf) |*b| {
-            const hex = QuantumConfig.HEX_CHARS;
-            b.* = hex[random.intRangeAtMost(usize, 0, hex.len - 1)];
-        }
-
+        const new_session = try newUuidV4(self.allocator);
         if (self.session_id) |old_session| self.allocator.free(old_session);
-        self.session_id = try self.allocator.dupe(u8, &session_buf);
+        self.session_id = new_session;
     }
 
     pub fn isAuthenticated(self: *const Self) bool {
@@ -1656,41 +1738,22 @@ pub const IBMQuantumClient = struct {
         const actual_backend_name = backend_name orelse self.default_backend orelse return error.BackendNotFound;
         const backend = self.getBackend(actual_backend_name) orelse return error.BackendNotFound;
 
-        if (!self.isAuthenticated()) {
+        if (!backend.is_simulator and !self.isAuthenticated()) {
             try self.authenticate();
         }
 
-        var prng = std.Random.DefaultPrng.init(@as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))));
-        const random = prng.random();
-
-        var job_id_buf: [QuantumConfig.JOB_ID_LENGTH]u8 = undefined;
-        const hex = QuantumConfig.HEX_CHARS;
-        var job_id_idx: usize = 0;
-        for (&job_id_buf) |*b| {
-            var is_dash = false;
-            for (QuantumConfig.JOB_ID_DASH_POSITIONS) |pos| {
-                if (job_id_idx == pos) {
-                    is_dash = true;
-                    break;
-                }
-            }
-            if (is_dash) {
-                b.* = '-';
-            } else {
-                b.* = hex[random.intRangeAtMost(usize, 0, hex.len - 1)];
-            }
-            job_id_idx += 1;
-        }
+        const job_id = try newUuidV4(self.allocator);
+        defer self.allocator.free(job_id);
 
         const job = try QuantumJob.init(
             self.allocator,
-            &job_id_buf,
+            job_id,
             actual_backend_name,
             options.shots,
         );
         errdefer job.deinit();
 
-        const job_key = try self.allocator.dupe(u8, &job_id_buf);
+        const job_key = try self.allocator.dupe(u8, job_id);
         errdefer self.allocator.free(job_key);
 
         try self.active_jobs.put(job_key, job);
@@ -1936,12 +1999,13 @@ pub const IBMQuantumClient = struct {
         _ = self;
         const n = circuit.num_qubits;
         if (n == 0) return;
-        const dim = @as(usize, 1) << @intCast(@min(n, QuantumConfig.MAX_QUBITS_SIMULATION));
+        if (n > QuantumConfig.MAX_QUBITS_SIMULATION) return error.TooManyQubitsForSimulation;
+        const dim = @as(usize, 1) << @intCast(n);
 
         const Complex = std.math.Complex(f64);
         const state = try result.allocator.alloc(Complex, dim);
         defer result.allocator.free(state);
-        
+
         @memset(state, Complex.init(0, 0));
         state[0] = Complex.init(1, 0);
 
@@ -1964,12 +2028,159 @@ pub const IBMQuantumClient = struct {
             probabilities[0] = 1.0;
         }
 
-        var prng = if (options.seed) |s|
-            std.Random.DefaultPrng.init(s)
-        else
-            std.Random.DefaultPrng.init(@as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))));
-        
+        var seed: u64 = undefined;
+        if (options.seed) |configured_seed| {
+            seed = configured_seed;
+        } else {
+            std.crypto.random.bytes(std.mem.asBytes(&seed));
+        }
+        var prng = std.Random.DefaultPrng.init(seed);
+
         try sampleProbabilities(result.allocator, probabilities, options.shots, n, &result.counts, prng.random());
+    }
+
+    fn authorizationHeaders(self: *Self, bearer_buffer: []u8) ![3]std.http.Header {
+        const token = self.access_token orelse return error.QuantumNotAuthenticated;
+        const bearer = try std.fmt.bufPrint(bearer_buffer, "Bearer {s}", .{token});
+        return [3]std.http.Header{
+            .{ .name = "Authorization", .value = bearer },
+            .{ .name = "Service-CRN", .value = self.credentials.crn },
+            .{ .name = "Accept", .value = "application/json" },
+        };
+    }
+
+    fn submitRuntimeJob(
+        self: *Self,
+        circuit: *QuantumCircuit,
+        backend: *QuantumBackend,
+        options: SamplerOptions,
+    ) ![]u8 {
+        const qasm = try circuit.toOpenQASM3(self.allocator);
+        defer self.allocator.free(qasm);
+
+        var payload = std.ArrayList(u8).init(self.allocator);
+        defer payload.deinit();
+
+        var json_writer = std.json.writeStream(payload.writer(), .{});
+        try json_writer.beginObject();
+        try json_writer.objectField("program_id");
+        try json_writer.write("sampler");
+        try json_writer.objectField("backend");
+        try json_writer.write(backend.name);
+        try json_writer.objectField("hub");
+        try json_writer.write(self.credentials.instance);
+        try json_writer.objectField("params");
+        try json_writer.beginObject();
+        try json_writer.objectField("pubs");
+        try json_writer.beginArray();
+        try json_writer.beginArray();
+        try json_writer.write(qasm);
+        try json_writer.endArray();
+        try json_writer.endArray();
+        try json_writer.objectField("shots");
+        try json_writer.write(options.shots);
+        try json_writer.objectField("version");
+        try json_writer.write(2);
+        try json_writer.endObject();
+        try json_writer.endObject();
+
+        var bearer_buffer: [QuantumConfig.HEADER_BUFFER_SIZE]u8 = undefined;
+        const headers = try self.authorizationHeaders(&bearer_buffer);
+
+        var url_buffer: [QuantumConfig.URL_BUFFER_SIZE]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "{s}/jobs", .{QuantumConfig.RUNTIME_API_BASE_URL});
+
+        const response_body = try self.httpRequest(.POST, url, &headers, "application/json", payload.items);
+        defer self.allocator.free(response_body);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{});
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return error.QuantumInvalidResponse;
+        const id_value = parsed.value.object.get("id") orelse return error.QuantumInvalidResponse;
+        if (id_value != .string) return error.QuantumInvalidResponse;
+        return self.allocator.dupe(u8, id_value.string);
+    }
+
+    fn fetchRuntimeJobState(self: *Self, remote_job_id: []const u8) !JobStatus {
+        var bearer_buffer: [QuantumConfig.HEADER_BUFFER_SIZE]u8 = undefined;
+        const headers = try self.authorizationHeaders(&bearer_buffer);
+
+        var url_buffer: [QuantumConfig.URL_BUFFER_SIZE]u8 = undefined;
+        const url = try std.fmt.bufPrint(
+            &url_buffer,
+            "{s}/jobs/{s}",
+            .{ QuantumConfig.RUNTIME_API_BASE_URL, remote_job_id },
+        );
+
+        const response_body = try self.httpRequest(.GET, url, &headers, null, null);
+        defer self.allocator.free(response_body);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{});
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return error.QuantumInvalidResponse;
+        const state = parsed.value.object.get("state") orelse return error.QuantumInvalidResponse;
+        if (state != .object) return error.QuantumInvalidResponse;
+        const status = state.object.get("status") orelse return error.QuantumInvalidResponse;
+        if (status != .string) return error.QuantumInvalidResponse;
+
+        if (std.mem.eql(u8, status.string, "Completed")) return .COMPLETED;
+        if (std.mem.eql(u8, status.string, "Failed")) return .FAILED;
+        if (std.mem.eql(u8, status.string, "Cancelled")) return .CANCELLED;
+        if (std.mem.eql(u8, status.string, "Running")) return .RUNNING;
+        return .QUEUED;
+    }
+
+    fn fetchRuntimeJobCounts(self: *Self, remote_job_id: []const u8, result: *QuantumResult) !void {
+        var bearer_buffer: [QuantumConfig.HEADER_BUFFER_SIZE]u8 = undefined;
+        const headers = try self.authorizationHeaders(&bearer_buffer);
+
+        var url_buffer: [QuantumConfig.URL_BUFFER_SIZE]u8 = undefined;
+        const url = try std.fmt.bufPrint(
+            &url_buffer,
+            "{s}/jobs/{s}/results",
+            .{ QuantumConfig.RUNTIME_API_BASE_URL, remote_job_id },
+        );
+
+        const response_body = try self.httpRequest(.GET, url, &headers, null, null);
+        defer self.allocator.free(response_body);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{});
+        defer parsed.deinit();
+
+        const counts_object = findCountsObject(parsed.value) orelse return error.QuantumInvalidResponse;
+        var counts_iter = counts_object.iterator();
+        while (counts_iter.next()) |entry| {
+            const count: u64 = switch (entry.value_ptr.*) {
+                .integer => |value| if (value < 0) 0 else @intCast(value),
+                .float => |value| if (value < 0.0) 0 else @intFromFloat(value),
+                else => continue,
+            };
+            try result.addCount(entry.key_ptr.*, count);
+        }
+    }
+
+    fn findCountsObject(value: std.json.Value) ?std.json.ObjectMap {
+        switch (value) {
+            .object => |object| {
+                if (object.get("counts")) |counts| {
+                    if (counts == .object) return counts.object;
+                }
+                var iter = object.iterator();
+                while (iter.next()) |entry| {
+                    if (findCountsObject(entry.value_ptr.*)) |found| return found;
+                }
+                return null;
+            },
+            .array => |array| {
+                for (array.items) |item| {
+                    if (findCountsObject(item)) |found| return found;
+                }
+                return null;
+            },
+            else => return null,
+        }
     }
 
     fn executeOnHardware(
@@ -1979,46 +2190,29 @@ pub const IBMQuantumClient = struct {
         backend: *QuantumBackend,
         options: SamplerOptions,
     ) !void {
-        _ = self;
-        const n = circuit.num_qubits;
-        if (n == 0) return;
-        const dim = @as(usize, 1) << @intCast(@min(n, QuantumConfig.MAX_QUBITS_SIMULATION));
+        if (circuit.num_qubits == 0) return error.ZeroQubits;
+        if (circuit.num_qubits > backend.num_qubits) return error.CircuitExceedsBackendWidth;
+        if (options.shots == 0) return error.InvalidShotCount;
+        if (options.shots > backend.max_shots) return error.ShotLimitExceeded;
 
-        const Complex = std.math.Complex(f64);
-        const state = try result.allocator.alloc(Complex, dim);
-        defer result.allocator.free(state);
-        
-        @memset(state, Complex.init(0, 0));
-        state[0] = Complex.init(1, 0);
+        const remote_job_id = try self.submitRuntimeJob(circuit, backend, options);
+        defer self.allocator.free(remote_job_id);
 
-        for (circuit.instructions.items) |inst| {
-            applyGate(state, inst);
+        var attempt: usize = 0;
+        while (attempt < QuantumConfig.JOB_POLL_ATTEMPTS) : (attempt += 1) {
+            const state = try self.fetchRuntimeJobState(remote_job_id);
+            switch (state) {
+                .COMPLETED => {
+                    try self.fetchRuntimeJobCounts(remote_job_id, result);
+                    return;
+                },
+                .FAILED => return error.QuantumJobFailed,
+                .CANCELLED => return error.QuantumJobCancelled,
+                else => std.time.sleep(QuantumConfig.POLL_INTERVAL_MS * std.time.ns_per_ms),
+            }
         }
 
-        const probabilities = try result.allocator.alloc(f64, dim);
-        defer result.allocator.free(probabilities);
-
-        const fidelity = backend.estimateFidelity(try circuit.getDepth(), circuit.countTwoQubitGates());
-        const clamped_fidelity = std.math.clamp(fidelity, 0.0, 1.0);
-
-        var total: f64 = 0.0;
-        var prng = if (options.seed) |s|
-            std.Random.DefaultPrng.init(s)
-        else
-            std.Random.DefaultPrng.init(@as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))));
-        const random = prng.random();
-
-        for (state, 0..) |amp, i| {
-            const ideal_p = amp.re * amp.re + amp.im * amp.im;
-            const noise = (1.0 - clamped_fidelity) * random.float(f64);
-            probabilities[i] = ideal_p * clamped_fidelity + noise;
-            total += probabilities[i];
-        }
-        if (total > 0.0) {
-            for (probabilities) |*p| p.* /= total;
-        }
-
-        try sampleProbabilities(result.allocator, probabilities, options.shots, n, &result.counts, random);
+        return error.JobTimeout;
     }
 
     pub fn getJob(self: *Self, job_id: []const u8) ?*QuantumJob {

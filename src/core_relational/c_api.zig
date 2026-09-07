@@ -190,11 +190,14 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
         var seed: u64 = undefined;
         std.crypto.random.bytes(std.mem.asBytes(&seed));
 
+        const temp = if (std.math.isFinite(initial_temp) and initial_temp > 0.0) initial_temp else DEFAULT_INITIAL_TEMP;
+        const cooling = if (std.math.isFinite(cooling_rate) and cooling_rate > 0.0 and cooling_rate < 1.0) cooling_rate else DEFAULT_COOLING_RATE;
+
         return Self{
-            .temperature = if (std.math.isFinite(initial_temp)) initial_temp else DEFAULT_INITIAL_TEMP,
-            .initial_temperature = if (std.math.isFinite(initial_temp)) initial_temp else DEFAULT_INITIAL_TEMP,
+            .temperature = temp,
+            .initial_temperature = temp,
             .min_temperature = DEFAULT_MIN_TEMP,
-            .cooling_rate = if (std.math.isFinite(cooling_rate)) cooling_rate else DEFAULT_COOLING_RATE,
+            .cooling_rate = cooling,
             .max_iterations = if (max_iterations > 0) max_iterations else DEFAULT_MAX_ITERATIONS,
             .perturb_edge_prob = DEFAULT_PERTURB_EDGE_PROB,
             .perturb_node_prob = DEFAULT_PERTURB_NODE_PROB,
@@ -210,20 +213,42 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
     }
 
     pub fn setConfig(self: *Self, key: []const u8, value: f64) bool {
+        if (!std.math.isFinite(value)) return false;
         if (std.mem.eql(u8, key, "perturb_edge_prob")) {
+            if (value < 0.0 or value > 1.0) return false;
             self.perturb_edge_prob = value;
         } else if (std.mem.eql(u8, key, "perturb_node_prob")) {
+            if (value < 0.0 or value > 1.0) return false;
             self.perturb_node_prob = value;
         } else if (std.mem.eql(u8, key, "perturb_edge_factor")) {
+            if (value < 0.0) return false;
             self.perturb_edge_factor = value;
         } else if (std.mem.eql(u8, key, "perturb_node_factor")) {
+            if (value < 0.0) return false;
             self.perturb_node_factor = value;
         } else if (std.mem.eql(u8, key, "reheat_threshold")) {
+            if (value < 0.0 or value > 1.0) return false;
             self.reheat_threshold = value;
         } else if (std.mem.eql(u8, key, "reheat_factor")) {
+            if (value < 1.0) return false;
             self.reheat_factor = value;
         } else if (std.mem.eql(u8, key, "min_temperature")) {
+            if (value <= 0.0) return false;
             self.min_temperature = value;
+            if (self.temperature < value) self.temperature = value;
+        } else if (std.mem.eql(u8, key, "cooling_rate")) {
+            if (value <= 0.0 or value >= 1.0) return false;
+            self.cooling_rate = value;
+        } else if (std.mem.eql(u8, key, "initial_temperature")) {
+            if (value <= 0.0) return false;
+            self.initial_temperature = value;
+            self.temperature = @max(value, self.min_temperature);
+        } else if (std.mem.eql(u8, key, "max_iterations")) {
+            if (value < 1.0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return false;
+            self.max_iterations = @intFromFloat(value);
+        } else if (std.mem.eql(u8, key, "adaptive_cooling")) {
+            if (value != 0.0 and value != 1.0) return false;
+            self.adaptive_cooling = value != 0.0;
         } else {
             return false;
         }
@@ -496,8 +521,8 @@ export fn jaide_destroy_graph(handle: ?*CGraph) callconv(.C) void {
     const ctx = handle.?.toInternal();
     const allocator = ctx.allocator;
     ctx.lock.lock();
-    defer ctx.lock.unlock();
     ctx.inner.deinit();
+    ctx.lock.unlock();
     allocator.destroy(ctx);
 }
 
@@ -639,7 +664,7 @@ export fn jaide_add_edge(
         clamp01(weight),
         Complex(f64).init(0.0, 0.0),
         DEFAULT_EDGE_FRACTAL_DIM,
-    );
+    ) catch return JAIDE_ERROR_OPERATION_FAILED;
     ctx.inner.addEdge(source_slice, target_slice, edge) catch {
         edge.deinit();
         return JAIDE_ERROR_OPERATION_FAILED;
@@ -735,7 +760,6 @@ export fn jaide_encode_information(
     ctx.lock.lock();
     defer ctx.lock.unlock();
     const node_id = ctx.inner.encodeInformation(data_slice) catch return JAIDE_ERROR_OPERATION_FAILED;
-    defer ctx.allocator.free(node_id);
     const copy_len = @min(node_id.len, max_len - 1);
     @memcpy(out_node_id[0..copy_len], node_id[0..copy_len]);
     return JAIDE_SUCCESS;
@@ -789,7 +813,7 @@ export fn jaide_get_topology_hash(
     @memset(out_hash[0..max_len], 0);
     ctx.lock.lock();
     defer ctx.lock.unlock();
-    const hash_hex = ctx.inner.getTopologyHashHex();
+    const hash_hex = ctx.inner.getTopologyHashHex() catch return JAIDE_ERROR_OPERATION_FAILED;
     const copy_len = @min(hash_hex.len, max_len - 1);
     @memcpy(out_hash[0..copy_len], hash_hex[0..copy_len]);
     return JAIDE_SUCCESS;

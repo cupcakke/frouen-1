@@ -24,19 +24,19 @@ type TokenSetSize = 64
 type CandTokensSize = 16
 
 fixWeightBase :: Fix16
-fixWeightBase = 0.4000091552734375
+fixWeightBase = 0.25
 
 fixWeightOverlap :: Fix16
-fixWeightOverlap = 0.29998779296875
+fixWeightOverlap = 0.1875
 
 fixWeightJaccard :: Fix16
-fixWeightJaccard = 0.29998779296875
+fixWeightJaccard = 0.1875
 
 fixWeightDiversity :: Fix16
-fixWeightDiversity = 0.29998779296875
+fixWeightDiversity = 0.1875
 
 fixWeightProximity :: Fix16
-fixWeightProximity = 0.29998779296875
+fixWeightProximity = 0.1875
 
 fixMaxRawScoreInv :: Fix16
 fixMaxRawScoreInv = 0.010009765625
@@ -464,8 +464,8 @@ rankerEngineT st cmd = case csFSM st of
 
         CmdFlushTopK ->
             let currentItem = cellItem (head (csSystolic st))
-                nextFSM = if (0 :: Index TopKDepth) == maxBound then StateIdle else StateFlushing 1
-                isDone = (0 :: Index TopKDepth) == maxBound
+                isDone = (maxBound :: Index TopKDepth) == minBound
+                nextFSM = if isDone then StateIdle else StateFlushing 1
                 nextSt = st { csFSM = nextFSM }
                 resp = HardwareResponse currentItem False isDone (not isDone)
             in (nextSt, resp)

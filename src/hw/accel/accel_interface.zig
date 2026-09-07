@@ -562,6 +562,10 @@ pub const PinnedMemory = struct {
                 return;
             },
             .cuda_host => {
+                if (comptime !gpu_enabled) {
+                    self.reset();
+                    return AccelError.InvalidResourceState;
+                }
                 const ptr = self.ptr orelse {
                     self.reset();
                     return;

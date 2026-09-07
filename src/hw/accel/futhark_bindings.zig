@@ -101,14 +101,14 @@ pub extern "c" fn futhark_values_i64_1d(ctx: ?*struct_futhark_context, arr: ?*st
 pub extern "c" fn futhark_values_raw_f32_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_2d) ?*anyopaque;
 pub extern "c" fn futhark_values_raw_f32_3d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_3d) ?*anyopaque;
 
-pub extern "c" fn futhark_entry_matmul(ctx: ?*struct_futhark_context, out: ?*?*struct_futhark_f32_2d, a: ?*struct_futhark_f32_2d, b: ?*struct_futhark_f32_2d) c_int;
+pub extern "c" fn futhark_entry_matmul(ctx: ?*struct_futhark_context, out: ?*?*struct_futhark_f32_2d, a: ?*const struct_futhark_f32_2d, b: ?*const struct_futhark_f32_2d) c_int;
 
 pub extern "c" fn futhark_entry_rsf_forward(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f16_2d,
-    input: ?*struct_futhark_f16_2d,
-    weights_s: ?*struct_futhark_f16_2d,
-    weights_t: ?*struct_futhark_f16_2d,
+    input: ?*const struct_futhark_f16_2d,
+    weights_s: ?*const struct_futhark_f16_2d,
+    weights_t: ?*const struct_futhark_f16_2d,
     clip_min: u16,
     clip_max: u16,
 ) c_int;
@@ -116,14 +116,14 @@ pub extern "c" fn futhark_entry_rsf_forward(
 pub extern "c" fn futhark_entry_scale_matrix_f32(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f32_2d,
-    values: ?*struct_futhark_f32_2d,
+    values: ?*const struct_futhark_f32_2d,
     scale_factor: f32,
 ) c_int;
 
 pub extern "c" fn futhark_entry_clip_matrix_global_norm_f32(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f32_2d,
-    values: ?*struct_futhark_f32_2d,
+    values: ?*const struct_futhark_f32_2d,
     clip_norm: f32,
 ) c_int;
 

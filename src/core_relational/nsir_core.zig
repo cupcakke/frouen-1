@@ -156,6 +156,11 @@ pub const Node = struct {
         };
     }
 
+    pub fn initWithComplex(allocator: Allocator, id: []const u8, data: []const u8, amplitude: Complex(f64), phase: f64) !Node {
+        const qubit = Qubit.init(amplitude, Complex(f64).init(0.0, 0.0));
+        return Node.init(allocator, id, data, qubit, phase);
+    }
+
     pub fn magnitude(self: Node) f64 {
         return @sqrt(self.qubit.normSquared());
     }
@@ -1352,6 +1357,61 @@ pub const SelfSimilarRelationalGraph = struct {
         }
 
         return self.canonicalIdPtr(id_buf[0..16]).?;
+    }
+
+    pub fn propagateInformation(self: *SelfSimilarRelationalGraph, source_node_id: []const u8, depth: usize) !ArrayList([]u8) {
+        var result = ArrayList([]u8).init(self.allocator);
+        errdefer {
+            for (result.items) |id| self.allocator.free(id);
+            result.deinit();
+        }
+
+        const canonical_source = self.canonicalIdPtr(source_node_id) orelse return result;
+
+        var visited = StringHashMap(void).init(self.allocator);
+        defer visited.deinit();
+        try visited.put(canonical_source, {});
+
+        var frontier = ArrayList([]const u8).init(self.allocator);
+        defer frontier.deinit();
+        var next_frontier = ArrayList([]const u8).init(self.allocator);
+        defer next_frontier.deinit();
+        try frontier.append(canonical_source);
+
+        const owned_source = try dupeBytes(self.allocator, canonical_source);
+        {
+            errdefer self.allocator.free(owned_source);
+            try result.append(owned_source);
+        }
+
+        var level: usize = 0;
+        while (level < depth and frontier.items.len > 0) : (level += 1) {
+            next_frontier.clearRetainingCapacity();
+            for (frontier.items) |current| {
+                var edge_iter = self.edges.iterator();
+                while (edge_iter.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    const neighbor = if (std.mem.eql(u8, key.source, current))
+                        key.target
+                    else if (std.mem.eql(u8, key.target, current))
+                        key.source
+                    else
+                        continue;
+                    const canonical_neighbor = self.canonicalIdPtr(neighbor) orelse continue;
+                    if (visited.contains(canonical_neighbor)) continue;
+                    try visited.put(canonical_neighbor, {});
+                    const owned = try dupeBytes(self.allocator, canonical_neighbor);
+                    {
+                        errdefer self.allocator.free(owned);
+                        try result.append(owned);
+                    }
+                    try next_frontier.append(canonical_neighbor);
+                }
+            }
+            std.mem.swap(ArrayList([]const u8), &frontier, &next_frontier);
+        }
+
+        return result;
     }
 
     pub fn decodeInformation(self: *const SelfSimilarRelationalGraph, node_id: []const u8) ?[]const u8 {

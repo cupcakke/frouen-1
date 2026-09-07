@@ -1003,6 +1003,95 @@ def _parse_gpu_monitor(text: str) -> Dict[str, Any]:
 
 @app.function(
     image=image,
+    cpu=(1.0, 2.0),
+    memory=(4096, 8192),
+    timeout=1800,
+    volumes={
+        str(DATA_MOUNT_PATH): data_volume,
+        str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
+        str(BUILD_MOUNT_PATH): build_volume,
+    },
+)
+def inspect_prepared_state(run_id: int) -> Dict[str, Any]:
+    data_volume.reload()
+    checkpoint_volume.reload()
+    build_volume.reload()
+
+    source_fp = _source_fingerprint(PROJECT_MOUNT_PATH)
+    token_dataset_path = Path(TOKEN_DATASET_PATH)
+    dataset_meta = _read_token_dataset_meta(token_dataset_path)
+
+    dataset_phase: Dict[str, Any] = {
+        "dataset_path": str(token_dataset_path),
+        "source_dataset_path": str(DATASET_PATH),
+        "source": "modal_volume:jaide-bench-data",
+        "separate_modal_run": True,
+        "reused": True,
+    }
+
+    if dataset_meta is None:
+        dataset_phase["sample_count"] = 0
+        dataset_phase["dataset_bytes"] = 0
+        dataset_phase["pretokenized"] = False
+        _log(f"A token dataset hiányzik vagy érvénytelen: {token_dataset_path}")
+    else:
+        window_length = dataset_meta["maximum_sequence_length"] + 1
+        if dataset_meta["total_tokens"] % window_length != 0:
+            raise RuntimeError(
+                f"A kész token dataset token-száma nem osztható a mintablokk méretével: {token_dataset_path}"
+            )
+        if dataset_meta["maximum_sequence_length"] != MAX_SEQ_LEN:
+            raise RuntimeError(
+                "A meglévő token dataset szekvenciahossza eltér a kért JAIDE_BENCH_MAX_SEQ_LEN értéktől: "
+                f"{dataset_meta['maximum_sequence_length']} != {MAX_SEQ_LEN}"
+            )
+        if dataset_meta["vocabulary_size"] != VOCAB_SIZE:
+            raise RuntimeError(
+                "A meglévő token dataset szótármérete eltér a kért JAIDE_BENCH_VOCAB_SIZE értéktől: "
+                f"{dataset_meta['vocabulary_size']} != {VOCAB_SIZE}"
+            )
+        dataset_phase["sample_count"] = dataset_meta["total_tokens"] // window_length
+        dataset_phase["dataset_bytes"] = token_dataset_path.stat().st_size
+        dataset_phase["pretokenized"] = True
+        dataset_phase["maximum_sequence_length"] = dataset_meta["maximum_sequence_length"]
+        dataset_phase["vocabulary_size"] = dataset_meta["vocabulary_size"]
+        dataset_phase["total_tokens"] = dataset_meta["total_tokens"]
+        _log(
+            f"A token dataset ellenőrizve: {dataset_phase['sample_count']} minta, "
+            f"{dataset_phase['dataset_bytes']} bájt"
+        )
+
+    distributed_binary = _find_latest_binary("jaide-distributed-futhark", source_fp)
+    inference_binary = _find_latest_binary("jaide-inference-server", source_fp)
+
+    if distributed_binary is None:
+        _log("A jelenlegi forrás-ujjlenyomathoz tartozó disztributált bináris nem található")
+    else:
+        _log(f"Disztributált bináris megtalálva: {distributed_binary}")
+
+    if inference_binary is None:
+        _log("A jelenlegi forrás-ujjlenyomathoz tartozó inferencia bináris nem található")
+    else:
+        _log(f"Inferencia bináris megtalálva: {inference_binary}")
+
+    vocab_path = Path(CHECKPOINT_PATH)
+    vocabulary_present = vocab_path.is_file() and vocab_path.stat().st_size > 0
+
+    return {
+        "run_id": run_id,
+        "source_fingerprint": source_fp,
+        "distributed_binary_present": distributed_binary is not None,
+        "inference_binary_present": inference_binary is not None,
+        "distributed_binary_path": str(distributed_binary) if distributed_binary is not None else "",
+        "inference_binary_path": str(inference_binary) if inference_binary is not None else "",
+        "vocabulary_present": vocabulary_present,
+        "vocabulary_path": str(vocab_path),
+        "phases": {"C_prep_dataset": dataset_phase},
+    }
+
+
+@app.function(
+    image=image,
     cpu=(CPU_REQUEST, CPU_LIMIT),
     memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
     timeout=CPU_TIMEOUT_SEC,
@@ -1153,7 +1242,6 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
     _log("=" * 70)
     _log(f"C-előkészítő fázis: {SAMPLE_CAP} minta előtokenizálása GPU tréninghez")
     _log("=" * 70)
-    t0 = time.time()
     token_dataset_path.parent.mkdir(parents=True, exist_ok=True)
     pretokenize_bin = Path(project_dir) / "zig-out" / "bin" / "jaide-pretokenize"
     if not pretokenize_bin.is_file():
@@ -1295,14 +1383,14 @@ def run_gpu_train_and_infer(
         os.chmod(str(distributed_bin), 0o755)
         _log(f"Disztributált bináris sikeresen betöltve: {distributed_bin_src} -> {distributed_bin}")
     else:
-        _log(f"HIBA: A disztributált bináris sehol sem található a perzisztens tárolóban")
+        _log("HIBA: A disztributált bináris sehol sem található a perzisztens tárolóban")
 
     if inference_bin_src and inference_bin_src.exists():
         shutil.copy2(str(inference_bin_src), str(inference_bin))
         os.chmod(str(inference_bin), 0o755)
         _log(f"Inferenciaciklus binárisa sikeresen betöltve: {inference_bin_src} -> {inference_bin}")
     else:
-        _log(f"FIGYELMEZTETÉS: Az inferenciaciklus binárisa hiányzik")
+        _log("FIGYELMEZTETÉS: Az inferenciaciklus binárisa hiányzik")
 
     dataset_meta = prep_result.get("phases", {}).get("C_prep_dataset", {})
     dataset_path = dataset_meta.get("dataset_path") or DATASET_PATH
@@ -1901,36 +1989,19 @@ def main() -> None:
     _log(f"Futtatás indítása run_id={run_id}")
 
     if RUN_MODE == "train":
-        _log("A dataset ellenőrzése a GPU Modal function felcsatolt volume-jában történik")
-        prep_result = {
-            "run_id": run_id,
-            "distributed_binary_present": True,
-            "inference_binary_present": True,
-            "phases": {
-                "C_prep_dataset": {
-                    "sample_count": SAMPLE_CAP,
-                    "dataset_path": str(token_dataset_path),
-                    "source": "modal_volume:jaide-bench-data",
-                    "pretokenized": True,
-                    "separate_modal_run": True,
-                }
-            },
-        }
+        _log("A dataset és a GPU binárisok ellenőrzése a felcsatolt Modal volume-okban")
+        prep_result = inspect_prepared_state.remote(run_id)
+        print("\n" + "=" * 70)
+        print("MEGLÉVŐ ELŐKÉSZÍTETT ÁLLAPOT")
+        print("=" * 70)
+        print(json.dumps(prep_result, indent=2, default=str))
     elif SKIP_PREP:
-        _log("CPU előkészítési fázis átugorva (JAIDE_BENCH_SKIP_PREP=1)")
-        prep_result = {
-            "run_id": run_id,
-            "distributed_binary_present": True,
-            "inference_binary_present": True,
-            "phases": {
-                "C_prep_dataset": {
-                    "sample_count": SAMPLE_CAP,
-                    "dataset_path": TOKEN_DATASET_PATH,
-                    "source": "modal_volume:jaide-bench-data",
-                    "pretokenized": True,
-                }
-            },
-        }
+        _log("CPU előkészítési fázis átugorva (JAIDE_BENCH_SKIP_PREP=1); a meglévő állapot ellenőrzése")
+        prep_result = inspect_prepared_state.remote(run_id)
+        print("\n" + "=" * 70)
+        print("MEGLÉVŐ ELŐKÉSZÍTETT ÁLLAPOT")
+        print("=" * 70)
+        print(json.dumps(prep_result, indent=2, default=str))
     else:
         _log("1. LÉPÉS: CPU előkészítés ellenőrzése / futtatása")
         prep_result = prepare_cpu.remote(run_id)
@@ -1939,18 +2010,18 @@ def main() -> None:
         print("=" * 70)
         print(json.dumps(prep_result, indent=2, default=str))
 
-        if RUN_MODE != "prep" and not prep_result.get("distributed_binary_present"):
-            print("\n" + "=" * 70)
-            print("MEGSZAKÍTÁS: a disztributált bináris nem áll rendelkezésre")
-            print("=" * 70)
-            raise RuntimeError("A disztributált bináris nem épült fel és meglévő verzió sem található")
+    if RUN_MODE != "prep" and not prep_result.get("distributed_binary_present"):
+        print("\n" + "=" * 70)
+        print("MEGSZAKÍTÁS: a disztributált bináris nem áll rendelkezésre")
+        print("=" * 70)
+        raise RuntimeError("A disztributált bináris nem épült fel és meglévő verzió sem található")
 
-        dataset_ok = prep_result.get("phases", {}).get("C_prep_dataset", {}).get("sample_count", 0) > 0
-        if RUN_MODE != "build" and not dataset_ok:
-            print("\n" + "=" * 70)
-            print("MEGSZAKÍTÁS: az adathalmaz nincs előkészítve")
-            print("=" * 70)
-            raise RuntimeError("Az adathalmaz nem áll készen a betanításhoz")
+    dataset_ok = prep_result.get("phases", {}).get("C_prep_dataset", {}).get("sample_count", 0) > 0
+    if RUN_MODE != "build" and not dataset_ok:
+        print("\n" + "=" * 70)
+        print("MEGSZAKÍTÁS: az adathalmaz nincs előkészítve")
+        print("=" * 70)
+        raise RuntimeError("Az adathalmaz nem áll készen a betanításhoz")
 
     if RUN_MODE in {"prep", "build"}:
         print("\n" + "=" * 70)

@@ -524,7 +524,7 @@ test "LearnedEmbedding batched backward accumulates only valid lengths" {
     var emb = try LearnedEmbedding.init(allocator, 16, 4, 5);
     defer emb.deinit();
 
-    const tokens = [_]u32{ 1, 2, 3, 0, 4, 5, 0, 0 };
+    const tokens = [_]u32{ 1, 2, 1, 0, 4, 5, 0, 0 };
     const lengths = [_]u32{ 3, 2 };
     const n_rows = tokens.len;
     const grad = try allocator.alloc(f32, n_rows * @as(usize, 4));
@@ -535,7 +535,13 @@ test "LearnedEmbedding batched backward accumulates only valid lengths" {
     emb.zeroGrad();
     emb.backwardAccumulate(&tokens, &lengths, grad, 4, 2);
 
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), emb.grad.data[1 * 4 + 0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), emb.grad.data[3 * 4 + 0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[0], 1e-6);
+    var c: usize = 0;
+    while (c < 4) : (c += 1) {
+        try std.testing.expectApproxEqAbs(@as(f32, 2.0), emb.grad.data[1 * 4 + c], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[2 * 4 + c], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[4 * 4 + c], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[5 * 4 + c], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[0 * 4 + c], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[3 * 4 + c], 1e-6);
+    }
 }

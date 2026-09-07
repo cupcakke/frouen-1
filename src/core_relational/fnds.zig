@@ -674,7 +674,7 @@ pub const FractalLevel = struct {
             var h2 = std.hash.Wyhash.init(h1_val);
             h2.update(node.data);
             const position = h2.final();
-            try node_positions.append(@as(usize, @truncate(position)));
+            node_positions.append(@as(usize, @truncate(position))) catch return self.node_count;
         }
         var edge_iter = self.edges.iterator();
         while (edge_iter.next()) |entry| {
@@ -688,7 +688,7 @@ pub const FractalLevel = struct {
                 var h2 = std.hash.Wyhash.init(h1_val);
                 h2.update(&canonicalF64Bytes(edge.fractal_correlation));
                 const position = h2.final();
-                try edge_positions.append(@as(usize, @truncate(position)));
+                edge_positions.append(@as(usize, @truncate(position))) catch return self.node_count;
             }
         }
         var occupied = std.AutoHashMap(usize, void).init(self.allocator);

@@ -12,8 +12,8 @@ pub const SSI = struct {
     size: usize = 0,
     max_height: usize = 6,
 
-    const bucket_width: usize = 6;
-    const bucket_count: usize = 1 << bucket_width;
+    pub const bucket_width: usize = 6;
+    pub const bucket_count: usize = 1 << bucket_width;
     const tensor_width: usize = 134;
 
     const Segment = struct {
@@ -116,7 +116,7 @@ pub const SSI = struct {
         };
     }
 
-    fn mixHash(state: u64, value: u64) u64 {
+    pub fn mixHash(state: u64, value: u64) u64 {
         return state *% 0x9E3779B185EBCA87 +% value +% 0x517CC1B727220A95;
     }
 
@@ -124,7 +124,7 @@ pub const SSI = struct {
         return @as(u32, @bitCast(value));
     }
 
-    fn hashTokens(tokens: []const u32) u64 {
+    pub fn hashTokens(tokens: []const u32) u64 {
         var state: u64 = 0;
         state = mixHash(state, @as(u64, @intCast(tokens.len)));
         for (tokens) |tok| {
@@ -191,7 +191,7 @@ pub const SSI = struct {
         return std.math.clamp(estimate, @as(f32, 0.0), @as(f32, 1.0));
     }
 
-    fn computeAnchorHash(tokens: []const u32, position: u64) u64 {
+    pub fn computeAnchorHash(tokens: []const u32, position: u64) u64 {
         var state: u64 = position;
         state = mixHash(state, @as(u64, @intCast(tokens.len)));
         for (tokens) |tok| {
@@ -200,7 +200,7 @@ pub const SSI = struct {
         return state;
     }
 
-    fn bucketIndex(position: u64) usize {
+    pub fn bucketIndex(position: u64) usize {
         var h = position *% 0x9E3779B185EBCA87;
         h = (h ^ (h >> 30)) *% 0xbf58476d1ce4e5b9;
         h = (h ^ (h >> 27)) *% 0x94d049bb133111eb;

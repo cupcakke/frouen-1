@@ -1272,7 +1272,7 @@ pub const MatrixOps = struct {
         const det = self.determinant4x4(m);
         const norm = m.frobeniusNorm();
         const threshold = if (norm > 1.0) 1e-10 * norm else 1e-10;
-        if (if (det >= 0) det else -det < threshold) {
+        if (@abs(det) < threshold) {
             return null;
         }
         var adj = Matrix4x4.zero();
@@ -1418,8 +1418,8 @@ pub const RelationalVectorOps = struct {
         for (edges) |edge| {
             const vec = F64x4.initFromArray(.{
                 edge.weight,
-                edge.quantum_coupling.re,
-                edge.quantum_coupling.im,
+                edge.quantum_correlation.re,
+                edge.quantum_correlation.im,
                 edge.fractal_dimension,
             });
             try batch.append(vec);

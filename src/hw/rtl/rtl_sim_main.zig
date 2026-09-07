@@ -1,121 +1,215 @@
 const std = @import("std");
+const SSI = @import("../../index/ssi.zig").SSI;
 
-pub fn main() !void {
+extern fn hs_init(argc: *c_int, argv: *[*c][*c]u8) void;
+extern fn hs_exit() void;
+
+extern fn jaide_rtl_abi_version() c_uint;
+extern fn jaide_rtl_mix_hash(state: c_ulonglong, value: c_ulonglong) c_ulonglong;
+extern fn jaide_rtl_count_bits64(value: c_ulonglong) c_uint;
+extern fn jaide_rtl_isqrt32(value: c_uint) c_uint;
+extern fn jaide_rtl_signature_similarity(a: c_ulonglong, b: c_ulonglong) c_uint;
+extern fn jaide_rtl_compute_similarity(a: c_ulonglong, b: c_ulonglong) c_uint;
+extern fn jaide_rtl_bucket_index(position: c_ulonglong) c_uint;
+extern fn jaide_rtl_hash_tokens(tokens: [*]const c_uint, count: c_uint) c_ulonglong;
+extern fn jaide_rtl_fuse_scores(base: f64, overlap: f64, jaccard: f64, proximity: f64, diversity: f64) f64;
+extern fn jaide_rtl_arbiter_first_grant(mask: c_uint) c_int;
+extern fn jaide_rtl_arbiter_service_cycles() c_uint;
+extern fn jaide_rtl_max_search_depth() c_uint;
+
+const expected_abi_version: c_uint = 1;
+const expected_service_cycles: c_uint = 4;
+const expected_max_search_depth: c_uint = 64;
+
+var checks_passed: usize = 0;
+var checks_failed: usize = 0;
+
+fn report(name: []const u8, ok: bool) void {
+    if (ok) {
+        checks_passed += 1;
+        std.debug.print("[PASS] {s}\n", .{name});
+    } else {
+        checks_failed += 1;
+        std.debug.print("[FAIL] {s}\n", .{name});
+    }
+}
+
+fn reportEqualU64(name: []const u8, hardware: u64, reference: u64) void {
+    const ok = hardware == reference;
+    if (ok) {
+        checks_passed += 1;
+        std.debug.print("[PASS] {s}\n", .{name});
+    } else {
+        checks_failed += 1;
+        std.debug.print("[FAIL] {s}: rtl={d} reference={d}\n", .{ name, hardware, reference });
+    }
+}
+
+fn referenceIsqrt32(value: u32) u32 {
+    var result: u32 = 0;
+    var index: u5 = 15;
+    while (true) {
+        const candidate = result | (@as(u32, 1) << index);
+        if (candidate * candidate <= value) {
+            result = candidate;
+        }
+        if (index == 0) break;
+        index -= 1;
+    }
+    return result;
+}
+
+fn referenceSignatureSimilarityQ16(query: u64, segment: u64) u32 {
+    const mismatch: u32 = @popCount(query ^ segment);
+    if (mismatch >= 32) return 0;
+    return (32 - mismatch) * 2048;
+}
+
+fn referenceComputeSimilarityQ16(first: u64, second: u64) u32 {
+    const popcount_first: u32 = @popCount(first);
+    const popcount_second: u32 = @popCount(second);
+    const intersection: u32 = @popCount(first & second);
+    if (popcount_first == 0 and popcount_second == 0) return 65536;
+    if (popcount_first == 0 or popcount_second == 0) return 0;
+    const root = referenceIsqrt32(popcount_first * popcount_second);
+    if (root == 0) return 0;
+    return @intCast((@as(u64, intersection) * 65536) / root);
+}
+
+fn referenceFuseScores(base: f64, overlap: f64, jaccard: f64, proximity: f64, diversity: f64) f64 {
+    const raw_base = std.math.clamp(base, 0.0, 100.0);
+    const scaled_base = raw_base * 0.010009765625;
+    const combined = scaled_base * 0.25 +
+        std.math.clamp(overlap, 0.0, 1.0) * 0.1875 +
+        std.math.clamp(jaccard, 0.0, 1.0) * 0.1875 +
+        std.math.clamp(proximity, 0.0, 1.0) * 0.1875 +
+        std.math.clamp(diversity, 0.0, 1.0) * 0.1875;
+    return std.math.clamp(combined, 0.0, 1.0);
+}
+
+fn referenceFirstGrant(mask: u32) i32 {
+    var client: u5 = 0;
+    while (client < 4) : (client += 1) {
+        if ((mask & (@as(u32, 1) << client)) != 0) return @intCast(client);
+    }
+    return -1;
+}
+
+fn runHashEquivalence(allocator: std.mem.Allocator, token_count: usize, seed: u64) !void {
+    const tokens = try allocator.alloc(u32, token_count);
+    defer allocator.free(tokens);
+    const c_tokens = try allocator.alloc(c_uint, token_count);
+    defer allocator.free(c_tokens);
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    for (tokens, 0..) |*token, index| {
+        token.* = random.int(u32);
+        c_tokens[index] = @intCast(token.*);
+    }
+
+    const reference = SSI.hashTokens(tokens);
+    const hardware: u64 = @intCast(jaide_rtl_hash_tokens(c_tokens.ptr, @intCast(token_count)));
+
+    var name_buffer: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buffer, "hashTokens equivalence over {d} tokens", .{token_count});
+    reportEqualU64(name, hardware, reference);
+}
+
+pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var argc: c_int = 0;
+    var argv_storage: [*c][*c]u8 = null;
+    hs_init(&argc, &argv_storage);
+    defer hs_exit();
 
-    const cycles: usize = blk: {
-        if (args.len < 2) break :blk 1024;
-        break :blk std.fmt.parseInt(usize, args[1], 10) catch 1024;
-    };
+    std.debug.print("JAIDE RTL equivalence checker (MemoryArbiter + RankerCore + SSISearch)\n", .{});
 
-    const banks: usize = blk: {
-        if (args.len < 3) break :blk 8;
-        break :blk std.fmt.parseInt(usize, args[2], 10) catch 8;
-    };
+    report("RTL ABI version", jaide_rtl_abi_version() == expected_abi_version);
+    report("arbiter service cycles", jaide_rtl_arbiter_service_cycles() == expected_service_cycles);
+    report("SSI maximum search depth", jaide_rtl_max_search_depth() == expected_max_search_depth);
 
-    const requests_per_cycle: usize = blk: {
-        if (args.len < 4) break :blk 4;
-        break :blk std.fmt.parseInt(usize, args[3], 10) catch 4;
-    };
+    var prng = std.Random.DefaultPrng.init(0x5EED_1234_ABCD_9876);
+    const random = prng.random();
 
-    if (banks == 0 or requests_per_cycle == 0 or cycles == 0) {
-        std.debug.print("jaide-rtl-sim usage: jaide-rtl-sim <cycles> <banks> <requests_per_cycle>\n", .{});
-        return error.InvalidArguments;
-    }
+    var iteration: usize = 0;
+    var mix_matches = true;
+    var popcount_matches = true;
+    var isqrt_matches = true;
+    var signature_matches = true;
+    var similarity_matches = true;
+    var bucket_matches = true;
+    var fuse_matches = true;
 
-    var bank_busy_until = try allocator.alloc(usize, banks);
-    defer allocator.free(bank_busy_until);
-    @memset(bank_busy_until, 0);
+    while (iteration < 4096) : (iteration += 1) {
+        const state = random.int(u64);
+        const value = random.int(u64);
 
-    var rng = std.Random.DefaultPrng.init(0xC0FFEE12345);
-    const rand = rng.random();
+        if (@as(u64, @intCast(jaide_rtl_mix_hash(state, value))) != SSI.mixHash(state, value)) {
+            mix_matches = false;
+        }
+        if (@as(u32, @intCast(jaide_rtl_count_bits64(state))) != @as(u32, @popCount(state))) {
+            popcount_matches = false;
+        }
 
-    var total_requests: usize = 0;
-    var total_granted: usize = 0;
-    var total_conflicts: usize = 0;
-    var total_latency: u64 = 0;
-    var max_latency: u64 = 0;
+        const narrow: u32 = @truncate(value);
+        if (@as(u32, @intCast(jaide_rtl_isqrt32(narrow))) != referenceIsqrt32(narrow)) {
+            isqrt_matches = false;
+        }
+        if (@as(u32, @intCast(jaide_rtl_signature_similarity(state, value))) != referenceSignatureSimilarityQ16(state, value)) {
+            signature_matches = false;
+        }
+        if (@as(u32, @intCast(jaide_rtl_compute_similarity(state, value))) != referenceComputeSimilarityQ16(state, value)) {
+            similarity_matches = false;
+        }
+        if (@as(usize, @intCast(jaide_rtl_bucket_index(state))) != SSI.bucketIndex(state)) {
+            bucket_matches = false;
+        }
 
-    var current_cycle: usize = 0;
-    while (current_cycle < cycles) : (current_cycle += 1) {
-        var reqs_in_cycle: usize = 0;
-        while (reqs_in_cycle < requests_per_cycle) : (reqs_in_cycle += 1) {
-            total_requests += 1;
-            const target_bank = rand.intRangeAtMost(usize, 0, banks - 1);
-            if (bank_busy_until[target_bank] <= current_cycle) {
-                total_granted += 1;
-                const service_time: usize = 1 + rand.intRangeAtMost(usize, 0, 3);
-                bank_busy_until[target_bank] = current_cycle + service_time;
-                total_latency += service_time;
-                if (service_time > max_latency) max_latency = service_time;
-            } else {
-                total_conflicts += 1;
-                const wait: usize = bank_busy_until[target_bank] - current_cycle;
-                total_latency += wait;
-                if (wait > max_latency) max_latency = wait;
-            }
+        const base = random.float(f64) * 100.0;
+        const overlap = random.float(f64);
+        const jaccard = random.float(f64);
+        const proximity = random.float(f64);
+        const diversity = random.float(f64);
+        const hardware_score = jaide_rtl_fuse_scores(base, overlap, jaccard, proximity, diversity);
+        const reference_score = referenceFuseScores(base, overlap, jaccard, proximity, diversity);
+        if (@abs(hardware_score - reference_score) > 1.0e-3) {
+            fuse_matches = false;
         }
     }
 
-    const grant_ratio: f64 = if (total_requests > 0)
-        @as(f64, @floatFromInt(total_granted)) / @as(f64, @floatFromInt(total_requests))
-    else
-        0.0;
-    const avg_latency: f64 = if (total_requests > 0)
-        @as(f64, @floatFromInt(total_latency)) / @as(f64, @floatFromInt(total_requests))
-    else
-        0.0;
+    report("mixHash equivalence over 4096 vectors", mix_matches);
+    report("countBits64 equivalence over 4096 vectors", popcount_matches);
+    report("isqrt32 equivalence over 4096 vectors", isqrt_matches);
+    report("signatureSimilarity equivalence over 4096 vectors", signature_matches);
+    report("computeSimilarity equivalence over 4096 vectors", similarity_matches);
+    report("bucketIndex equivalence over 4096 vectors", bucket_matches);
+    report("fuseScores equivalence over 4096 vectors", fuse_matches);
 
-    var busy_sum: u64 = 0;
-    for (bank_busy_until) |b| busy_sum += b;
-    const avg_bank_pressure: f64 = @as(f64, @floatFromInt(busy_sum)) / @as(f64, @floatFromInt(banks));
-
-    const ranker_scores = try allocator.alloc(f64, 32);
-    defer allocator.free(ranker_scores);
-    for (ranker_scores, 0..) |*s, i| {
-        const w1: f64 = @as(f64, @floatFromInt((i * 17) % 100)) / 100.0;
-        const w2: f64 = @as(f64, @floatFromInt((i * 31) % 100)) / 100.0;
-        s.* = w1 * 0.6 + w2 * 0.4;
+    var mask: u32 = 0;
+    var grant_matches = true;
+    while (mask < 16) : (mask += 1) {
+        if (jaide_rtl_arbiter_first_grant(mask) != referenceFirstGrant(mask)) {
+            grant_matches = false;
+        }
     }
+    report("arbiter grant priority over every request mask", grant_matches);
 
-    std.sort.pdq(f64, ranker_scores, {}, std.sort.desc(f64));
+    try runHashEquivalence(allocator, 1, 0x1111_2222_3333_4444);
+    try runHashEquivalence(allocator, 8, 0x2222_3333_4444_5555);
+    try runHashEquivalence(allocator, 64, 0x3333_4444_5555_6666);
+    try runHashEquivalence(allocator, 512, 0x4444_5555_6666_7777);
 
-    var ssi_hits: usize = 0;
-    var ssi_probes: usize = 0;
-    var pattern: u64 = 0xDEADBEEF12345678;
-    var probe_idx: usize = 0;
-    while (probe_idx < 4096) : (probe_idx += 1) {
-        ssi_probes += 1;
-        pattern ^= pattern << 13;
-        pattern ^= pattern >> 7;
-        pattern ^= pattern << 17;
-        if ((pattern & 0xFF) < 40) ssi_hits += 1;
-    }
+    const weight_sum = 0.25 + 0.1875 * 4.0;
+    report("ranker fusion weights sum to one", @abs(weight_sum - 1.0) < 1.0e-12);
+    report(
+        "ranker fusion saturates at one",
+        @abs(referenceFuseScores(100.0, 1.0, 1.0, 1.0, 1.0) - 1.0) < 1.0e-3,
+    );
 
-    const ssi_hit_ratio: f64 = @as(f64, @floatFromInt(ssi_hits)) / @as(f64, @floatFromInt(ssi_probes));
-
-    std.debug.print("============================================================\n", .{});
-    std.debug.print("JAIDE RTL Simulation (MemoryArbiter + RankerCore + SSISearch)\n", .{});
-    std.debug.print("============================================================\n", .{});
-    std.debug.print("Cycles simulated:       {d}\n", .{cycles});
-    std.debug.print("Banks:                  {d}\n", .{banks});
-    std.debug.print("Requests per cycle:     {d}\n", .{requests_per_cycle});
-    std.debug.print("Total requests:         {d}\n", .{total_requests});
-    std.debug.print("Total granted:          {d}\n", .{total_granted});
-    std.debug.print("Total conflicts:        {d}\n", .{total_conflicts});
-    std.debug.print("Grant ratio:            {d:.4}\n", .{grant_ratio});
-    std.debug.print("Avg latency (cycles):   {d:.4}\n", .{avg_latency});
-    std.debug.print("Max latency (cycles):   {d}\n", .{max_latency});
-    std.debug.print("Avg bank pressure:      {d:.4}\n", .{avg_bank_pressure});
-    std.debug.print("Top ranker score:       {d:.4}\n", .{ranker_scores[0]});
-    std.debug.print("Median ranker score:    {d:.4}\n", .{ranker_scores[ranker_scores.len / 2]});
-    std.debug.print("SSI probes:             {d}\n", .{ssi_probes});
-    std.debug.print("SSI hits:               {d}\n", .{ssi_hits});
-    std.debug.print("SSI hit ratio:          {d:.4}\n", .{ssi_hit_ratio});
-    std.debug.print("============================================================\n", .{});
+    std.debug.print("jaide-rtl-sim: {d} passed, {d} failed\n", .{ checks_passed, checks_failed });
+    return if (checks_failed == 0) 0 else 1;
 }

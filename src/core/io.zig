@@ -245,7 +245,10 @@ pub const MMAP = struct {
         if (new_size > IoConfig.MAX_FILE_SIZE) return error.FileTooLarge;
 
         try self.file.setEndPos(new_size);
-        errdefer self.file.setEndPos(current_size) catch {};
+        errdefer self.file.setEndPos(current_size) catch |rollback_error| std.log.err(
+            "io: rolling back the appended file length failed: {s}",
+            .{@errorName(rollback_error)},
+        );
 
         try self.file.pwriteAll(data, current_size);
 
@@ -255,9 +258,7 @@ pub const MMAP = struct {
         if (self.is_writable) prot_flags |= std.posix.PROT.WRITE;
         const map_flags: std.posix.MAP = if (self.is_writable) .{ .TYPE = .SHARED } else .{ .TYPE = .PRIVATE };
 
-        const new_buf = std.posix.mmap(null, aligned_size, prot_flags, map_flags, self.file.handle, 0) catch {
-            return IoError.BufferNotMapped;
-        };
+        const new_buf = try std.posix.mmap(null, aligned_size, prot_flags, map_flags, self.file.handle, 0);
 
         std.posix.munmap(buf);
         self.buffer = new_buf;
@@ -683,10 +684,19 @@ pub fn writeFileWithOptions(path: []const u8, data: []const u8, options: WriteFi
 
 pub fn appendFile(path: []const u8, data: []const u8) !void {
     var path_c: [IoConfig.MAX_PATH_LEN]u8 = undefined;
+    if (path.len == 0) return IoError.InvalidPath;
     if (path.len >= IoConfig.MAX_PATH_LEN) return IoError.PathTooLong;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return IoError.InvalidPath;
     @memcpy(path_c[0..path.len], path);
     path_c[path.len] = 0;
-    const fd = try std.posix.openat(fs.cwd().fd, &path_c, std.posix.O.WRONLY | std.posix.O.APPEND | std.posix.O.CREAT, IoConfig.SECURE_FILE_MODE);
+    const path_z: [:0]const u8 = path_c[0..path.len :0];
+    const flags: std.posix.O = .{
+        .ACCMODE = .WRONLY,
+        .APPEND = true,
+        .CREAT = true,
+        .CLOEXEC = true,
+    };
+    const fd = try std.posix.openat(fs.cwd().fd, path_z, flags, IoConfig.SECURE_FILE_MODE);
     const file = fs.File{ .handle = fd };
     defer file.close();
     try file.writeAll(data);
