@@ -803,9 +803,10 @@ pub fn loadNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8, 
             var weight: f64 = undefined;
             try reader.readNoEof(mem.asBytes(&weight));
             const quality_byte = try reader.readByte();
-            const quality: nsir.EdgeQuality = @enumFromInt(quality_byte);
+            const quality = std.meta.intToEnum(nsir.EdgeQuality, quality_byte) catch return ModelError.CorruptedData;
+            if (!std.math.isFinite(weight)) return ModelError.CorruptedData;
 
-            const edge = nsir.Edge.init(
+            var edge = try nsir.Edge.init(
                 allocator,
                 source,
                 target,
@@ -814,6 +815,7 @@ pub fn loadNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8, 
                 std.math.Complex(f64).init(0.0, 0.0),
                 0.0,
             );
+            errdefer edge.deinit();
             try graph.addEdge(source, target, edge);
         }
     }

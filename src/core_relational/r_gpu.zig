@@ -1109,7 +1109,7 @@ pub const GraphIsomorphismProcessor = struct {
 
             for (subgraph_nodes) |node_id| {
                 if (main_graph.nodes.get(node_id)) |node| {
-                    const node_clone = try node.clone(self.allocator);
+                    var node_clone = try node.clone(self.allocator);
                     var node_transferred = false;
                     defer if (!node_transferred) node_clone.deinit();
                     try subgraph.addNode(node_clone);
@@ -1130,7 +1130,7 @@ pub const GraphIsomorphismProcessor = struct {
 
                 if (source_in_subgraph and target_in_subgraph) {
                     for (edge_entry.value_ptr.items) |edge| {
-                        const edge_clone = try edge.clone(self.allocator);
+                        var edge_clone = try edge.clone(self.allocator);
                         var edge_transferred = false;
                         defer if (!edge_transferred) edge_clone.deinit();
                         try subgraph.addEdge(edge_clone.source, edge_clone.target, edge_clone);
@@ -1771,8 +1771,11 @@ pub const RelationalGraphProcessingUnit = struct {
 
                     if (source_in_core and target_in_core) {
                         for (edge_entry.value_ptr.items) |edge| {
-                            const edge_clone = try edge.clone(self.allocator);
+                            var edge_clone = try edge.clone(self.allocator);
+                            var edge_transferred = false;
+                            defer if (!edge_transferred) edge_clone.deinit();
                             try local_graph.addEdge(edge_clone.source, edge_clone.target, edge_clone);
+                            edge_transferred = true;
                         }
                     }
                 }
@@ -1958,7 +1961,7 @@ pub const RelationalGraphProcessingUnit = struct {
             while (node_iter.next()) |node_entry| {
                 const node_id = node_entry.key_ptr.*;
                 if (!new_global.nodes.contains(node_id)) {
-                    const node_clone = try node_entry.value_ptr.clone(self.allocator);
+                    var node_clone = try node_entry.value_ptr.clone(self.allocator);
                     var node_transferred = false;
                     defer if (!node_transferred) node_clone.deinit();
                     try new_global.addNode(node_clone);
@@ -1969,7 +1972,7 @@ pub const RelationalGraphProcessingUnit = struct {
             var edge_iter = core.local_graph.?.edges.iterator();
             while (edge_iter.next()) |edge_entry| {
                 for (edge_entry.value_ptr.items) |edge| {
-                    const edge_clone = try edge.clone(self.allocator);
+                    var edge_clone = try edge.clone(self.allocator);
                     var edge_transferred = false;
                     defer if (!edge_transferred) edge_clone.deinit();
                     try new_global.addEdge(edge_clone.source, edge_clone.target, edge_clone);
@@ -2144,8 +2147,11 @@ pub const RelationalGraphProcessingUnit = struct {
                 const core = self.noc.getCore(core_id) orelse continue;
                 const local_graph = core.local_graph orelse continue;
                 for (edge_entry.value_ptr.items) |edge| {
-                    const edge_clone = try edge.clone(self.allocator);
+                    var edge_clone = try edge.clone(self.allocator);
+                    var edge_transferred = false;
+                    defer if (!edge_transferred) edge_clone.deinit();
                     try local_graph.addEdge(edge_clone.source, edge_clone.target, edge_clone);
+                    edge_transferred = true;
                 }
             }
         }

@@ -38,6 +38,7 @@ var global_huge_successes: usize = 0;
 var global_huge_fallbacks: usize = 0;
 var global_huge1g_attempts: usize = 0;
 var global_huge1g_successes: usize = 0;
+var global_huge1g_fallbacks: usize = 0;
 
 pub const HugePageStats = struct {
     attempts: usize,
@@ -45,6 +46,7 @@ pub const HugePageStats = struct {
     fallbacks: usize,
     attempts_1gb: usize = 0,
     successes_1gb: usize = 0,
+    fallbacks_1gb: usize = 0,
 };
 
 pub fn hugePageStats() HugePageStats {
@@ -54,6 +56,7 @@ pub fn hugePageStats() HugePageStats {
         .fallbacks = @atomicLoad(usize, &global_huge_fallbacks, .acquire),
         .attempts_1gb = @atomicLoad(usize, &global_huge1g_attempts, .acquire),
         .successes_1gb = @atomicLoad(usize, &global_huge1g_successes, .acquire),
+        .fallbacks_1gb = @atomicLoad(usize, &global_huge1g_fallbacks, .acquire),
     };
 }
 
@@ -117,14 +120,7 @@ pub const HugePageAllocator = struct {
     }
 
     pub fn isHugePointer(self: *HugePageAllocator, pointer: *const anyopaque) bool {
-        const address = @intFromPtr(pointer);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var current = self.mappings;
-        while (current) |mapping| : (current = mapping.next) {
-            if (mapping.address == address) return true;
-        }
-        return false;
+        return self.hasMapping(@intFromPtr(pointer));
     }
 
     fn createMapping(self: *HugePageAllocator) !*HugeMapping {
@@ -221,29 +217,28 @@ pub const HugePageAllocator = struct {
 
     fn allocFn(context: *anyopaque, len: usize, align_val: mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *HugePageAllocator = @ptrCast(@alignCast(context));
+        if (comptime builtin.os.tag != .linux) return self.parentAlloc(len, align_val, ret_addr);
         if (len < huge_page_size) return self.parentAlloc(len, align_val, ret_addr);
         if (len % huge_page_size_1gb == 0 and @intFromEnum(align_val) <= 30) {
             if (self.mapHuge1gb(len)) |ptr| {
                 return ptr;
-            } else |err| switch (err) {
-                error.OutOfMemory => {},
-                else => return null,
+            } else |_| {
+                _ = @atomicRmw(usize, &global_huge1g_fallbacks, .Add, 1, .monotonic);
             }
         }
-        if (len % huge_page_size != 0 or @intFromEnum(align_val) > 21) return null;
-        return self.mapHuge(len) catch |err| switch (err) {
-            error.OutOfMemory => blk: {
+        if (len % huge_page_size == 0 and @intFromEnum(align_val) <= 21) {
+            if (self.mapHuge(len)) |ptr| {
+                return ptr;
+            } else |_| {
                 _ = @atomicRmw(usize, &global_huge_fallbacks, .Add, 1, .monotonic);
-                break :blk self.parentAlloc(len, align_val, ret_addr);
-            },
-            else => null,
-        };
+            }
+        }
+        return self.parentAlloc(len, align_val, ret_addr);
     }
 
     fn resizeFn(context: *anyopaque, buffer: []u8, align_val: mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *HugePageAllocator = @ptrCast(@alignCast(context));
         if (self.hasMapping(@intFromPtr(buffer.ptr))) return new_len == buffer.len;
-        if (new_len >= huge_page_size) return false;
         return self.parentResize(buffer, align_val, new_len, ret_addr);
     }
 

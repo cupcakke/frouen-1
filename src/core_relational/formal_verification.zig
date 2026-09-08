@@ -414,7 +414,7 @@ pub const Term = struct {
     pub fn computeHash(self: *const Self, hasher: *Sha256) void {
         hasher.update(&[_]u8{@intFromEnum(self.kind)});
         hasher.update(self.name);
-        var args_len_u64 = std.math.cast(u64, self.args.items.len) catch unreachable;
+        const args_len_u64: u64 = @intCast(self.args.items.len);
         hasher.update(std.mem.asBytes(&args_len_u64));
         for (self.args.items) |arg| {
             arg.computeHash(hasher);
@@ -692,12 +692,12 @@ pub const Proposition = struct {
         if (self.bound_variable) |bv| {
             hasher.update(bv);
         }
-        var terms_len_u64 = std.math.cast(u64, self.terms.items.len) catch unreachable;
+        const terms_len_u64: u64 = @intCast(self.terms.items.len);
         hasher.update(std.mem.asBytes(&terms_len_u64));
         for (self.terms.items) |term| {
             term.computeHash(&hasher);
         }
-        var subs_len_u64 = std.math.cast(u64, self.sub_propositions.items.len) catch unreachable;
+        const subs_len_u64: u64 = @intCast(self.sub_propositions.items.len);
         hasher.update(std.mem.asBytes(&subs_len_u64));
         for (self.sub_propositions.items) |sub| {
             const sub_hash = sub.computeHash();

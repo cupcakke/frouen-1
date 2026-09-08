@@ -421,7 +421,7 @@ pub const RelationalTriplet = struct {
         try object_node.setMetadata("type", "entity");
         try object_node.setMetadata("role", "object");
 
-        var edge = try Edge.initWithComplex(
+        var edge = try Edge.init(
             allocator,
             subject_id_str[0..],
             object_id_str[0..],

@@ -606,7 +606,7 @@ pub const SurpriseMemoryManager = struct {
             if (self.surprise_records.get(candidate.block_id)) |record| {
                 self.statistics.removeBlock(record.surprise_score, self.surprise_threshold);
             }
-            if (self.storage.removeBlock(candidate.block_id)) |_| {} else |_| {
+            if (self.storage.removeBlock(candidate.block_id) == null) {
                 return error.StorageRemoveFailed;
             }
             if (self.storage.containsBlock(candidate.block_id)) {

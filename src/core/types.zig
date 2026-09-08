@@ -528,7 +528,7 @@ pub const PRNG = struct {
 
     pub fn reseed(self: *PRNG) !void {
         var buf: [32]u8 = undefined;
-        try std.crypto.random.bytes(&buf);
+        std.crypto.random.bytes(&buf);
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update(&buf);
         var hash: [32]u8 = undefined;

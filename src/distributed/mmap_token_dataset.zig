@@ -135,12 +135,16 @@ pub const MmapTokenDataset = struct {
         const rank_offset = std.math.mul(u64, @intCast(rank), stride) catch return Error.IntegerOverflow;
         const epoch_offset = std.math.mul(u64, epoch, @intCast(self.payload.len)) catch return Error.IntegerOverflow;
         const batch_offset = std.math.mul(u64, batch_index, stride) catch return Error.IntegerOverflow;
+        const payload_len_u64 = @as(u64, @intCast(self.payload.len));
+        const wrapped_rank_batch = std.math.add(u64, rank_offset, batch_offset) catch return Error.IntegerOverflow;
         const raw_start = std.math.add(
-            epoch_offset % @as(u64, @intCast(self.payload.len)),
-            (rank_offset + batch_offset) % @as(u64, @intCast(self.payload.len)),
+            u64,
+            epoch_offset % payload_len_u64,
+            wrapped_rank_batch % payload_len_u64,
         ) catch return Error.IntegerOverflow;
-        const start = std.math.cast(usize, raw_start % @as(u64, @intCast(self.payload.len))) orelse return Error.IntegerOverflow;
-        const needed = std.math.add(usize, stride, 1) catch return Error.IntegerOverflow;
+        const start = std.math.cast(usize, raw_start % payload_len_u64) orelse return Error.IntegerOverflow;
+        const needed_u64 = std.math.add(u64, stride, 1) catch return Error.IntegerOverflow;
+        const needed = std.math.cast(usize, needed_u64) orelse return Error.IntegerOverflow;
         if (needed > self.payload.len) return Error.InsufficientTokens;
         const adjusted_start = if (start + needed <= self.payload.len) start else 0;
         return .{ .tokens = self.payload[adjusted_start .. adjusted_start + needed], .global_start = adjusted_start };

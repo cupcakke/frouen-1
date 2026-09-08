@@ -1299,23 +1299,32 @@ pub const InferenceServer = struct {
         }
     }
 
+    fn constantTimeEqual(left: []const u8, right: []const u8) bool {
+        if (left.len != right.len) return false;
+        var difference: u8 = 0;
+        var index: usize = 0;
+        while (index < left.len) : (index += 1) {
+            difference |= left[index] ^ right[index];
+        }
+        return difference == 0;
+    }
+
     fn checkAuthorization(self: *InferenceServer, headers: []const u8, expected_key: []const u8) bool {
         _ = self;
 
+        const header_name = "authorization:";
         var lines = mem.splitSequence(u8, headers, "\r\n");
         while (lines.next()) |line| {
-            if (line.len < 14) continue;
+            if (line.len < header_name.len) continue;
 
-            var lower_buf: [64]u8 = undefined;
-            const prefix = line[0..@min(line.len, 13)];
+            var lower_buf: [header_name.len]u8 = undefined;
             var pi: usize = 0;
-            while (pi < prefix.len) : (pi += 1) {
-                lower_buf[pi] = std.ascii.toLower(prefix[pi]);
+            while (pi < header_name.len) : (pi += 1) {
+                lower_buf[pi] = std.ascii.toLower(line[pi]);
             }
 
-            if (mem.eql(u8, lower_buf[0..13], "authorization:")) {
-                const value_start = mem.indexOf(u8, line, ":") orelse continue;
-                const value = mem.trim(u8, line[value_start + 1 ..], " \t");
+            if (mem.eql(u8, &lower_buf, header_name)) {
+                const value = mem.trim(u8, line[header_name.len..], " \t");
 
                 if (value.len > 7) {
                     var prefix_lower: [6]u8 = undefined;
@@ -1323,9 +1332,9 @@ pub const InferenceServer = struct {
                     while (bi < 6) : (bi += 1) {
                         prefix_lower[bi] = std.ascii.toLower(value[bi]);
                     }
-                    if (mem.eql(u8, prefix_lower[0..6], "bearer") and (value[6] == ' ' or value[6] == '\t')) {
+                    if (mem.eql(u8, &prefix_lower, "bearer") and (value[6] == ' ' or value[6] == '\t')) {
                         const token = mem.trim(u8, value[7..], " \t");
-                        return mem.eql(u8, token, expected_key);
+                        return constantTimeEqual(token, expected_key);
                     }
                 }
             }

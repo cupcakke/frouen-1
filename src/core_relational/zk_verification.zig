@@ -906,7 +906,7 @@ pub const RangeProof = struct {
 
         const range = @as(u128, @intCast(self.max_value)) - @as(u128, @intCast(self.min_value));
         const bits_needed: usize = if (range == 0) 1 else blk: {
-            const bits = std.math.bitSizeOf(u128) - @clz(range);
+            const bits = @as(usize, @bitSizeOf(u128)) - @as(usize, @clz(range));
             break :blk @min(bits, 127);
         };
 

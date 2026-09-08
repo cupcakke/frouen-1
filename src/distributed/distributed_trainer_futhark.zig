@@ -446,12 +446,20 @@ const StepSynchronizer = struct {
         defer job.fused.deinit();
         try ctx.sync();
         if (trainer.coordinator.world_size > 1) {
-            const gradients = try job.fused.gradientDeviceBuffers();
+            var gradients = try job.fused.gradientDeviceBuffers();
+            defer {
+                gradients[0].deinit();
+                gradients[1].deinit();
+            }
+            try gradients[0].requireSameContext(ctx);
+            try gradients[1].requireSameContext(ctx);
             {
                 trainer.nccl_mutex.lock();
                 defer trainer.nccl_mutex.unlock();
-                try trainer.coordinator.allReduceFloat32(gradients[0].ptr, gradients[0].ptr, gradients[0].count);
-                try trainer.coordinator.allReduceFloat32(gradients[1].ptr, gradients[1].ptr, gradients[1].count);
+                const gradient_s_ptr = try gradients[0].rawPointer();
+                const gradient_t_ptr = try gradients[1].rawPointer();
+                try trainer.coordinator.allReduceFloat32(gradient_s_ptr, gradient_s_ptr, gradients[0].elementCount());
+                try trainer.coordinator.allReduceFloat32(gradient_t_ptr, gradient_t_ptr, gradients[1].elementCount());
                 try trainer.coordinator.synchronize();
             }
         }
@@ -475,15 +483,18 @@ const StepSynchronizer = struct {
                         try embedding.scaleGradient(gradient_scale);
                     }
                     try ctx.sync();
-                    const gradient = gradient_buffer: {
+                    var gradient = gradient_buffer: {
                         ctx.mutex.lock();
                         defer ctx.mutex.unlock();
                         break :gradient_buffer try embedding.getGradientDevicePtrF32();
                     };
+                    defer gradient.deinit();
+                    try gradient.requireSameContext(ctx);
                     {
                         trainer.nccl_mutex.lock();
                         defer trainer.nccl_mutex.unlock();
-                        try trainer.coordinator.allReduceFloat32(gradient.ptr, gradient.ptr, gradient.count);
+                        const gradient_ptr = try gradient.rawPointer();
+                        try trainer.coordinator.allReduceFloat32(gradient_ptr, gradient_ptr, gradient.elementCount());
                         try trainer.coordinator.synchronize();
                     }
                 }
@@ -925,8 +936,12 @@ pub const DistributedTrainerFuthark = struct {
     }
     fn resetSpectralState(self: *DistributedTrainerFuthark) void {
         const ctx = &self.accelerator.ctx;
-        if (self.gpu_spectral_u) |*u| u.free(ctx);
-        if (self.gpu_spectral_v) |*v| v.free(ctx);
+        if (self.gpu_spectral_u) |*u| {
+            u.free(ctx) catch |err| std.log.err("distributed trainer: releasing spectral u vector failed: {s}", .{@errorName(err)});
+        }
+        if (self.gpu_spectral_v) |*v| {
+            v.free(ctx) catch |err| std.log.err("distributed trainer: releasing spectral v vector failed: {s}", .{@errorName(err)});
+        }
         self.gpu_spectral_u = null;
         self.gpu_spectral_v = null;
     }
@@ -1608,15 +1623,15 @@ pub const DistributedTrainerFuthark = struct {
             context.mutex.lock();
             defer context.mutex.unlock();
             var inputs = try embedding.forwardPadded(prepared.flat_input_tokens, prepared.real_sequence_lengths, prepared.sequence_length);
-            errdefer inputs.free(context);
+            errdefer inputs.free(context) catch |err| std.log.err("distributed trainer: releasing padded input embeddings failed: {s}", .{@errorName(err)});
             const targets = if (self.target_source) |*frozen_source|
                 try frozen_source.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length)
             else
                 try embedding.forwardPadded(prepared.flat_target_tokens, prepared.real_sequence_lengths, prepared.sequence_length);
             break :embedding_block BatchTensors{ .inputs = inputs, .targets = targets };
         } else return TrainerError.InvalidTrainingState;
-        defer tensors.inputs.free(&self.accelerator.ctx);
-        defer tensors.targets.free(&self.accelerator.ctx);
+        defer tensors.inputs.free(&self.accelerator.ctx) catch |err| std.log.err("distributed trainer: releasing padded input embeddings failed: {s}", .{@errorName(err)});
+        defer tensors.targets.free(&self.accelerator.ctx) catch |err| std.log.err("distributed trainer: releasing padded target embeddings failed: {s}", .{@errorName(err)});
         const completed_step = std.math.add(u64, self.global_step, 1) catch return TrainerError.ValueOverflow;
         const warmup_factor: f32 = if (self.config.optimizer_warmup_steps > 0 and completed_step < self.config.optimizer_warmup_steps)
             @as(f32, @floatFromInt(completed_step)) / @as(f32, @floatFromInt(self.config.optimizer_warmup_steps))
@@ -2531,7 +2546,7 @@ pub const DistributedTrainerFuthark = struct {
         @memset(v_cpu, initial_v);
         const ctx = &self.accelerator.ctx;
         var new_u = try accel.FutharkArray1DF32.newFromSlice(ctx, u_cpu);
-        errdefer new_u.free(ctx);
+        errdefer new_u.free(ctx) catch |err| std.log.err("distributed trainer: releasing spectral u vector failed: {s}", .{@errorName(err)});
         const new_v = try accel.FutharkArray1DF32.newFromSlice(ctx, v_cpu);
         self.gpu_spectral_u = new_u;
         self.gpu_spectral_v = new_v;

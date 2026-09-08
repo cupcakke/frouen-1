@@ -1,63 +1,140 @@
 const std = @import("std");
 
+const AccelConfig = struct {
+    include: std.Build.LazyPath,
+    kernels_c: std.Build.LazyPath,
+    abi_check_c: std.Build.LazyPath,
+    cflags: []const []const u8,
+    codegen: ?*std.Build.Step,
+    gpu: bool,
+    options: *std.Build.Step.Options,
+    core_relational: *std.Build.Module,
+    tensor_core: *std.Build.Module,
+};
+
+fn linkCudaRuntime(artifact: *std.Build.Step.Compile, with_nccl: bool) void {
+    artifact.addIncludePath(.{ .cwd_relative = "/usr/local/cuda/include" });
+    artifact.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64" });
+    artifact.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64/stubs" });
+    artifact.linkSystemLibrary("cuda");
+    artifact.linkSystemLibrary("cudart");
+    artifact.linkSystemLibrary("nvrtc");
+    artifact.linkSystemLibrary("cublas");
+    artifact.linkSystemLibrary("cublasLt");
+    if (with_nccl) artifact.linkSystemLibrary("nccl");
+    artifact.linkSystemLibrary("m");
+    artifact.linkSystemLibrary("pthread");
+    artifact.linkSystemLibrary("dl");
+}
+
+fn applyAccel(artifact: *std.Build.Step.Compile, cfg: AccelConfig, with_nccl: bool) void {
+    artifact.linkLibC();
+    artifact.addIncludePath(cfg.include);
+    artifact.addCSourceFile(.{ .file = cfg.kernels_c, .flags = cfg.cflags });
+    artifact.addCSourceFile(.{ .file = cfg.abi_check_c, .flags = cfg.cflags });
+    if (cfg.codegen) |step| artifact.step.dependOn(step);
+    if (cfg.gpu) linkCudaRuntime(artifact, with_nccl);
+    artifact.root_module.addOptions("build_options", cfg.options);
+    artifact.root_module.addImport("core_relational", cfg.core_relational);
+    artifact.root_module.addImport("tensor_core_matmul", cfg.tensor_core);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const gpu_enabled = b.option(bool, "gpu", "Enable GPU/CUDA via Futhark CUDA backend") orelse false;
-    const zk_enabled = b.option(bool, "zk", "Compile Circom ZK circuits") orelse false;
-    const verify_enabled = b.option(bool, "verify", "Run Lean verification") orelse false;
-    const rtl_enabled = b.option(bool, "rtl", "Compile Haskell RTL simulation") orelse false;
-    const skip_futhark = b.option(bool, "skip-futhark", "Skip running futhark codegen (assume generated files are present)") orelse false;
+    const gpu_enabled = b.option(bool, "gpu", "Enable GPU/CUDA via the Futhark CUDA backend") orelse false;
+    const zk_enabled = b.option(bool, "zk", "Compile the Circom zero-knowledge circuits") orelse false;
+    const verify_enabled = b.option(bool, "verify", "Build the Lean formal verification project") orelse false;
+    const rtl_enabled = b.option(bool, "rtl", "Compile the Clash RTL modules and link the RTL simulator") orelse false;
+    const skip_futhark = b.option(bool, "skip-futhark", "Assume the generated Futhark C sources are already present") orelse false;
+    const circom_lib_dir = b.option([]const u8, "circom-lib", "Directory searched for Circom includes") orelse "node_modules";
+    const ptau_entropy = b.option([]const u8, "ptau-entropy", "Entropy string for the powers-of-tau contribution") orelse "jaide-inference-trace-phase1";
+    const clash_bin = b.option([]const u8, "clash", "Clash compiler executable") orelse "clash";
 
-    const cpu_build_options = b.addOptions();
-    cpu_build_options.addOption(bool, "gpu_acceleration", false);
-    cpu_build_options.addOption(bool, "zk_enabled", zk_enabled);
-    cpu_build_options.addOption(bool, "verify_enabled", verify_enabled);
-    cpu_build_options.addOption(bool, "rtl_enabled", rtl_enabled);
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "gpu_acceleration", gpu_enabled);
+    build_options.addOption(bool, "zk_enabled", zk_enabled);
+    build_options.addOption(bool, "verify_enabled", verify_enabled);
+    build_options.addOption(bool, "rtl_enabled", rtl_enabled);
 
-    const gpu_build_options = b.addOptions();
-    gpu_build_options.addOption(bool, "gpu_acceleration", gpu_enabled);
-    gpu_build_options.addOption(bool, "zk_enabled", zk_enabled);
-    gpu_build_options.addOption(bool, "verify_enabled", verify_enabled);
-    gpu_build_options.addOption(bool, "rtl_enabled", rtl_enabled);
+    const accel_dir = "src/hw/accel";
+    const futhark_include = b.path(accel_dir);
 
-    const futhark_c = b.path("src/hw/accel/futhark_kernels.c");
-    const futhark_gpu_c = b.path("src/hw/accel/main_gpu.c");
-    const futhark_include = b.path("src/hw/accel");
-    const accel_dir_path = "src/hw/accel";
+    const futhark_sync_step = b.addSystemCommand(&.{ "futhark", "pkg", "sync" });
+    futhark_sync_step.setCwd(b.path(accel_dir));
 
-    const futhark_cpu_step = b.addSystemCommand(&.{
-        "futhark",
-        "c",
-        "--library",
-        "futhark_kernels.fut",
-        "-o",
-        "futhark_kernels",
-    });
-    futhark_cpu_step.setCwd(b.path(accel_dir_path));
+    const main_cpu_step = b.addSystemCommand(&.{ "futhark", "c", "--library", "main.fut", "-o", "main_cpu" });
+    main_cpu_step.setCwd(b.path(accel_dir));
+    main_cpu_step.step.dependOn(&futhark_sync_step.step);
 
-    const futhark_gpu_step = b.addSystemCommand(&.{
-        "futhark",
-        "cuda",
-        "--library",
-        "main.fut",
-        "-o",
-        "main_gpu",
-    });
-    futhark_gpu_step.setCwd(b.path(accel_dir_path));
+    const main_gpu_step = b.addSystemCommand(&.{ "futhark", "cuda", "--library", "main.fut", "-o", "main_gpu" });
+    main_gpu_step.setCwd(b.path(accel_dir));
+    main_gpu_step.step.dependOn(&futhark_sync_step.step);
+
+    const kernels_cpu_step = b.addSystemCommand(&.{ "futhark", "c", "--library", "futhark_kernels.fut", "-o", "futhark_kernels" });
+    kernels_cpu_step.setCwd(b.path(accel_dir));
+    kernels_cpu_step.step.dependOn(&futhark_sync_step.step);
+
+    const kernels_gpu_step = b.addSystemCommand(&.{ "futhark", "cuda", "--library", "futhark_kernels.fut", "-o", "futhark_kernels_cuda" });
+    kernels_gpu_step.setCwd(b.path(accel_dir));
+    kernels_gpu_step.step.dependOn(&futhark_sync_step.step);
+
+    const futhark_check_step = b.addSystemCommand(&.{ "futhark", "check", "main.fut", "futhark_kernels.fut" });
+    futhark_check_step.setCwd(b.path(accel_dir));
+    futhark_check_step.step.dependOn(&futhark_sync_step.step);
+
+    const futhark_test_step = b.addSystemCommand(&.{ "futhark", "test", "--backend=c", "main.fut" });
+    futhark_test_step.setCwd(b.path(accel_dir));
+    futhark_test_step.step.dependOn(&futhark_sync_step.step);
+
+    const regenerate_futhark_step = b.step("regen-futhark", "Regenerate every Futhark C source from the .fut definitions");
+    regenerate_futhark_step.dependOn(&main_cpu_step.step);
+    regenerate_futhark_step.dependOn(&main_gpu_step.step);
+    regenerate_futhark_step.dependOn(&kernels_cpu_step.step);
+    regenerate_futhark_step.dependOn(&kernels_gpu_step.step);
+
+    const futhark_lint_step = b.step("futhark-check", "Type check every Futhark source");
+    futhark_lint_step.dependOn(&futhark_check_step.step);
+
+    const futhark_unit_step = b.step("futhark-test", "Run the Futhark property tests on the CPU backend");
+    futhark_unit_step.dependOn(&futhark_test_step.step);
+
+    const cpu_cflags = [_][]const u8{ "-O2", "-std=c11" };
+    const gpu_cflags = [_][]const u8{ "-O2", "-std=c11", "-DJAIDE_FUTHARK_CUDA" };
 
     const core_relational_mod = b.createModule(.{
         .root_source_file = b.path("src/core_relational/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
+    core_relational_mod.addOptions("build_options", build_options);
 
     const tensor_core_mod = b.createModule(.{
         .root_source_file = b.path("src/hw/accel/tensor_core_matmul.zig"),
         .target = target,
         .optimize = optimize,
     });
+    tensor_core_mod.addOptions("build_options", build_options);
+
+    const tokenizer_mod = b.createModule(.{
+        .root_source_file = b.path("src/tokenizer/mgt.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tokenizer_mod.addOptions("build_options", build_options);
+
+    const accel: AccelConfig = .{
+        .include = futhark_include,
+        .kernels_c = if (gpu_enabled) b.path(accel_dir ++ "/main_gpu.c") else b.path(accel_dir ++ "/main_cpu.c"),
+        .abi_check_c = b.path(accel_dir ++ "/futhark_abi_check.c"),
+        .cflags = if (gpu_enabled) &gpu_cflags else &cpu_cflags,
+        .codegen = if (skip_futhark) null else if (gpu_enabled) &main_gpu_step.step else &main_cpu_step.step,
+        .gpu = gpu_enabled,
+        .options = build_options,
+        .core_relational = core_relational_mod,
+        .tensor_core = tensor_core_mod,
+    };
 
     const inference_server_exe = b.addExecutable(.{
         .name = "jaide-inference-server",
@@ -65,22 +142,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    inference_server_exe.linkLibC();
-    inference_server_exe.addIncludePath(futhark_include);
-    inference_server_exe.addCSourceFile(.{
-        .file = futhark_c,
-        .flags = &.{"-O2"},
-    });
-    if (!skip_futhark) {
-        inference_server_exe.step.dependOn(&futhark_cpu_step.step);
-    }
-    inference_server_exe.root_module.addOptions("build_options", cpu_build_options);
-    inference_server_exe.root_module.addImport("core_relational", core_relational_mod);
-    inference_server_exe.root_module.addImport("tensor_core_matmul", tensor_core_mod);
+    applyAccel(inference_server_exe, accel, false);
     b.installArtifact(inference_server_exe);
     const inference_server_step = b.step("inference-server", "Build the inference server");
-    inference_server_step.dependOn(&b.addInstallArtifact(inference_server_exe, .{}).step);
+    inference_server_step.dependOn(&inference_server_exe.step);
 
+    const distributed_futhark_step = b.step("distributed-futhark", "Build the Futhark-accelerated distributed trainer");
     if (gpu_enabled) {
         const distributed_futhark_exe = b.addExecutable(.{
             .name = "jaide-distributed-futhark",
@@ -88,45 +155,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        distributed_futhark_exe.linkLibC();
-        distributed_futhark_exe.addCSourceFile(.{
-            .file = futhark_gpu_c,
-            .flags = &.{"-O2"},
-        });
-        distributed_futhark_exe.addCSourceFile(.{
-            .file = b.path("src/hw/accel/futhark_abi_check.c"),
-            .flags = &.{ "-O2", "-std=c11" },
-        });
-        distributed_futhark_exe.addIncludePath(futhark_include);
-        distributed_futhark_exe.addIncludePath(.{
-            .cwd_relative = "/usr/local/cuda/include",
-        });
-        distributed_futhark_exe.addLibraryPath(.{
-            .cwd_relative = "/usr/local/cuda/lib64",
-        });
-        distributed_futhark_exe.addLibraryPath(.{
-            .cwd_relative = "/usr/local/cuda/lib64/stubs",
-        });
-        distributed_futhark_exe.linkSystemLibrary("cuda");
-        distributed_futhark_exe.linkSystemLibrary("cudart");
-        distributed_futhark_exe.linkSystemLibrary("nvrtc");
-        distributed_futhark_exe.linkSystemLibrary("cublas");
-        distributed_futhark_exe.linkSystemLibrary("cublasLt");
-        distributed_futhark_exe.linkSystemLibrary("nccl");
-        distributed_futhark_exe.linkSystemLibrary("m");
-        distributed_futhark_exe.linkSystemLibrary("pthread");
-        distributed_futhark_exe.linkSystemLibrary("dl");
-        distributed_futhark_exe.root_module.addOptions("build_options", gpu_build_options);
-        distributed_futhark_exe.root_module.addImport("core_relational", core_relational_mod);
-        distributed_futhark_exe.root_module.addImport("tensor_core_matmul", tensor_core_mod);
-
-        if (!skip_futhark) {
-            distributed_futhark_exe.step.dependOn(&futhark_gpu_step.step);
-        }
-
-        const distributed_futhark_install = b.addInstallArtifact(distributed_futhark_exe, .{});
-        const distributed_futhark_step = b.step("distributed-futhark", "Build only the Futhark-accelerated distributed trainer");
-        distributed_futhark_step.dependOn(&distributed_futhark_install.step);
+        applyAccel(distributed_futhark_exe, accel, true);
+        b.installArtifact(distributed_futhark_exe);
+        distributed_futhark_step.dependOn(&distributed_futhark_exe.step);
+    } else {
+        const distributed_futhark_unavailable = b.addFail("jaide-distributed-futhark requires CUDA and NCCL; configure with -Dgpu=true");
+        distributed_futhark_step.dependOn(&distributed_futhark_unavailable.step);
     }
 
     const pretokenize_exe = b.addExecutable(.{
@@ -135,14 +169,55 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    pretokenize_exe.root_module.addOptions("build_options", cpu_build_options);
+    pretokenize_exe.linkLibC();
+    pretokenize_exe.root_module.addOptions("build_options", build_options);
+    pretokenize_exe.root_module.addImport("core_relational", core_relational_mod);
+    pretokenize_exe.root_module.addImport("tensor_core_matmul", tensor_core_mod);
+    pretokenize_exe.root_module.addImport("tokenizer", tokenizer_mod);
     b.installArtifact(pretokenize_exe);
     const pretokenize_step = b.step("pretokenize", "Build the binary dataset pre-tokenizer");
-    pretokenize_step.dependOn(&b.addInstallArtifact(pretokenize_exe, .{}).step);
+    pretokenize_step.dependOn(&pretokenize_exe.step);
 
-    const regenerate_futhark_step = b.step("regen-futhark", "Regenerate both CPU and CUDA Futhark C sources from .fut files");
-    regenerate_futhark_step.dependOn(&futhark_cpu_step.step);
-    regenerate_futhark_step.dependOn(&futhark_gpu_step.step);
+    const c_api_lib = b.addStaticLibrary(.{
+        .name = "jaide",
+        .root_source_file = b.path("src/core_relational/c_api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_api_lib.linkLibC();
+    c_api_lib.root_module.addOptions("build_options", build_options);
+    c_api_lib.installHeader(b.path("src/core_relational/jaide.h"), "jaide.h");
+    b.installArtifact(c_api_lib);
+    const c_api_step = b.step("c-api", "Build the JAIDE C API static library");
+    c_api_step.dependOn(&c_api_lib.step);
+
+    const semantic_check_obj = b.addObject(.{
+        .name = "jaide-semantic-check",
+        .root_source_file = b.path("src/semantic_check_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    semantic_check_obj.linkLibC();
+    semantic_check_obj.addIncludePath(futhark_include);
+    semantic_check_obj.root_module.addOptions("build_options", build_options);
+    semantic_check_obj.root_module.addImport("core_relational", core_relational_mod);
+    semantic_check_obj.root_module.addImport("tensor_core_matmul", tensor_core_mod);
+
+    const distributed_check_obj = b.addObject(.{
+        .name = "jaide-distributed-check",
+        .root_source_file = b.path("src/main_distributed_futhark.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    distributed_check_obj.linkLibC();
+    distributed_check_obj.addIncludePath(futhark_include);
+    distributed_check_obj.root_module.addOptions("build_options", build_options);
+    distributed_check_obj.root_module.addImport("core_relational", core_relational_mod);
+    distributed_check_obj.root_module.addImport("tensor_core_matmul", tensor_core_mod);
+
+    const check_step = b.step("check", "Semantically analyse every Zig module without linking");
+    check_step.dependOn(&semantic_check_obj.step);
+    check_step.dependOn(&distributed_check_obj.step);
 
     const TestSpec = struct {
         step: []const u8,
@@ -172,7 +247,7 @@ pub fn build(b: *std.Build) void {
         .{ .step = "stress-refcount", .wrapper = "src/test_root_stress_refcount.zig", .desc = "Run tensor refcount stress test" },
     };
 
-    const test_all_step = b.step("test-all", "Run all tests");
+    const test_all_step = b.step("test-all", "Run every test suite");
 
     inline for (test_specs) |spec| {
         const test_artifact = b.addTest(.{
@@ -180,20 +255,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        test_artifact.linkLibC();
-        test_artifact.addCSourceFile(.{
-            .file = futhark_c,
-            .flags = &.{"-O2"},
-        });
-        test_artifact.addIncludePath(futhark_include);
-
-        if (!skip_futhark) {
-            test_artifact.step.dependOn(&futhark_cpu_step.step);
-        }
-
-        test_artifact.root_module.addOptions("build_options", cpu_build_options);
-        test_artifact.root_module.addImport("core_relational", core_relational_mod);
-        test_artifact.root_module.addImport("tensor_core_matmul", tensor_core_mod);
+        applyAccel(test_artifact, accel, gpu_enabled);
 
         const run = b.addRunArtifact(test_artifact);
         const step = b.step(spec.step, spec.desc);
@@ -208,37 +270,78 @@ pub fn build(b: *std.Build) void {
     });
     c_api_test.addCSourceFile(.{
         .file = b.path("src/tests/c_api_test.c"),
-        .flags = &.{"-O2"},
+        .flags = &cpu_cflags,
     });
     c_api_test.addIncludePath(b.path("src/core_relational"));
+    c_api_test.linkLibrary(c_api_lib);
     c_api_test.linkLibC();
     b.installArtifact(c_api_test);
 
     const c_api_test_run = b.addRunArtifact(c_api_test);
-    const c_api_test_step = b.step("test-c-api", "Run C API test");
+    const c_api_test_step = b.step("test-c-api", "Run the JAIDE C API conformance test");
     c_api_test_step.dependOn(&c_api_test_run.step);
     test_all_step.dependOn(&c_api_test_run.step);
 
     if (zk_enabled) {
-        const circom_step = b.addSystemCommand(&.{
-            "circom",
-            "src/zk/inference_trace.circom",
-            "--r1cs",
-            "--wasm",
-            "--sym",
-            "-o",
-            "src/zk/",
+        const ptau_new = b.addSystemCommand(&.{
+            "snarkjs",
+            "powersoftau",
+            "new",
+            "bn128",
+            "18",
+            "src/zk/pot18_0000.ptau",
+            "-v",
         });
+
+        const ptau_contribute = b.addSystemCommand(&.{
+            "snarkjs",
+            "powersoftau",
+            "contribute",
+            "src/zk/pot18_0000.ptau",
+            "src/zk/pot18_0001.ptau",
+            "--name=jaide-inference-trace",
+            "-v",
+        });
+        ptau_contribute.addArg(b.fmt("-e={s}", .{ptau_entropy}));
+        ptau_contribute.step.dependOn(&ptau_new.step);
+
+        const ptau_prepare = b.addSystemCommand(&.{
+            "snarkjs",
+            "powersoftau",
+            "prepare",
+            "phase2",
+            "src/zk/pot18_0001.ptau",
+            "src/zk/pot18_final.ptau",
+            "-v",
+        });
+        ptau_prepare.step.dependOn(&ptau_contribute.step);
+
+        const circom_step = b.addSystemCommand(&.{"circom"});
+        circom_step.addArg("src/zk/inference_trace.circom");
+        circom_step.addArg("--r1cs");
+        circom_step.addArg("--wasm");
+        circom_step.addArg("--sym");
+        circom_step.addArg("-l");
+        circom_step.addArg(circom_lib_dir);
+        circom_step.addArg("-o");
+        circom_step.addArg("src/zk/");
+
+        const zk_witness_test = b.addSystemCommand(&.{ "node", "src/zk/test/inference_trace.test.js" });
+        zk_witness_test.step.dependOn(&circom_step.step);
+
+        const zk_test_step = b.step("test-zk", "Check the inference trace circuit against reference witnesses");
+        zk_test_step.dependOn(&zk_witness_test.step);
 
         const snarkjs_setup = b.addSystemCommand(&.{
             "snarkjs",
             "groth16",
             "setup",
             "src/zk/inference_trace.r1cs",
-            "pot12_final.ptau",
+            "src/zk/pot18_final.ptau",
             "src/zk/inference_trace.zkey",
         });
         snarkjs_setup.step.dependOn(&circom_step.step);
+        snarkjs_setup.step.dependOn(&ptau_prepare.step);
 
         const snarkjs_vkey = b.addSystemCommand(&.{
             "snarkjs",
@@ -250,32 +353,48 @@ pub fn build(b: *std.Build) void {
         });
         snarkjs_vkey.step.dependOn(&snarkjs_setup.step);
 
-        const zk_step = b.step("zk", "Compile ZK circuits");
+        const zk_step = b.step("zk", "Compile the zero-knowledge circuits and export the verification key");
         zk_step.dependOn(&snarkjs_vkey.step);
     }
 
     if (verify_enabled) {
-        const lean_step = b.addSystemCommand(&.{
-            "lake",
-            "build",
-        });
-        lean_step.setCwd(b.path("src/verification"));
+        const lake_step = b.addSystemCommand(&.{ "lake", "build" });
+        lake_step.setCwd(b.path("src/verification"));
 
-        const verify_step = b.step("verify", "Run Lean formal verification");
-        verify_step.dependOn(&lean_step.step);
-        test_all_step.dependOn(&lean_step.step);
+        const verify_step = b.step("verify", "Build the Lean formal verification project");
+        verify_step.dependOn(&lake_step.step);
     }
 
     if (rtl_enabled) {
+        const clash_step = b.addSystemCommand(&.{clash_bin});
+        clash_step.addArg("--verilog");
+        clash_step.addArg("-isrc/hw/rtl");
+        clash_step.addArg("-outputdir");
+        clash_step.addArg("src/hw/rtl/verilog");
+        clash_step.addArg("src/hw/rtl/MemoryArbiter.hs");
+        clash_step.addArg("src/hw/rtl/RankerCore.hs");
+        clash_step.addArg("src/hw/rtl/SSISearch.hs");
+
         const ghc_step = b.addSystemCommand(&.{
             "ghc",
             "-O2",
             "-dynamic",
             "-shared",
             "-fPIC",
+            "-no-hs-main",
+            "-package",
+            "clash-prelude",
+            "-package",
+            "base",
+            "-isrc/hw/rtl",
+            "-outputdir",
+            "src/hw/rtl/build",
+            "-hidir",
+            "src/hw/rtl/build",
             "src/hw/rtl/MemoryArbiter.hs",
             "src/hw/rtl/RankerCore.hs",
             "src/hw/rtl/SSISearch.hs",
+            "src/hw/rtl/RtlExports.hs",
             "-o",
             "src/hw/rtl/librtl_sim.so",
         });
@@ -287,12 +406,24 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         rtl_exe.linkLibC();
+        rtl_exe.root_module.addOptions("build_options", build_options);
+        rtl_exe.addLibraryPath(b.path("src/hw/rtl"));
+        rtl_exe.linkSystemLibrary("rtl_sim");
+        rtl_exe.addRPath(b.path("src/hw/rtl"));
         rtl_exe.step.dependOn(&ghc_step.step);
-        b.installArtifact(rtl_exe);
 
         const rtl_install = b.addInstallArtifact(rtl_exe, .{});
-        const rtl_step = b.step("rtl", "Build Haskell RTL simulation");
+
+        const rtl_step = b.step("rtl", "Build the Clash RTL library and the RTL simulator");
         rtl_step.dependOn(&rtl_install.step);
+
+        const rtl_verilog_step = b.step("rtl-verilog", "Generate Verilog from the Clash RTL modules");
+        rtl_verilog_step.dependOn(&clash_step.step);
+
+        const rtl_run = b.addRunArtifact(rtl_exe);
+        rtl_run.step.dependOn(&rtl_install.step);
+        const rtl_test_step = b.step("test-rtl", "Run the RTL simulator against the Clash models");
+        rtl_test_step.dependOn(&rtl_run.step);
     }
 
     const bench_deps = b.createModule(.{
@@ -300,9 +431,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    bench_deps.addOptions("build_options", cpu_build_options);
+    bench_deps.addOptions("build_options", build_options);
+    bench_deps.addImport("core_relational", core_relational_mod);
+    bench_deps.addImport("tensor_core_matmul", tensor_core_mod);
 
-    const bench_step = b.step("bench", "Run all benchmarks");
+    const bench_step = b.step("bench", "Run every benchmark");
 
     const bench_sources = [_]struct {
         name: []const u8,
@@ -321,20 +454,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        executable.linkLibC();
-        executable.addIncludePath(futhark_include);
-        executable.addCSourceFile(.{
-            .file = futhark_c,
-            .flags = &.{"-O2"},
-        });
-
-        if (!skip_futhark) {
-            executable.step.dependOn(&futhark_cpu_step.step);
-        }
-
-        executable.root_module.addOptions("build_options", cpu_build_options);
+        applyAccel(executable, accel, gpu_enabled);
         executable.root_module.addImport("deps", bench_deps);
-        executable.root_module.addImport("tensor_core_matmul", tensor_core_mod);
         b.installArtifact(executable);
 
         const run = b.addRunArtifact(executable);

@@ -1431,7 +1431,12 @@ pub const ChaosCoreKernel = struct {
         return task_id;
     }
 
-    pub fn getInferenceTaskResult(self: *ChaosCoreKernel, task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8) ?struct { completed: bool, duration: i128 } {
+    pub const TaskResult = struct {
+        completed: bool,
+        duration: i128,
+    };
+
+    pub fn getInferenceTaskResult(self: *ChaosCoreKernel, task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8) ?TaskResult {
         if (self.scheduler.active_tasks.get(task_id)) |task| {
             return .{ .completed = task.completion_status, .duration = task.getDuration() };
         }
@@ -1449,7 +1454,7 @@ pub const ChaosCoreKernel = struct {
             return self.kernel.createInferenceTask(priority, deps, cycles, context_id);
         }
 
-        pub fn getTaskResult(self: *const InferenceHooks, task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8) ?struct { completed: bool, duration: i128 } {
+        pub fn getTaskResult(self: *const InferenceHooks, task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8) ?TaskResult {
             return self.kernel.getInferenceTaskResult(task_id);
         }
 

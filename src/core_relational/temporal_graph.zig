@@ -30,6 +30,11 @@ const StringContext = struct {
     }
 };
 
+pub const VersionProperty = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const NodeVersion = struct {
     version: usize,
     timestamp: Timestamp,
@@ -59,7 +64,7 @@ pub const NodeVersion = struct {
         version_num: usize,
         timestamp_ns: Timestamp,
         quantum_data: QuantumState,
-        props: []const struct { key: []const u8, value: []const u8 },
+        props: []const VersionProperty,
     ) !Self {
         var self = Self{
             .version = version_num,
@@ -134,11 +139,11 @@ pub const NodeVersion = struct {
     }
 
     pub fn probability(self: *const Self) f64 {
-        return self.data.probability();
+        return self.data.totalProbability();
     }
 
     pub fn magnitude(self: *const Self) f64 {
-        return self.data.magnitude();
+        return self.data.totalMagnitude();
     }
 };
 
@@ -271,7 +276,7 @@ pub const TemporalNode = struct {
         self: *Self,
         state: QuantumState,
         timestamp_ns: Timestamp,
-        props: []const struct { key: []const u8, value: []const u8 },
+        props: []const VersionProperty,
     ) !usize {
         const new_version_num = self.versions.items.len;
         const new_version = try NodeVersion.initWithProperties(

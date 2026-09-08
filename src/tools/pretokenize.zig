@@ -1,6 +1,6 @@
 const std = @import("std");
-const MGT = @import("tokenizer").MGT;
-const dataset = @import("mmap_token_dataset");
+const MGT = @import("../tokenizer/mgt.zig").MGT;
+const dataset = @import("../distributed/mmap_token_dataset.zig");
 
 const CliError = error{
     InvalidArguments,
