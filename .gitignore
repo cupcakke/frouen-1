@@ -44,3 +44,5 @@ venv/
 .jaide-inference-tokenizer-*.vocab
 *.bak
 *.tmp
+
+*.profraw
