@@ -52,7 +52,7 @@ theorem add_add_self (a b : α) : a + b + (b - a) = b + b :=
     _ = b + b + a - a := congrArg (fun t => t - a) (RSFScalar.add_comm a (b + b))
     _ = b + b := RSFScalar.add_sub_cancel (b + b) a
 
-def unitModel : RSFScalar Unit where
+instance unitModel : RSFScalar Unit where
   add _ _ := ()
   sub _ _ := ()
   mul _ _ := ()
