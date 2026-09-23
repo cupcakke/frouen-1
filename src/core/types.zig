@@ -560,6 +560,13 @@ pub const Error = error{
     InvalidArgument,
     WindowFull,
     Overflow,
+    RSFBindingRequired,
+    RSFSpaceMismatch,
+    RSFModelMismatch,
+    RSFLayerMismatch,
+    RSFDimMismatch,
+    InvalidCausalMask,
+    InvalidDiffusionLayout,
 };
 
 pub fn clamp(comptime T: type, value: T, min_val: T, max_val: T) T {
@@ -1984,4 +1991,535 @@ test "norm and lerp with floats" {
 test "log2 with floats" {
     const result = log2(f32, 8.0);
     try testing.expectApproxEqAbs(@as(f64, 3.0), result, 0.01);
+}
+
+pub const RSFSpace = enum(u8) {
+    layer_weight_s,
+    layer_weight_t,
+    latent_state,
+    gradient,
+    fisher,
+    fisher_block,
+    momentum,
+    master_weight,
+    ranker_head,
+    index_payload,
+
+    pub fn columns(self: RSFSpace) usize {
+        return switch (self) {
+            .layer_weight_s, .layer_weight_t, .latent_state, .gradient, .momentum, .master_weight, .ranker_head => 2,
+            .fisher => 2,
+            .fisher_block => 3,
+            .index_payload => 1,
+        };
+    }
+
+    pub fn isLayerBound(self: RSFSpace) bool {
+        return switch (self) {
+            .layer_weight_s, .layer_weight_t, .gradient, .fisher, .fisher_block, .momentum, .master_weight => true,
+            .latent_state, .ranker_head, .index_payload => false,
+        };
+    }
+};
+
+pub const RSFBindingError = error{
+    RSFBindingRequired,
+    RSFSpaceMismatch,
+    RSFModelMismatch,
+    RSFLayerMismatch,
+    RSFDimMismatch,
+};
+
+pub const RSFBinding = struct {
+    space: RSFSpace,
+    model_id: u64,
+    layer_index: ?usize,
+    dim: usize,
+
+    pub fn detached(space: RSFSpace, dim: usize) RSFBinding {
+        return .{ .space = space, .model_id = 0, .layer_index = null, .dim = dim };
+    }
+
+    pub fn layer(space: RSFSpace, model_id: u64, layer_index: usize, dim: usize) RSFBinding {
+        return .{ .space = space, .model_id = model_id, .layer_index = layer_index, .dim = dim };
+    }
+
+    pub fn model(space: RSFSpace, model_id: u64, dim: usize) RSFBinding {
+        return .{ .space = space, .model_id = model_id, .layer_index = null, .dim = dim };
+    }
+
+    pub fn eql(self: RSFBinding, other: RSFBinding) bool {
+        if (self.space != other.space) return false;
+        if (self.model_id != other.model_id) return false;
+        if (self.dim != other.dim) return false;
+        if (self.layer_index == null or other.layer_index == null) {
+            return self.layer_index == null and other.layer_index == null;
+        }
+        return self.layer_index.? == other.layer_index.?;
+    }
+
+    pub fn rowLen(self: RSFBinding) usize {
+        return self.dim * self.space.columns();
+    }
+
+    pub fn requireSpace(self: RSFBinding, expected: RSFSpace) RSFBindingError!void {
+        if (self.space != expected) return RSFBindingError.RSFSpaceMismatch;
+    }
+
+    pub fn requireModel(self: RSFBinding, expected_model_id: u64) RSFBindingError!void {
+        if (self.model_id == 0 or expected_model_id == 0) return;
+        if (self.model_id != expected_model_id) return RSFBindingError.RSFModelMismatch;
+    }
+
+    pub fn requireLayer(self: RSFBinding, expected_layer: ?usize) RSFBindingError!void {
+        if (expected_layer) |l| {
+            const mine = self.layer_index orelse return RSFBindingError.RSFLayerMismatch;
+            if (mine != l) return RSFBindingError.RSFLayerMismatch;
+            return;
+        }
+        if (self.layer_index != null) return RSFBindingError.RSFLayerMismatch;
+    }
+
+    pub fn requireDim(self: RSFBinding, expected_dim: usize) RSFBindingError!void {
+        if (self.dim != expected_dim) return RSFBindingError.RSFDimMismatch;
+    }
+
+    pub fn require(binding: ?RSFBinding, expected: RSFBinding) RSFBindingError!void {
+        const b = binding orelse return RSFBindingError.RSFBindingRequired;
+        try b.requireSpace(expected.space);
+        try b.requireModel(expected.model_id);
+        try b.requireLayer(expected.layer_index);
+        try b.requireDim(expected.dim);
+    }
+};
+
+pub const RSFDiffusionLayout = struct {
+    row_len: usize,
+    radix: usize,
+    block: usize,
+    stages: usize,
+
+    pub fn butterfliesPerRow(self: RSFDiffusionLayout) usize {
+        return self.radix * self.block * self.stages / 2;
+    }
+
+    pub fn isTrivial(self: RSFDiffusionLayout) bool {
+        return self.stages == 0 and self.radix <= 1;
+    }
+};
+
+pub fn rsfDiffusionLayout(row_len: usize) ?RSFDiffusionLayout {
+    if (row_len == 0) return null;
+    var radix = row_len;
+    var block: usize = 1;
+    while (radix % 2 == 0) {
+        radix /= 2;
+        block *= 2;
+    }
+    var stages: usize = 0;
+    var probe = block;
+    while (probe > 1) {
+        probe /= 2;
+        stages += 1;
+    }
+    return .{ .row_len = row_len, .radix = radix, .block = block, .stages = stages };
+}
+
+pub fn rsfLowerTriangularCount(seq_len: usize) usize {
+    if (seq_len < 2) return 0;
+    const product = std.math.mul(usize, seq_len, seq_len - 1) catch return std.math.maxInt(usize);
+    return product / 2;
+}
+
+pub fn rsfBitmaskWords(seq_len: usize) usize {
+    return (seq_len + 63) / 64;
+}
+
+pub const RSFSequenceMask = struct {
+    seq_len: usize,
+    words_per_row: usize,
+    words: []u64,
+    nnz: usize,
+    full_causal: bool,
+    allocator: Allocator,
+
+    pub fn initZero(allocator: Allocator, seq_len: usize) !RSFSequenceMask {
+        const words_per_row = rsfBitmaskWords(seq_len);
+        const total = try std.math.mul(usize, seq_len, words_per_row);
+        const words = try allocator.alloc(u64, total);
+        @memset(words, 0);
+        return .{
+            .seq_len = seq_len,
+            .words_per_row = words_per_row,
+            .words = words,
+            .nnz = 0,
+            .full_causal = rsfLowerTriangularCount(seq_len) == 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn initCausal(allocator: Allocator, seq_len: usize) !RSFSequenceMask {
+        var mask = try initZero(allocator, seq_len);
+        errdefer mask.deinit();
+        var nnz: usize = 0;
+        for (0..seq_len) |i| {
+            for (0..i) |j| {
+                mask.words[i * mask.words_per_row + j / 64] |= @as(u64, 1) << @as(u6, @intCast(j % 64));
+                nnz += 1;
+            }
+        }
+        mask.nnz = nnz;
+        mask.full_causal = nnz == rsfLowerTriangularCount(seq_len);
+        return mask;
+    }
+
+    pub fn initFromBytes(allocator: Allocator, seq_len: usize, bytes: []const u8) !RSFSequenceMask {
+        const expected = std.math.mul(usize, seq_len, seq_len) catch return Error.InvalidCausalMask;
+        if (bytes.len != expected) return Error.InvalidCausalMask;
+        var mask = try initZero(allocator, seq_len);
+        errdefer mask.deinit();
+        var nnz: usize = 0;
+        for (0..seq_len) |i| {
+            for (0..seq_len) |j| {
+                const value = bytes[i * seq_len + j];
+                if (value != 0 and value != 1) return Error.InvalidCausalMask;
+                if (value == 1) {
+                    if (j >= i) return Error.InvalidCausalMask;
+                    mask.words[i * mask.words_per_row + j / 64] |= @as(u64, 1) << @as(u6, @intCast(j % 64));
+                    nnz += 1;
+                }
+            }
+        }
+        mask.nnz = nnz;
+        mask.full_causal = nnz == rsfLowerTriangularCount(seq_len);
+        return mask;
+    }
+
+    pub fn initBand(allocator: Allocator, seq_len: usize, band: usize) !RSFSequenceMask {
+        var mask = try initZero(allocator, seq_len);
+        errdefer mask.deinit();
+        var nnz: usize = 0;
+        for (0..seq_len) |i| {
+            const first = if (i > band) i - band else 0;
+            for (first..i) |j| {
+                mask.words[i * mask.words_per_row + j / 64] |= @as(u64, 1) << @as(u6, @intCast(j % 64));
+                nnz += 1;
+            }
+        }
+        mask.nnz = nnz;
+        mask.full_causal = nnz == rsfLowerTriangularCount(seq_len);
+        return mask;
+    }
+
+    pub fn set(self: *RSFSequenceMask, i: usize, j: usize) Error!void {
+        if (i >= self.seq_len or j >= self.seq_len) return Error.OutOfBounds;
+        if (j >= i) return Error.InvalidCausalMask;
+        const word = i * self.words_per_row + j / 64;
+        const bit = @as(u64, 1) << @as(u6, @intCast(j % 64));
+        if (self.words[word] & bit == 0) {
+            self.words[word] |= bit;
+            self.nnz += 1;
+            self.full_causal = self.nnz == rsfLowerTriangularCount(self.seq_len);
+        }
+    }
+
+    pub fn get(self: *const RSFSequenceMask, i: usize, j: usize) bool {
+        if (i >= self.seq_len or j >= self.seq_len) return false;
+        const word = self.words[i * self.words_per_row + j / 64];
+        return (word >> @as(u6, @intCast(j % 64))) & 1 != 0;
+    }
+
+    pub fn density(self: *const RSFSequenceMask) f32 {
+        const denominator = rsfLowerTriangularCount(self.seq_len);
+        if (denominator == 0) return 0;
+        return @as(f32, @floatFromInt(self.nnz)) / @as(f32, @floatFromInt(denominator));
+    }
+
+    pub fn rowNnz(self: *const RSFSequenceMask, i: usize) usize {
+        if (i >= self.seq_len) return 0;
+        const base = i * self.words_per_row;
+        var count: usize = 0;
+        for (0..self.words_per_row) |w| count += @popCount(self.words[base + w]);
+        return count;
+    }
+
+    pub fn toBytes(self: *const RSFSequenceMask, allocator: Allocator) ![]u8 {
+        const total = try std.math.mul(usize, self.seq_len, self.seq_len);
+        const out = try allocator.alloc(u8, total);
+        @memset(out, 0);
+        for (0..self.seq_len) |i| {
+            const base = i * self.words_per_row;
+            for (0..self.words_per_row) |w| {
+                var bits = self.words[base + w];
+                while (bits != 0) {
+                    const trailing: usize = @ctz(bits);
+                    bits &= bits - 1;
+                    const j = w * 64 + trailing;
+                    if (j < self.seq_len) out[i * self.seq_len + j] = 1;
+                }
+            }
+        }
+        return out;
+    }
+
+    pub fn rowSetBits(self: *const RSFSequenceMask, i: usize, ctx: anytype, comptime visit: fn (@TypeOf(ctx), usize) void) void {
+        if (i >= self.seq_len) return;
+        const base = i * self.words_per_row;
+        for (0..self.words_per_row) |w| {
+            var bits = self.words[base + w];
+            while (bits != 0) {
+                const trailing: usize = @ctz(bits);
+                bits &= bits - 1;
+                const j = w * 64 + trailing;
+                if (j < self.seq_len) visit(ctx, j);
+            }
+        }
+    }
+
+    pub fn clone(self: *const RSFSequenceMask, allocator: Allocator) !RSFSequenceMask {
+        const words = try allocator.dupe(u64, self.words);
+        return .{
+            .seq_len = self.seq_len,
+            .words_per_row = self.words_per_row,
+            .words = words,
+            .nnz = self.nnz,
+            .full_causal = self.full_causal,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *RSFSequenceMask) void {
+        const words = self.words;
+        self.words = words[0..0];
+        self.allocator.free(words);
+        self.words_per_row = 0;
+        self.seq_len = 0;
+        self.nnz = 0;
+        self.full_causal = false;
+    }
+};
+
+test "rsfDiffusionLayout production geometry" {
+    const layout = rsfDiffusionLayout(98304).?;
+    try testing.expectEqual(@as(usize, 98304), layout.row_len);
+    try testing.expectEqual(@as(usize, 3), layout.radix);
+    try testing.expectEqual(@as(usize, 32768), layout.block);
+    try testing.expectEqual(@as(usize, 15), layout.stages);
+    try testing.expectEqual(layout.row_len, layout.radix * layout.block);
+}
+
+test "rsfDiffusionLayout power of two and small rows" {
+    const pure = rsfDiffusionLayout(32).?;
+    try testing.expectEqual(@as(usize, 1), pure.radix);
+    try testing.expectEqual(@as(usize, 32), pure.block);
+    try testing.expectEqual(@as(usize, 5), pure.stages);
+
+    const mixed = rsfDiffusionLayout(48).?;
+    try testing.expectEqual(@as(usize, 3), mixed.radix);
+    try testing.expectEqual(@as(usize, 16), mixed.block);
+    try testing.expectEqual(@as(usize, 4), mixed.stages);
+
+    const two = rsfDiffusionLayout(2).?;
+    try testing.expectEqual(@as(usize, 1), two.radix);
+    try testing.expectEqual(@as(usize, 2), two.block);
+    try testing.expectEqual(@as(usize, 1), two.stages);
+
+    const one = rsfDiffusionLayout(1).?;
+    try testing.expectEqual(@as(usize, 1), one.radix);
+    try testing.expectEqual(@as(usize, 1), one.block);
+    try testing.expectEqual(@as(usize, 0), one.stages);
+    try testing.expect(one.isTrivial());
+
+    try testing.expect(rsfDiffusionLayout(0) == null);
+}
+
+test "rsfDiffusionLayout butterfly count" {
+    const layout = rsfDiffusionLayout(32).?;
+    try testing.expectEqual(@as(usize, 80), layout.butterfliesPerRow());
+    const small = rsfDiffusionLayout(8).?;
+    try testing.expectEqual(@as(usize, 12), small.butterfliesPerRow());
+}
+
+test "RSFSequenceMask initCausal" {
+    var mask = try RSFSequenceMask.initCausal(testing.allocator, 5);
+    defer mask.deinit();
+    try testing.expectEqual(@as(usize, 10), mask.nnz);
+    try testing.expect(mask.full_causal);
+    try testing.expectEqual(@as(f32, 1.0), mask.density());
+    try testing.expectEqual(@as(usize, 1), mask.words_per_row);
+    for (0..5) |i| {
+        for (0..5) |j| {
+            try testing.expectEqual(j < i, mask.get(i, j));
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), mask.rowNnz(0));
+    try testing.expectEqual(@as(usize, 4), mask.rowNnz(4));
+}
+
+test "RSFSequenceMask initCausal spans multiple words" {
+    var mask = try RSFSequenceMask.initCausal(testing.allocator, 200);
+    defer mask.deinit();
+    try testing.expectEqual(@as(usize, 4), mask.words_per_row);
+    try testing.expectEqual(@as(usize, 19900), mask.nnz);
+    try testing.expect(mask.full_causal);
+    for (0..200) |i| {
+        try testing.expectEqual(i, mask.rowNnz(i));
+        for (0..200) |j| try testing.expectEqual(j < i, mask.get(i, j));
+    }
+}
+
+test "RSFSequenceMask initZero" {
+    var mask = try RSFSequenceMask.initZero(testing.allocator, 4);
+    defer mask.deinit();
+    try testing.expectEqual(@as(usize, 0), mask.nnz);
+    try testing.expect(!mask.full_causal);
+    try testing.expectEqual(@as(f32, 0.0), mask.density());
+    for (0..4) |i| for (0..4) |j| try testing.expect(!mask.get(i, j));
+}
+
+test "RSFSequenceMask initZero degenerate lengths are vacuously causal" {
+    var zero = try RSFSequenceMask.initZero(testing.allocator, 0);
+    defer zero.deinit();
+    try testing.expect(zero.full_causal);
+    try testing.expectEqual(@as(f32, 0.0), zero.density());
+
+    var one = try RSFSequenceMask.initZero(testing.allocator, 1);
+    defer one.deinit();
+    try testing.expect(one.full_causal);
+    try testing.expectEqual(@as(usize, 0), one.nnz);
+}
+
+test "RSFSequenceMask initFromBytes round trip" {
+    const seq_len: usize = 4;
+    const bytes = [_]u8{
+        0, 0, 0, 0,
+        1, 0, 0, 0,
+        1, 0, 0, 0,
+        1, 1, 1, 0,
+    };
+    var mask = try RSFSequenceMask.initFromBytes(testing.allocator, seq_len, &bytes);
+    defer mask.deinit();
+    try testing.expectEqual(@as(usize, 5), mask.nnz);
+    try testing.expect(!mask.full_causal);
+    try testing.expectApproxEqAbs(@as(f32, 5.0 / 6.0), mask.density(), 1e-6);
+    const exported = try mask.toBytes(testing.allocator);
+    defer testing.allocator.free(exported);
+    try testing.expectEqualSlices(u8, &bytes, exported);
+}
+
+test "RSFSequenceMask initFromBytes rejects malformed input" {
+    try testing.expectError(Error.InvalidCausalMask, RSFSequenceMask.initFromBytes(testing.allocator, 3, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }));
+
+    const bad_value = [_]u8{
+        0, 0, 0,
+        2, 0, 0,
+        0, 0, 0,
+    };
+    try testing.expectError(Error.InvalidCausalMask, RSFSequenceMask.initFromBytes(testing.allocator, 3, &bad_value));
+
+    const upper = [_]u8{
+        0, 1, 0,
+        0, 0, 0,
+        0, 0, 0,
+    };
+    try testing.expectError(Error.InvalidCausalMask, RSFSequenceMask.initFromBytes(testing.allocator, 3, &upper));
+
+    const diagonal = [_]u8{
+        0, 0, 0,
+        0, 1, 0,
+        0, 0, 0,
+    };
+    try testing.expectError(Error.InvalidCausalMask, RSFSequenceMask.initFromBytes(testing.allocator, 3, &diagonal));
+}
+
+test "RSFSequenceMask set and band" {
+    var mask = try RSFSequenceMask.initZero(testing.allocator, 6);
+    defer mask.deinit();
+    try mask.set(3, 1);
+    try mask.set(3, 1);
+    try testing.expectEqual(@as(usize, 1), mask.nnz);
+    try testing.expect(mask.get(3, 1));
+    try testing.expectError(Error.InvalidCausalMask, mask.set(2, 4));
+    try testing.expectError(Error.OutOfBounds, mask.set(9, 0));
+
+    var band = try RSFSequenceMask.initBand(testing.allocator, 8, 2);
+    defer band.deinit();
+    try testing.expectEqual(@as(usize, 13), band.nnz);
+    try testing.expect(!band.full_causal);
+    try testing.expect(band.get(7, 6));
+    try testing.expect(band.get(7, 5));
+    try testing.expect(!band.get(7, 4));
+    try testing.expectEqual(@as(usize, 2), band.rowNnz(5));
+}
+
+test "RSFSequenceMask rowSetBits visits ascending" {
+    const Collected = struct {
+        values: [8]usize,
+        count: usize,
+
+        fn visit(self: *@This(), j: usize) void {
+            self.values[self.count] = j;
+            self.count += 1;
+        }
+    };
+    var mask = try RSFSequenceMask.initZero(testing.allocator, 130);
+    defer mask.deinit();
+    try mask.set(129, 0);
+    try mask.set(129, 63);
+    try mask.set(129, 64);
+    try mask.set(129, 128);
+    try mask.set(129, 77);
+    var collected = Collected{ .values = [_]usize{0} ** 8, .count = 0 };
+    mask.rowSetBits(129, &collected, Collected.visit);
+    try testing.expectEqual(@as(usize, 5), collected.count);
+    try testing.expectEqual(@as(usize, 0), collected.values[0]);
+    try testing.expectEqual(@as(usize, 63), collected.values[1]);
+    try testing.expectEqual(@as(usize, 64), collected.values[2]);
+    try testing.expectEqual(@as(usize, 77), collected.values[3]);
+    try testing.expectEqual(@as(usize, 128), collected.values[4]);
+}
+
+test "RSFSequenceMask clone" {
+    var original = try RSFSequenceMask.initCausal(testing.allocator, 9);
+    defer original.deinit();
+    var copy = try original.clone(testing.allocator);
+    defer copy.deinit();
+    try testing.expectEqual(original.nnz, copy.nnz);
+    try testing.expectEqual(original.full_causal, copy.full_causal);
+    try testing.expectEqualSlices(u64, original.words, copy.words);
+}
+
+test "RSFBinding construction and enforcement" {
+    const binding = RSFBinding.layer(.layer_weight_s, 7, 3, 16);
+    try testing.expectEqual(@as(usize, 32), binding.rowLen());
+    try binding.requireSpace(.layer_weight_s);
+    try binding.requireModel(7);
+    try binding.requireLayer(3);
+    try binding.requireDim(16);
+    try testing.expectError(RSFBindingError.RSFSpaceMismatch, binding.requireSpace(.layer_weight_t));
+    try testing.expectError(RSFBindingError.RSFModelMismatch, binding.requireModel(8));
+    try testing.expectError(RSFBindingError.RSFLayerMismatch, binding.requireLayer(4));
+    try testing.expectError(RSFBindingError.RSFLayerMismatch, binding.requireLayer(null));
+    try testing.expectError(RSFBindingError.RSFDimMismatch, binding.requireDim(32));
+
+    const loose = RSFBinding.detached(.latent_state, 16);
+    try testing.expectEqual(@as(u64, 0), loose.model_id);
+    try loose.requireModel(9);
+    try loose.requireLayer(null);
+    try testing.expectError(RSFBindingError.RSFBindingRequired, RSFBinding.require(null, loose));
+    try RSFBinding.require(binding, binding);
+    try testing.expectError(RSFBindingError.RSFModelMismatch, RSFBinding.model(.latent_state, 3, 16).requireModel(4));
+    try RSFBinding.model(.latent_state, 3, 16).requireModel(0);
+    try testing.expect(!binding.eql(loose));
+    try testing.expect(binding.eql(RSFBinding.layer(.layer_weight_s, 7, 3, 16)));
+    try testing.expect(loose.eql(RSFBinding.detached(.latent_state, 16)));
+}
+
+test "RSFSpace column widths" {
+    try testing.expectEqual(@as(usize, 2), RSFSpace.layer_weight_s.columns());
+    try testing.expectEqual(@as(usize, 2), RSFSpace.master_weight.columns());
+    try testing.expectEqual(@as(usize, 3), RSFSpace.fisher_block.columns());
+    try testing.expect(RSFSpace.fisher_block.isLayerBound());
+    try testing.expect(!RSFSpace.latent_state.isLayerBound());
+    try testing.expect(!RSFSpace.index_payload.isLayerBound());
 }

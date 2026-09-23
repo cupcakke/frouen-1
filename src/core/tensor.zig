@@ -2627,3 +2627,1774 @@ test "Tensor inverse and det" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.4), try inverse_tensor.get(&.{ 1, 1 }), 1e-5);
 }
 
+
+pub const coupling_width: usize = 2;
+pub const coupling_weight_column: usize = 0;
+pub const coupling_bias_column: usize = 1;
+pub const rsf_default_clip_min: f32 = -5.0;
+pub const rsf_default_clip_max: f32 = 5.0;
+
+pub const RSFCouplingParams = struct {
+    s_weight: []const f32,
+    t_weight: []const f32,
+    dim: usize,
+    clip_min: f32,
+    clip_max: f32,
+
+    pub fn init(s_weight: []const f32, t_weight: []const f32, dim: usize, clip_min: f32, clip_max: f32) Error!RSFCouplingParams {
+        if (dim == 0) return Error.InvalidShape;
+        if (!(clip_min < clip_max)) return Error.InvalidArgument;
+        const required = std.math.mul(usize, dim, coupling_width) catch return Error.Overflow;
+        if (s_weight.len < required) return Error.InvalidShape;
+        if (t_weight.len < required) return Error.InvalidShape;
+        return .{
+            .s_weight = s_weight,
+            .t_weight = t_weight,
+            .dim = dim,
+            .clip_min = clip_min,
+            .clip_max = clip_max,
+        };
+    }
+
+    pub fn default(s_weight: []const f32, t_weight: []const f32, dim: usize) Error!RSFCouplingParams {
+        return init(s_weight, t_weight, dim, rsf_default_clip_min, rsf_default_clip_max);
+    }
+
+    pub fn scaleWeight(self: RSFCouplingParams, d: usize) f32 {
+        return self.s_weight[d * coupling_width + coupling_weight_column];
+    }
+
+    pub fn scaleBias(self: RSFCouplingParams, d: usize) f32 {
+        return self.s_weight[d * coupling_width + coupling_bias_column];
+    }
+
+    pub fn translationWeight(self: RSFCouplingParams, d: usize) f32 {
+        return self.t_weight[d * coupling_width + coupling_weight_column];
+    }
+
+    pub fn translationBias(self: RSFCouplingParams, d: usize) f32 {
+        return self.t_weight[d * coupling_width + coupling_bias_column];
+    }
+
+    pub fn rowBytes(self: RSFCouplingParams) usize {
+        return self.dim * 2 * @sizeOf(f32);
+    }
+};
+
+pub fn clipCoupling(value: f32, clip_min: f32, clip_max: f32) f32 {
+    return if (value < clip_min) clip_min else if (value > clip_max) clip_max else value;
+}
+
+pub fn couplingSaturates(raw: f32, clip_min: f32, clip_max: f32) bool {
+    return raw < clip_min or raw > clip_max;
+}
+
+pub fn couplingScaleFromInput(params: RSFCouplingParams, x2_value: f32, d: usize) f32 {
+    const raw = params.scaleWeight(d) * x2_value + params.scaleBias(d);
+    return @exp(clipCoupling(raw, params.clip_min, params.clip_max));
+}
+
+pub fn couplingForwardHalves(params: RSFCouplingParams, x1: []f32, x2: []f32, scale: []f32, trans: []f32) Error!f64 {
+    const dim = params.dim;
+    if (x1.len < dim or x2.len < dim) return Error.InvalidShape;
+    if (scale.len < dim or trans.len < dim) return Error.InvalidShape;
+    var logdet: f64 = 0.0;
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        const raw = params.scaleWeight(d) * x2[d] + params.scaleBias(d);
+        const clipped = clipCoupling(raw, params.clip_min, params.clip_max);
+        logdet += clipped;
+        const factor = @exp(clipped);
+        scale[d] = factor;
+        x1[d] *= factor;
+    }
+    d = 0;
+    while (d < dim) : (d += 1) {
+        const shift = params.translationWeight(d) * x1[d] + params.translationBias(d);
+        trans[d] = shift;
+        x2[d] += shift;
+    }
+    return logdet;
+}
+
+pub fn couplingInverseHalves(params: RSFCouplingParams, y1: []f32, y2: []f32, scale: []f32, trans: []f32) Error!f64 {
+    const dim = params.dim;
+    if (y1.len < dim or y2.len < dim) return Error.InvalidShape;
+    if (scale.len < dim or trans.len < dim) return Error.InvalidShape;
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        const shift = params.translationWeight(d) * y1[d] + params.translationBias(d);
+        trans[d] = shift;
+        y2[d] -= shift;
+    }
+    var logdet: f64 = 0.0;
+    d = 0;
+    while (d < dim) : (d += 1) {
+        const raw = params.scaleWeight(d) * y2[d] + params.scaleBias(d);
+        const clipped = clipCoupling(raw, params.clip_min, params.clip_max);
+        logdet += clipped;
+        const factor = @exp(clipped);
+        scale[d] = factor;
+        y1[d] /= factor;
+    }
+    return logdet;
+}
+
+pub fn couplingForwardRows(params: RSFCouplingParams, rows: []f32, batch: usize, scale: []f32, trans: []f32) Error!f64 {
+    const row_len = std.math.mul(usize, params.dim, 2) catch return Error.Overflow;
+    const total = std.math.mul(usize, row_len, batch) catch return Error.Overflow;
+    if (rows.len < total) return Error.InvalidShape;
+    var logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        const base = b * row_len;
+        logdet += try couplingForwardHalves(params, rows[base .. base + params.dim], rows[base + params.dim .. base + row_len], scale, trans);
+    }
+    return logdet;
+}
+
+pub fn couplingInverseRows(params: RSFCouplingParams, rows: []f32, batch: usize, scale: []f32, trans: []f32) Error!f64 {
+    const row_len = std.math.mul(usize, params.dim, 2) catch return Error.Overflow;
+    const total = std.math.mul(usize, row_len, batch) catch return Error.Overflow;
+    if (rows.len < total) return Error.InvalidShape;
+    var logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        const base = b * row_len;
+        logdet += try couplingInverseHalves(params, rows[base .. base + params.dim], rows[base + params.dim .. base + row_len], scale, trans);
+    }
+    return logdet;
+}
+
+pub fn couplingForwardStrided(params: RSFCouplingParams, x1: []f32, x2: []f32, batch: usize, x1_stride: usize, x2_stride: usize, scale: []f32, trans: []f32) Error!f64 {
+    const dim = params.dim;
+    if (batch == 0) return 0.0;
+    if (x1_stride < dim or x2_stride < dim) return Error.InvalidShape;
+    const x1_required = std.math.add(usize, std.math.mul(usize, batch - 1, x1_stride) catch return Error.Overflow, dim) catch return Error.Overflow;
+    const x2_required = std.math.add(usize, std.math.mul(usize, batch - 1, x2_stride) catch return Error.Overflow, dim) catch return Error.Overflow;
+    if (x1.len < x1_required or x2.len < x2_required) return Error.InvalidShape;
+    var logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        logdet += try couplingForwardHalves(params, x1[b * x1_stride ..][0..dim], x2[b * x2_stride ..][0..dim], scale, trans);
+    }
+    return logdet;
+}
+
+pub fn couplingInverseStrided(params: RSFCouplingParams, y1: []f32, y2: []f32, batch: usize, y1_stride: usize, y2_stride: usize, scale: []f32, trans: []f32) Error!f64 {
+    const dim = params.dim;
+    if (batch == 0) return 0.0;
+    if (y1_stride < dim or y2_stride < dim) return Error.InvalidShape;
+    const y1_required = std.math.add(usize, std.math.mul(usize, batch - 1, y1_stride) catch return Error.Overflow, dim) catch return Error.Overflow;
+    const y2_required = std.math.add(usize, std.math.mul(usize, batch - 1, y2_stride) catch return Error.Overflow, dim) catch return Error.Overflow;
+    if (y1.len < y1_required or y2.len < y2_required) return Error.InvalidShape;
+    var logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        logdet += try couplingInverseHalves(params, y1[b * y1_stride ..][0..dim], y2[b * y2_stride ..][0..dim], scale, trans);
+    }
+    return logdet;
+}
+
+pub fn couplingBackwardHalves(
+    params: RSFCouplingParams,
+    x1_in: []const f32,
+    x2_in: []const f32,
+    y1: []const f32,
+    g_y1: []const f32,
+    g_y2: []const f32,
+    volume_term: f32,
+    ds_weight: []f32,
+    dt_weight: []f32,
+    dx1: []f32,
+    dx2: []f32,
+) Error!f64 {
+    const dim = params.dim;
+    if (x1_in.len < dim or x2_in.len < dim or y1.len < dim) return Error.InvalidShape;
+    if (g_y1.len < dim or g_y2.len < dim) return Error.InvalidShape;
+    if (ds_weight.len < dim * coupling_width or dt_weight.len < dim * coupling_width) return Error.InvalidShape;
+    if (dx1.len < dim or dx2.len < dim) return Error.InvalidShape;
+    var logdet: f64 = 0.0;
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        const w_s = params.scaleWeight(d);
+        const b_s = params.scaleBias(d);
+        const w_t = params.translationWeight(d);
+        const raw = w_s * x2_in[d] + b_s;
+        const clipped = clipCoupling(raw, params.clip_min, params.clip_max);
+        logdet += clipped;
+        const saturated = couplingSaturates(raw, params.clip_min, params.clip_max);
+        const exp_scale = @exp(clipped);
+        const mixed = g_y1[d] + w_t * g_y2[d];
+        var ds = y1[d] * mixed + volume_term;
+        if (saturated) ds = 0.0;
+        ds_weight[d * coupling_width + coupling_weight_column] += ds * x2_in[d];
+        ds_weight[d * coupling_width + coupling_bias_column] += ds;
+        dt_weight[d * coupling_width + coupling_weight_column] += g_y2[d] * y1[d];
+        dt_weight[d * coupling_width + coupling_bias_column] += g_y2[d];
+        dx1[d] = exp_scale * mixed;
+        dx2[d] = g_y2[d] + w_s * ds;
+    }
+    return logdet;
+}
+
+pub fn couplingBackwardRows(
+    params: RSFCouplingParams,
+    inputs: []const f32,
+    outputs: []const f32,
+    g_outputs: []const f32,
+    batch: usize,
+    volume_term: f32,
+    ds_weight: []f32,
+    dt_weight: []f32,
+    d_inputs: []f32,
+    scale: []f32,
+) Error!f64 {
+    const dim = params.dim;
+    const row_len = std.math.mul(usize, dim, 2) catch return Error.Overflow;
+    const total = std.math.mul(usize, row_len, batch) catch return Error.Overflow;
+    if (inputs.len < total or outputs.len < total or g_outputs.len < total) return Error.InvalidShape;
+    if (d_inputs.len < total) return Error.InvalidShape;
+    if (scale.len < dim) return Error.InvalidShape;
+    var logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        const base = b * row_len;
+        const x1_in = inputs[base .. base + dim];
+        const x2_in = inputs[base + dim .. base + row_len];
+        const y1 = outputs[base .. base + dim];
+        const g_y1 = g_outputs[base .. base + dim];
+        const g_y2 = g_outputs[base + dim .. base + row_len];
+        const dx1 = d_inputs[base .. base + dim];
+        const dx2 = d_inputs[base + dim .. base + row_len];
+        logdet += try couplingBackwardHalves(params, x1_in, x2_in, y1, g_y1, g_y2, volume_term, ds_weight, dt_weight, dx1, dx2);
+        var d: usize = 0;
+        while (d < dim) : (d += 1) scale[d] = @exp(clipCoupling(params.scaleWeight(d) * x2_in[d] + params.scaleBias(d), params.clip_min, params.clip_max));
+    }
+    return logdet;
+}
+
+pub const Rank2Gram = struct {
+    a: f64,
+    b: f64,
+    c: f64,
+
+    pub fn trace(self: Rank2Gram) f64 {
+        return self.a + self.c;
+    }
+
+    pub fn determinant(self: Rank2Gram) f64 {
+        return self.a * self.c - self.b * self.b;
+    }
+
+    pub fn discriminant(self: Rank2Gram) f64 {
+        const diff = self.a - self.c;
+        return diff * diff + 4.0 * self.b * self.b;
+    }
+
+    pub fn lambdaMax(self: Rank2Gram) f64 {
+        return (self.trace() + @sqrt(self.discriminant())) / 2.0;
+    }
+
+    pub fn lambdaMin(self: Rank2Gram) f64 {
+        return (self.trace() - @sqrt(self.discriminant())) / 2.0;
+    }
+
+    pub fn sigmaMax(self: Rank2Gram) f64 {
+        const lambda = self.lambdaMax();
+        return @sqrt(if (lambda > 0.0) lambda else 0.0);
+    }
+
+    pub fn sigmaMin(self: Rank2Gram) f64 {
+        const lambda = self.lambdaMin();
+        return @sqrt(if (lambda > 0.0) lambda else 0.0);
+    }
+
+    pub fn frobenius(self: Rank2Gram) f64 {
+        return @sqrt(self.a + self.c);
+    }
+};
+
+pub fn gramRank2(w: []const f32, dim: usize) Error!Rank2Gram {
+    const required = std.math.mul(usize, dim, coupling_width) catch return Error.Overflow;
+    if (dim == 0) return Error.InvalidShape;
+    if (w.len < required) return Error.InvalidShape;
+    var a: f64 = 0.0;
+    var b: f64 = 0.0;
+    var c: f64 = 0.0;
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        const w0: f64 = @floatCast(w[d * coupling_width + coupling_weight_column]);
+        const w1: f64 = @floatCast(w[d * coupling_width + coupling_bias_column]);
+        a += w0 * w0;
+        b += w0 * w1;
+        c += w1 * w1;
+    }
+    return .{ .a = a, .b = b, .c = c };
+}
+
+pub fn exactSpectralNormRank2(w: []const f32, dim: usize) Error!f64 {
+    const gram = try gramRank2(w, dim);
+    return gram.sigmaMax();
+}
+
+pub fn normalizeRank2(w: []f32, dim: usize, target: f64) Error!f64 {
+    if (!(target > 0.0)) return Error.InvalidArgument;
+    const sigma = try exactSpectralNormRank2(w, dim);
+    if (sigma > target) {
+        const factor: f32 = @floatCast(target / sigma);
+        const total = dim * coupling_width;
+        var i: usize = 0;
+        while (i < total) : (i += 1) w[i] *= factor;
+    }
+    return sigma;
+}
+
+pub fn normalizeRank2Stack(stack: []f32, layers: usize, dim: usize, target: f64, sigmas_out: []f64) Error!void {
+    if (layers == 0) return;
+    const stride = std.math.mul(usize, dim, coupling_width) catch return Error.Overflow;
+    const total = std.math.mul(usize, stride, layers) catch return Error.Overflow;
+    if (stack.len < total) return Error.InvalidShape;
+    if (sigmas_out.len < layers) return Error.InvalidShape;
+    var l: usize = 0;
+    while (l < layers) : (l += 1) {
+        const base = l * stride;
+        sigmas_out[l] = try normalizeRank2(stack[base .. base + stride], dim, target);
+    }
+}
+
+pub fn constrainCouplingSpectralNorm(w: []f32, dim: usize, target: f32) Error!f64 {
+    if (!std.math.isFinite(target) or !(target > 0.0)) return Error.InvalidArgument;
+    return normalizeRank2(w, dim, @as(f64, @floatCast(target)));
+}
+
+pub fn hadamardBlockInPlace(block: []f32) Error!void {
+    const len = block.len;
+    if (len <= 1) return;
+    if (len & (len - 1) != 0) return Error.InvalidShape;
+    const inv_sqrt2: f32 = 0.70710678118654752440;
+    var h: usize = 1;
+    while (h < len) : (h *= 2) {
+        var base: usize = 0;
+        while (base < len) : (base += 2 * h) {
+            var k: usize = 0;
+            while (k < h) : (k += 1) {
+                const u = block[base + k];
+                const v = block[base + k + h];
+                block[base + k] = (u + v) * inv_sqrt2;
+                block[base + k + h] = (u - v) * inv_sqrt2;
+            }
+        }
+    }
+}
+
+pub fn hadamardBlockF64(block: []const f32, out: []f64) Error!void {
+    const len = block.len;
+    if (len <= 1) {
+        if (len == 1) out[0] = @floatCast(block[0]);
+        return;
+    }
+    if (len & (len - 1) != 0) return Error.InvalidShape;
+    if (out.len < len) return Error.InvalidShape;
+    const inv_sqrt2: f64 = 0.70710678118654752440;
+    for (0..len) |i| out[i] = @floatCast(block[i]);
+    var h: usize = 1;
+    while (h < len) : (h *= 2) {
+        var base: usize = 0;
+        while (base < len) : (base += 2 * h) {
+            for (0..h) |k| {
+                const u = out[base + k];
+                const v = out[base + k + h];
+                out[base + k] = (u + v) * inv_sqrt2;
+                out[base + k + h] = (u - v) * inv_sqrt2;
+            }
+        }
+    }
+}
+
+pub fn globalDiffuseRowInPlace(row: []f32, layout: types.RSFDiffusionLayout, scratch: []f32) Error!void {
+    if (row.len != layout.row_len) return Error.InvalidShape;
+    if (layout.radix * layout.block != layout.row_len) return Error.InvalidDiffusionLayout;
+    if (layout.stages > 0) {
+        var b: usize = 0;
+        while (b < layout.radix) : (b += 1) {
+            const base = b * layout.block;
+            try hadamardBlockInPlace(row[base .. base + layout.block]);
+        }
+    }
+    if (layout.radix <= 1) return;
+    if (scratch.len < layout.block) return Error.InvalidShape;
+    const m = layout.block;
+    const r = layout.radix;
+    var o: usize = 0;
+    while (o < m) : (o += 1) scratch[o] = 0.0;
+    var bi: usize = 0;
+    while (bi < r) : (bi += 1) {
+        const base = bi * m;
+        o = 0;
+        while (o < m) : (o += 1) scratch[o] += row[base + o];
+    }
+    const factor: f32 = @floatCast(2.0 / @as(f64, @floatFromInt(r)));
+    bi = 0;
+    while (bi < r) : (bi += 1) {
+        const base = bi * m;
+        o = 0;
+        while (o < m) : (o += 1) row[base + o] -= factor * scratch[o];
+    }
+}
+
+pub fn globalDiffuseRowF64(row: []f32, layout: types.RSFDiffusionLayout, work: []f64, scratch: []f64) Error!void {
+    if (row.len != layout.row_len) return Error.InvalidShape;
+    if (layout.radix * layout.block != layout.row_len) return Error.InvalidDiffusionLayout;
+    if (work.len < layout.row_len) return Error.InvalidShape;
+    for (0..layout.row_len) |i| work[i] = @floatCast(row[i]);
+    if (layout.stages > 0) {
+        for (0..layout.radix) |b| {
+            const base = b * layout.block;
+            var h: usize = 1;
+            const inv_sqrt2: f64 = 0.70710678118654752440;
+            while (h < layout.block) : (h *= 2) {
+                var start: usize = base;
+                while (start < base + layout.block) : (start += 2 * h) {
+                    for (0..h) |k| {
+                        const u = work[start + k];
+                        const v = work[start + k + h];
+                        work[start + k] = (u + v) * inv_sqrt2;
+                        work[start + k + h] = (u - v) * inv_sqrt2;
+                    }
+                }
+            }
+        }
+    }
+    if (layout.radix > 1) {
+        if (scratch.len < layout.block) return Error.InvalidShape;
+        const m = layout.block;
+        const r = layout.radix;
+        for (0..m) |o| scratch[o] = 0.0;
+        for (0..r) |b| {
+            for (0..m) |o| scratch[o] += work[b * m + o];
+        }
+        const factor: f64 = 2.0 / @as(f64, @floatFromInt(r));
+        for (0..r) |b| {
+            for (0..m) |o| work[b * m + o] -= factor * scratch[o];
+        }
+    }
+    for (0..layout.row_len) |i| {
+        const v = work[i];
+        row[i] = @floatCast(v);
+    }
+}
+
+pub fn globalDiffuseRows(rows: []f32, count: usize, layout: types.RSFDiffusionLayout, scratch: []f32) Error!void {
+    if (scratch.len < layout.block) return Error.InvalidShape;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const base = i * layout.row_len;
+        if (base + layout.row_len > rows.len) return Error.InvalidShape;
+        try globalDiffuseRowInPlace(rows[base .. base + layout.row_len], layout, scratch);
+    }
+}
+
+pub fn globalDiffusePairInPlace(x1: []f32, x2: []f32, layout: types.RSFDiffusionLayout, row_scratch: []f32, block_scratch: []f32) Error!void {
+    const dim = layout.row_len / 2;
+    if (x1.len < dim or x2.len < dim) return Error.InvalidShape;
+    if (row_scratch.len < layout.row_len) return Error.InvalidShape;
+    for (0..dim) |i| {
+        row_scratch[i] = x1[i];
+        row_scratch[dim + i] = x2[i];
+    }
+    try globalDiffuseRowInPlace(row_scratch[0..layout.row_len], layout, block_scratch);
+    for (0..dim) |i| {
+        x1[i] = row_scratch[i];
+        x2[i] = row_scratch[dim + i];
+    }
+}
+
+pub const diffusion_tile: usize = 64;
+
+pub fn diffusionLayoutIsApplicable(row_len: usize, layout: types.RSFDiffusionLayout) bool {
+    if (layout.row_len != row_len) return false;
+    if (layout.radix == 0 or layout.block == 0) return false;
+    const product = std.math.mul(usize, layout.radix, layout.block) catch return false;
+    if (product != row_len) return false;
+    if (layout.block > 1 and (layout.block & (layout.block - 1)) != 0) return false;
+    var probe = layout.block;
+    var stages: usize = 0;
+    while (probe > 1) {
+        probe /= 2;
+        stages += 1;
+    }
+    return stages == layout.stages;
+}
+
+pub fn globalDiffuseRowUnchecked(row: []f32, layout: types.RSFDiffusionLayout) void {
+    const inv_sqrt2: f32 = 0.70710678118654752440;
+    if (layout.stages > 0) {
+        var b: usize = 0;
+        while (b < layout.radix) : (b += 1) {
+            const block_base = b * layout.block;
+            var h: usize = 1;
+            while (h < layout.block) : (h *= 2) {
+                var start: usize = block_base;
+                const block_end = block_base + layout.block;
+                while (start < block_end) : (start += 2 * h) {
+                    var k: usize = 0;
+                    while (k < h) : (k += 1) {
+                        const u = row[start + k];
+                        const v = row[start + k + h];
+                        row[start + k] = (u + v) * inv_sqrt2;
+                        row[start + k + h] = (u - v) * inv_sqrt2;
+                    }
+                }
+            }
+        }
+    }
+    if (layout.radix <= 1) return;
+    const m = layout.block;
+    const r = layout.radix;
+    const factor: f32 = @floatCast(2.0 / @as(f64, @floatFromInt(r)));
+    var tile: [diffusion_tile]f32 = undefined;
+    var o: usize = 0;
+    while (o < m) {
+        const width = @min(diffusion_tile, m - o);
+        var q: usize = 0;
+        while (q < width) : (q += 1) tile[q] = 0.0;
+        var bi: usize = 0;
+        while (bi < r) : (bi += 1) {
+            const base = bi * m + o;
+            q = 0;
+            while (q < width) : (q += 1) tile[q] += row[base + q];
+        }
+        bi = 0;
+        while (bi < r) : (bi += 1) {
+            const base = bi * m + o;
+            q = 0;
+            while (q < width) : (q += 1) row[base + q] -= factor * tile[q];
+        }
+        o += width;
+    }
+}
+
+pub fn globalDiffuseRowStack(row: []f32, layout: types.RSFDiffusionLayout) Error!void {
+    if (row.len != layout.row_len) return Error.InvalidShape;
+    if (!diffusionLayoutIsApplicable(row.len, layout)) return Error.InvalidDiffusionLayout;
+    globalDiffuseRowUnchecked(row, layout);
+}
+
+pub fn globalDiffuseRowsStack(rows: []f32, count: usize, layout: types.RSFDiffusionLayout) Error!void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const base = std.math.mul(usize, i, layout.row_len) catch return Error.Overflow;
+        const end = std.math.add(usize, base, layout.row_len) catch return Error.Overflow;
+        if (end > rows.len) return Error.InvalidShape;
+        try globalDiffuseRowStack(rows[base..end], layout);
+    }
+}
+
+pub fn causalCouplingKeyCount(mask: types.RSFSequenceMask, t: usize) usize {
+    return mask.rowNnz(t) + 1;
+}
+
+pub fn causalCouplingForward(
+    params: RSFCouplingParams,
+    mask: types.RSFSequenceMask,
+    x1: []const f32,
+    x2: []const f32,
+    y1: []f32,
+    y2: []f32,
+    key: []f32,
+    scale: []f32,
+    trans: []f32,
+) Error!f64 {
+    const dim = params.dim;
+    const seq_len = mask.seq_len;
+    if (seq_len == 0) return 0.0;
+    if (key.len < dim or scale.len < dim or trans.len < dim) return Error.InvalidShape;
+    const required = std.math.mul(usize, seq_len, dim) catch return Error.Overflow;
+    if (x1.len < required or x2.len < required or y1.len < required or y2.len < required) return Error.InvalidShape;
+    if (!mask.full_causal) {
+        if (slicesOverlap(x2, y2) or slicesOverlap(x1, y1)) return Error.InvalidArgument;
+    }
+    const RowAccumulator = struct {
+        src: []const f32,
+        dst: []f32,
+        row_len: usize,
+
+        fn add(self: *@This(), j: usize) void {
+            const row = j * self.row_len;
+            for (0..self.dst.len) |d| self.dst[d] += self.src[row + d];
+        }
+    };
+    const k = key[0..dim];
+    @memset(k, 0.0);
+    var logdet: f64 = 0.0;
+    var t: usize = 0;
+    while (t < seq_len) : (t += 1) {
+        const base = t * dim;
+        if (mask.full_causal) {
+            var d: usize = 0;
+            while (d < dim) : (d += 1) k[d] += x2[base + d];
+        } else {
+            @memset(k, 0.0);
+            var accumulator = RowAccumulator{ .src = x2, .dst = k, .row_len = dim };
+            mask.rowSetBits(t, &accumulator, RowAccumulator.add);
+            var d: usize = 0;
+            while (d < dim) : (d += 1) k[d] += x2[base + d];
+        }
+        var d: usize = 0;
+        while (d < dim) : (d += 1) {
+            const raw = params.scaleWeight(d) * k[d] + params.scaleBias(d);
+            const clipped = clipCoupling(raw, params.clip_min, params.clip_max);
+            logdet += clipped;
+            const factor = @exp(clipped);
+            scale[d] = factor;
+            y1[base + d] = x1[base + d] * factor;
+        }
+        d = 0;
+        while (d < dim) : (d += 1) {
+            const shift = params.translationWeight(d) * y1[base + d] + params.translationBias(d);
+            trans[d] = shift;
+            y2[base + d] = x2[base + d] + shift;
+        }
+    }
+    return logdet;
+}
+
+pub fn causalCouplingInverse(
+    params: RSFCouplingParams,
+    mask: types.RSFSequenceMask,
+    y1: []const f32,
+    y2: []const f32,
+    x1: []f32,
+    x2: []f32,
+    key: []f32,
+    scale: []f32,
+    trans: []f32,
+) Error!f64 {
+    const dim = params.dim;
+    const seq_len = mask.seq_len;
+    if (seq_len == 0) return 0.0;
+    if (key.len < dim or scale.len < dim or trans.len < dim) return Error.InvalidShape;
+    const required = std.math.mul(usize, seq_len, dim) catch return Error.Overflow;
+    if (y1.len < required or y2.len < required or x1.len < required or x2.len < required) return Error.InvalidShape;
+    var t: usize = 0;
+    while (t < seq_len) : (t += 1) {
+        const base = t * dim;
+        for (0..dim) |d| {
+            const shift = params.translationWeight(d) * y1[base + d] + params.translationBias(d);
+            trans[d] = shift;
+            x2[base + d] = y2[base + d] - shift;
+        }
+    }
+    const RowAccumulator = struct {
+        src: []const f32,
+        dst: []f32,
+        row_len: usize,
+
+        fn add(self: *@This(), j: usize) void {
+            const row = j * self.row_len;
+            for (0..self.dst.len) |d| self.dst[d] += self.src[row + d];
+        }
+    };
+    const k = key[0..dim];
+    @memset(k, 0.0);
+    var logdet: f64 = 0.0;
+    t = 0;
+    while (t < seq_len) : (t += 1) {
+        const base = t * dim;
+        if (mask.full_causal) {
+            var d: usize = 0;
+            while (d < dim) : (d += 1) k[d] += x2[base + d];
+        } else {
+            @memset(k, 0.0);
+            var accumulator = RowAccumulator{ .src = x2, .dst = k, .row_len = dim };
+            mask.rowSetBits(t, &accumulator, RowAccumulator.add);
+            var d: usize = 0;
+            while (d < dim) : (d += 1) k[d] += x2[base + d];
+        }
+        for (0..dim) |d| {
+            const raw = params.scaleWeight(d) * k[d] + params.scaleBias(d);
+            const clipped = clipCoupling(raw, params.clip_min, params.clip_max);
+            logdet += clipped;
+            const factor = @exp(clipped);
+            scale[d] = factor;
+            x1[base + d] = y1[base + d] / factor;
+        }
+    }
+    return logdet;
+}
+
+pub fn causalCouplingBackward(
+    params: RSFCouplingParams,
+    mask: types.RSFSequenceMask,
+    x2_in: []const f32,
+    y1: []const f32,
+    g_y1: []const f32,
+    g_y2: []const f32,
+    volume_term: f32,
+    ds_weight: []f32,
+    dt_weight: []f32,
+    dx1: []f32,
+    dx2: []f32,
+    key: []f32,
+    ds_scratch: []f32,
+) Error!f64 {
+    const dim = params.dim;
+    const seq_len = mask.seq_len;
+    if (seq_len == 0) return 0.0;
+    if (key.len < dim) return Error.InvalidShape;
+    if (ds_weight.len < dim * coupling_width or dt_weight.len < dim * coupling_width) return Error.InvalidShape;
+    const required = std.math.mul(usize, seq_len, dim) catch return Error.Overflow;
+    if (x2_in.len < required or y1.len < required or g_y1.len < required) return Error.InvalidShape;
+    if (g_y2.len < required or dx1.len < required or dx2.len < required) return Error.InvalidShape;
+    if (ds_scratch.len < required) return Error.InvalidShape;
+    if (slicesOverlap(x2_in, dx2) or slicesOverlap(y1, dx1) or slicesOverlap(y1, dx2)) return Error.InvalidArgument;
+    const RowAccumulator = struct {
+        src: []const f32,
+        dst: []f32,
+        row_len: usize,
+
+        fn add(self: *@This(), j: usize) void {
+            const row = j * self.row_len;
+            for (0..self.dst.len) |d| self.dst[d] += self.src[row + d];
+        }
+    };
+    const k = key[0..dim];
+    @memset(k, 0.0);
+    var logdet: f64 = 0.0;
+    for (0..seq_len) |t| {
+        const base = t * dim;
+        if (mask.full_causal) {
+            for (0..dim) |d| k[d] += x2_in[base + d];
+        } else {
+            @memset(k, 0.0);
+            var accumulator = RowAccumulator{ .src = x2_in, .dst = k, .row_len = dim };
+            mask.rowSetBits(t, &accumulator, RowAccumulator.add);
+            for (0..dim) |d| k[d] += x2_in[base + d];
+        }
+        for (0..dim) |d| {
+            const w_s = params.scaleWeight(d);
+            const w_t = params.translationWeight(d);
+            const raw = w_s * k[d] + params.scaleBias(d);
+            const clipped = clipCoupling(raw, params.clip_min, params.clip_max);
+            logdet += clipped;
+            const saturated = couplingSaturates(raw, params.clip_min, params.clip_max);
+            const y1_value = y1[base + d];
+            const g1 = g_y1[base + d];
+            const g2 = g_y2[base + d];
+            const mixed = g1 + w_t * g2;
+            var ds: f32 = y1_value * mixed + volume_term;
+            if (saturated) ds = 0.0;
+            ds_scratch[base + d] = ds;
+            ds_weight[d * coupling_width + coupling_weight_column] += ds * k[d];
+            ds_weight[d * coupling_width + coupling_bias_column] += ds;
+            dt_weight[d * coupling_width + coupling_weight_column] += g2 * y1_value;
+            dt_weight[d * coupling_width + coupling_bias_column] += g2;
+            dx1[base + d] = @exp(clipped) * mixed;
+            dx2[base + d] = g2 + w_s * ds;
+        }
+    }
+    if (mask.full_causal) {
+        const incoming = key[0..dim];
+        @memset(incoming, 0.0);
+        var i: usize = seq_len;
+        while (i > 0) {
+            i -= 1;
+            const base = i * dim;
+            for (0..dim) |d| {
+                dx2[base + d] += params.scaleWeight(d) * incoming[d];
+                incoming[d] += ds_scratch[base + d];
+            }
+        }
+    } else {
+        const incoming = key[0..dim];
+        for (0..seq_len) |i| {
+            const base = i * dim;
+            @memset(incoming, 0.0);
+            for (i + 1..seq_len) |t| {
+                if (!mask.get(t, i)) continue;
+                const source = t * dim;
+                for (0..dim) |d| incoming[d] += ds_scratch[source + d];
+            }
+            for (0..dim) |d| dx2[base + d] += params.scaleWeight(d) * incoming[d];
+        }
+    }
+    return logdet;
+}
+
+fn slicesOverlap(a: []const f32, b: []const f32) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const a_start = @intFromPtr(a.ptr);
+    const a_end = a_start + a.len * @sizeOf(f32);
+    const b_start = @intFromPtr(b.ptr);
+    const b_end = b_start + b.len * @sizeOf(f32);
+    return a_start < b_end and b_start < a_end;
+}
+
+fn fillSliceDeterministic(buffer: []f32, seed: u64, scale: f32) void {
+    var generator = types.PRNG.init(seed);
+    var i: usize = 0;
+    while (i < buffer.len) : (i += 1) {
+        buffer[i] = (generator.float() * 2.0 - 1.0) * scale;
+    }
+}
+
+fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
+    var worst: f32 = 0.0;
+    for (a, b) |x, y| {
+        const diff = @abs(x - y);
+        if (diff > worst) worst = diff;
+    }
+    return worst;
+}
+
+fn normL2F32(values: []const f32) f64 {
+    var acc: f64 = 0.0;
+    for (values) |v| {
+        const x: f64 = @floatCast(v);
+        acc += x * x;
+    }
+    return @sqrt(acc);
+}
+
+fn powerIterationSigmaMaxF64(w: []const f32, dim: usize, iterations: usize) f64 {
+    var g = [_]f64{0} ** 4;
+    var a: f64 = 0;
+    var b: f64 = 0;
+    var c: f64 = 0;
+    for (0..dim) |d| {
+        const w0: f64 = @floatCast(w[d * coupling_width + coupling_weight_column]);
+        const w1: f64 = @floatCast(w[d * coupling_width + coupling_bias_column]);
+        a += w0 * w0;
+        b += w0 * w1;
+        c += w1 * w1;
+    }
+    g[0] = a;
+    g[1] = b;
+    g[2] = b;
+    g[3] = c;
+    var v = [_]f64{ 1.0, 0.5 };
+    var lambda: f64 = 0.0;
+    for (0..iterations) |_| {
+        const n0 = g[0] * v[0] + g[1] * v[1];
+        const n1 = g[2] * v[0] + g[3] * v[1];
+        const norm = @sqrt(n0 * n0 + n1 * n1);
+        if (norm == 0.0) return 0.0;
+        v[0] = n0 / norm;
+        v[1] = n1 / norm;
+        lambda = norm;
+    }
+    return @sqrt(lambda);
+}
+
+test "coupling forward inverse roundtrip" {
+    const dim: usize = 37;
+    const batch: usize = 5;
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = undefined;
+    var rows: [batch * dim * 2]f32 = undefined;
+    var original: [batch * dim * 2]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    fillSliceDeterministic(&s_weight, 0x1111, 0.35);
+    fillSliceDeterministic(&t_weight, 0x2222, 0.35);
+    fillSliceDeterministic(&rows, 0x3333, 1.5);
+    @memcpy(&original, &rows);
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const logdet_forward = try couplingForwardRows(params, &rows, batch, &scale, &trans);
+    try std.testing.expect(std.math.isFinite(logdet_forward));
+    const logdet_inverse = try couplingInverseRows(params, &rows, batch, &scale, &trans);
+    try std.testing.expectApproxEqAbs(logdet_forward, logdet_inverse, 1e-5);
+    try std.testing.expect(maxAbsDiff(&original, &rows) < 1e-3);
+}
+
+test "coupling forward matches scalar reference" {
+    const dim: usize = 11;
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = undefined;
+    var x1: [dim]f32 = undefined;
+    var x2: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    fillSliceDeterministic(&s_weight, 7, 0.6);
+    fillSliceDeterministic(&t_weight, 8, 0.6);
+    fillSliceDeterministic(&x1, 9, 2.0);
+    fillSliceDeterministic(&x2, 10, 2.0);
+    var expected_x1: [dim]f32 = undefined;
+    var expected_x2: [dim]f32 = undefined;
+    var expected_logdet: f64 = 0.0;
+    for (0..dim) |d| {
+        const raw = s_weight[d * 2] * x2[d] + s_weight[d * 2 + 1];
+        const clipped = if (raw < -5.0) @as(f32, -5.0) else if (raw > 5.0) @as(f32, 5.0) else raw;
+        expected_logdet += clipped;
+        expected_x1[d] = x1[d] * @exp(clipped);
+    }
+    for (0..dim) |d| {
+        expected_x2[d] = x2[d] + t_weight[d * 2] * expected_x1[d] + t_weight[d * 2 + 1];
+    }
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const logdet = try couplingForwardHalves(params, &x1, &x2, &scale, &trans);
+    try std.testing.expectApproxEqAbs(logdet, expected_logdet, 1e-9);
+    for (0..dim) |d| {
+        try std.testing.expectApproxEqRel(x1[d], expected_x1[d], 1e-6);
+        try std.testing.expectApproxEqRel(x2[d], expected_x2[d], 1e-6);
+    }
+}
+
+test "coupling params validation" {
+    var s_weight: [8]f32 = [_]f32{0} ** 8;
+    var t_weight: [8]f32 = [_]f32{0} ** 8;
+    try std.testing.expectError(Error.InvalidShape, RSFCouplingParams.default(&s_weight, &t_weight, 0));
+    try std.testing.expectError(Error.InvalidShape, RSFCouplingParams.default(s_weight[0..4], &t_weight, 4));
+    try std.testing.expectError(Error.InvalidArgument, RSFCouplingParams.init(&s_weight, &t_weight, 4, 1.0, 1.0));
+    try std.testing.expectError(Error.InvalidArgument, RSFCouplingParams.init(&s_weight, &t_weight, 4, std.math.nan(f32), 1.0));
+    const params = try RSFCouplingParams.init(&s_weight, &t_weight, 4, -2.0, 2.0);
+    try std.testing.expectEqual(@as(usize, 4), params.dim);
+    try std.testing.expectEqual(@as(f32, -2.0), params.clip_min);
+    try std.testing.expectEqual(@as(usize, 32), params.rowBytes());
+    var short: [3]f32 = undefined;
+    var scratch: [4]f32 = undefined;
+    try std.testing.expectError(Error.InvalidShape, couplingForwardHalves(params, &short, &short, &scratch, &scratch));
+    try std.testing.expectError(Error.InvalidShape, couplingForwardHalves(params, &scratch, &scratch, short[0..2], &scratch));
+}
+
+test "coupling logdet saturates at clip bounds" {
+    const dim: usize = 5;
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var x1: [dim]f32 = [_]f32{1} ** dim;
+    var x2: [dim]f32 = [_]f32{100.0} ** dim;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    for (0..dim) |d| {
+        s_weight[d * 2] = 1.0;
+        s_weight[d * 2 + 1] = 0.0;
+    }
+    const params = try RSFCouplingParams.init(&s_weight, &t_weight, dim, -5.0, 5.0);
+    const logdet = try couplingForwardHalves(params, &x1, &x2, &scale, &trans);
+    try std.testing.expectApproxEqAbs(logdet, @as(f64, 25.0), 1e-9);
+    for (0..dim) |d| try std.testing.expectApproxEqAbs(scale[d], @exp(@as(f32, 5.0)), 1e-3);
+    x2 = [_]f32{-100.0} ** dim;
+    const logdet_low = try couplingForwardHalves(params, &x1, &x2, &scale, &trans);
+    try std.testing.expectApproxEqAbs(logdet_low, @as(f64, -25.0), 1e-9);
+}
+
+test "coupling gradients match finite differences" {
+    const dim: usize = 7;
+    const Case = struct {
+        s_weight: [dim * 2]f32,
+        t_weight: [dim * 2]f32,
+        x1: [dim]f32,
+        x2: [dim]f32,
+        a: [dim]f32,
+        b: [dim]f32,
+        volume: f32,
+
+        fn loss(self: *@This(), s_override: ?[]const f32, t_override: ?[]const f32, x1_override: ?[]const f32, x2_override: ?[]const f32) !f64 {
+            const s = s_override orelse &self.s_weight;
+            const t = t_override orelse &self.t_weight;
+            const in1 = x1_override orelse &self.x1;
+            const in2 = x2_override orelse &self.x2;
+            const params = try RSFCouplingParams.init(s, t, dim, -5.0, 5.0);
+            var y1: [dim]f32 = undefined;
+            var y2: [dim]f32 = undefined;
+            var scale: [dim]f32 = undefined;
+            var trans: [dim]f32 = undefined;
+            @memcpy(&y1, in1);
+            @memcpy(&y2, in2);
+            const logdet = try couplingForwardHalves(params, &y1, &y2, &scale, &trans);
+            var total: f64 = self.volume * logdet;
+            for (0..dim) |d| {
+                total += @as(f64, @floatCast(self.a[d])) * @as(f64, @floatCast(y1[d]));
+                total += @as(f64, @floatCast(self.b[d])) * @as(f64, @floatCast(y2[d]));
+            }
+            return total;
+        }
+    };
+    var case = Case{
+        .s_weight = undefined,
+        .t_weight = undefined,
+        .x1 = undefined,
+        .x2 = undefined,
+        .a = undefined,
+        .b = undefined,
+        .volume = 0.002,
+    };
+    fillSliceDeterministic(&case.s_weight, 21, 0.25);
+    fillSliceDeterministic(&case.t_weight, 22, 0.25);
+    fillSliceDeterministic(&case.x1, 23, 0.8);
+    fillSliceDeterministic(&case.x2, 24, 0.8);
+    fillSliceDeterministic(&case.a, 25, 1.0);
+    fillSliceDeterministic(&case.b, 26, 1.0);
+    const params = try RSFCouplingParams.init(&case.s_weight, &case.t_weight, dim, -5.0, 5.0);
+    var y1: [dim]f32 = undefined;
+    var y2: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    @memcpy(&y1, &case.x1);
+    @memcpy(&y2, &case.x2);
+    _ = try couplingForwardHalves(params, &y1, &y2, &scale, &trans);
+    var ds_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var dt_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var dx1: [dim]f32 = undefined;
+    var dx2: [dim]f32 = undefined;
+    _ = try couplingBackwardHalves(params, &case.x1, &case.x2, &y1, &case.a, &case.b, case.volume, &ds_weight, &dt_weight, &dx1, &dx2);
+    const h: f32 = 1e-3;
+    for (0..dim) |d| {
+        var plus_x1 = case.x1;
+        var minus_x1 = case.x1;
+        plus_x1[d] += h;
+        minus_x1[d] -= h;
+        const lp1 = try case.loss(null, null, &plus_x1, null);
+        const lm1 = try case.loss(null, null, &minus_x1, null);
+        try std.testing.expectApproxEqAbs(dx1[d], (lp1 - lm1) / (2 * @as(f64, @floatCast(h))), 5e-3);
+
+        var plus_x2 = case.x2;
+        var minus_x2 = case.x2;
+        plus_x2[d] += h;
+        minus_x2[d] -= h;
+        const lp2 = try case.loss(null, null, null, &plus_x2);
+        const lm2 = try case.loss(null, null, null, &minus_x2);
+        try std.testing.expectApproxEqAbs(dx2[d], (lp2 - lm2) / (2 * @as(f64, @floatCast(h))), 5e-3);
+
+        for (0..2) |col| {
+            var plus_s = case.s_weight;
+            var minus_s = case.s_weight;
+            plus_s[d * 2 + col] += h;
+            minus_s[d * 2 + col] -= h;
+            const lps = try case.loss(&plus_s, null, null, null);
+            const lms = try case.loss(&minus_s, null, null, null);
+            try std.testing.expectApproxEqAbs(ds_weight[d * 2 + col], (lps - lms) / (2 * @as(f64, @floatCast(h))), 5e-3);
+
+            var plus_t = case.t_weight;
+            var minus_t = case.t_weight;
+            plus_t[d * 2 + col] += h;
+            minus_t[d * 2 + col] -= h;
+            const lpt = try case.loss(null, &plus_t, null, null);
+            const lmt = try case.loss(null, &minus_t, null, null);
+            try std.testing.expectApproxEqAbs(dt_weight[d * 2 + col], (lpt - lmt) / (2 * @as(f64, @floatCast(h))), 5e-3);
+        }
+    }
+}
+
+test "coupling gradient zeroes saturated channels" {
+    const dim: usize = 3;
+    var s_weight: [dim * 2]f32 = [_]f32{ 10.0, 0.0, 0.1, 0.0, -10.0, 0.0 };
+    var t_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var x1: [dim]f32 = [_]f32{ 1.0, 1.0, 1.0 };
+    var x2: [dim]f32 = [_]f32{ 1.0, 1.0, 1.0 };
+    var y1: [dim]f32 = undefined;
+    var y2: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    const params = try RSFCouplingParams.init(&s_weight, &t_weight, dim, -5.0, 5.0);
+    _ = try couplingForwardHalves(params, &x1, &x2, &scale, &trans);
+    @memcpy(&y1, &x1);
+    @memcpy(&y2, &x2);
+    var ds_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var dt_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var dx1: [dim]f32 = undefined;
+    var dx2: [dim]f32 = undefined;
+    const g1 = [_]f32{ 1.0, 1.0, 1.0 };
+    const g2 = [_]f32{ 0.5, 0.5, 0.5 };
+    _ = try couplingBackwardHalves(params, &[_]f32{ 1.0, 1.0, 1.0 }, &[_]f32{ 1.0, 1.0, 1.0 }, &y1, &g1, &g2, 0.0, &ds_weight, &dt_weight, &dx1, &dx2);
+    try std.testing.expectEqual(@as(f32, 0.0), ds_weight[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), ds_weight[1]);
+    try std.testing.expectEqual(@as(f32, 0.0), ds_weight[4]);
+    try std.testing.expectEqual(@as(f32, 0.0), ds_weight[5]);
+    try std.testing.expect(ds_weight[2] != 0.0);
+    try std.testing.expect(ds_weight[3] != 0.0);
+}
+
+test "coupling strided matches contiguous rows" {
+    const dim: usize = 9;
+    const batch: usize = 4;
+    const x1_stride: usize = 16;
+    const x2_stride: usize = 12;
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = undefined;
+    var rows: [batch * dim * 2]f32 = undefined;
+    var x1_padded: [batch * x1_stride]f32 = [_]f32{9.0} ** (batch * x1_stride);
+    var x2_padded: [batch * x2_stride]f32 = [_]f32{9.0} ** (batch * x2_stride);
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    fillSliceDeterministic(&s_weight, 31, 0.4);
+    fillSliceDeterministic(&t_weight, 32, 0.4);
+    fillSliceDeterministic(&rows, 33, 1.2);
+    for (0..batch) |b| {
+        @memcpy(x1_padded[b * x1_stride ..][0..dim], rows[b * dim * 2 ..][0..dim]);
+        @memcpy(x2_padded[b * x2_stride ..][0..dim], rows[b * dim * 2 + dim ..][0..dim]);
+    }
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const logdet_rows = try couplingForwardRows(params, &rows, batch, &scale, &trans);
+    const logdet_strided = try couplingForwardStrided(params, &x1_padded, &x2_padded, batch, x1_stride, x2_stride, &scale, &trans);
+    try std.testing.expectApproxEqAbs(logdet_rows, logdet_strided, 1e-9);
+    for (0..batch) |b| {
+        try std.testing.expectEqualSlices(f32, rows[b * dim * 2 ..][0..dim], x1_padded[b * x1_stride ..][0..dim]);
+        try std.testing.expectEqualSlices(f32, rows[b * dim * 2 + dim ..][0..dim], x2_padded[b * x2_stride ..][0..dim]);
+    }
+    try std.testing.expectEqual(@as(f32, 9.0), x1_padded[dim]);
+    try std.testing.expectEqual(@as(f32, 9.0), x2_padded[dim]);
+    _ = try couplingInverseRows(params, &rows, batch, &scale, &trans);
+    _ = try couplingInverseStrided(params, &x1_padded, &x2_padded, batch, x1_stride, x2_stride, &scale, &trans);
+    for (0..batch) |b| {
+        try std.testing.expectEqualSlices(f32, rows[b * dim * 2 ..][0..dim], x1_padded[b * x1_stride ..][0..dim]);
+        try std.testing.expectEqualSlices(f32, rows[b * dim * 2 + dim ..][0..dim], x2_padded[b * x2_stride ..][0..dim]);
+    }
+    try std.testing.expectError(Error.InvalidShape, couplingForwardStrided(params, &x1_padded, &x2_padded, batch, dim - 1, x2_stride, &scale, &trans));
+    try std.testing.expectError(Error.InvalidShape, couplingForwardStrided(params, x1_padded[0..dim], &x2_padded, batch, x1_stride, x2_stride, &scale, &trans));
+}
+
+test "exact spectral norm matches power iteration reference" {
+    const dim: usize = 64;
+    var w: [dim * 2]f32 = undefined;
+    fillSliceDeterministic(&w, 41, 1.0);
+    const exact = try exactSpectralNormRank2(&w, dim);
+    const reference = powerIterationSigmaMaxF64(&w, dim, 4000);
+    try std.testing.expectApproxEqRel(exact, reference, 1e-9);
+    const gram = try gramRank2(&w, dim);
+    try std.testing.expectApproxEqRel(gram.frobenius(), normL2F32(&w), 1e-12);
+    try std.testing.expect(gram.sigmaMax() >= gram.sigmaMin());
+    try std.testing.expectApproxEqRel(gram.lambdaMax() + gram.lambdaMin(), gram.trace(), 1e-12);
+    try std.testing.expectApproxEqRel(gram.lambdaMax() * gram.lambdaMin(), gram.determinant(), 1e-9);
+    var single: [2]f32 = [_]f32{ 3.0, 4.0 };
+    try std.testing.expectApproxEqRel(try exactSpectralNormRank2(&single, 1), @as(f64, 5.0), 1e-12);
+    var zero: [4]f32 = [_]f32{0} ** 4;
+    try std.testing.expectEqual(@as(f64, 0.0), try exactSpectralNormRank2(&zero, 2));
+    try std.testing.expectError(Error.InvalidShape, exactSpectralNormRank2(&single, 2));
+    try std.testing.expectError(Error.InvalidShape, exactSpectralNormRank2(&single, 0));
+}
+
+test "normalizeRank2 enforces the target exactly" {
+    const dim: usize = 48;
+    var w: [dim * 2]f32 = undefined;
+    var before: [dim * 2]f32 = undefined;
+    fillSliceDeterministic(&w, 51, 2.0);
+    @memcpy(&before, &w);
+    const sigma_before = try exactSpectralNormRank2(&w, dim);
+    try std.testing.expect(sigma_before > 1.0);
+    const reported = try normalizeRank2(&w, dim, 1.0);
+    try std.testing.expectApproxEqRel(reported, sigma_before, 1e-12);
+    try std.testing.expectApproxEqRel(try exactSpectralNormRank2(&w, dim), @as(f64, 1.0), 1e-6);
+    var after_first: [dim * 2]f32 = undefined;
+    @memcpy(&after_first, &w);
+    const unchanged = try normalizeRank2(&w, dim, 5.0);
+    try std.testing.expectApproxEqRel(unchanged, @as(f64, 1.0), 1e-6);
+    try std.testing.expectEqualSlices(f32, &after_first, &w);
+    try std.testing.expectError(Error.InvalidArgument, normalizeRank2(&w, dim, 0.0));
+    try std.testing.expectError(Error.InvalidArgument, normalizeRank2(&w, dim, -1.0));
+}
+
+test "normalizeRank2Stack normalizes every layer" {
+    const layers: usize = 4;
+    const dim: usize = 24;
+    var stack: [layers * dim * 2]f32 = undefined;
+    var sigmas: [layers]f64 = undefined;
+    fillSliceDeterministic(&stack, 61, 3.0);
+    for (0..layers) |l| {
+        const base = l * dim * 2;
+        for (0..dim) |d| {
+            stack[base + d * 2] *= @as(f32, @floatFromInt(l + 1));
+        }
+    }
+    try normalizeRank2Stack(&stack, layers, dim, 1.0, &sigmas);
+    for (0..layers) |l| {
+        try std.testing.expect(sigmas[l] > 1.0);
+        const base = l * dim * 2;
+        try std.testing.expectApproxEqRel(try exactSpectralNormRank2(stack[base .. base + dim * 2], dim), @as(f64, 1.0), 1e-6);
+    }
+    try std.testing.expectError(Error.InvalidShape, normalizeRank2Stack(&stack, layers, dim, 1.0, sigmas[0..2]));
+    try std.testing.expectError(Error.InvalidShape, normalizeRank2Stack(stack[0..10], layers, dim, 1.0, &sigmas));
+    try normalizeRank2Stack(&stack, 0, dim, 1.0, &sigmas);
+}
+
+test "hadamard block involution and norm preservation" {
+    const len: usize = 32;
+    var block: [len]f32 = undefined;
+    var original: [len]f32 = undefined;
+    fillSliceDeterministic(&block, 71, 1.0);
+    @memcpy(&original, &block);
+    const norm_before = normL2F32(&block);
+    try hadamardBlockInPlace(&block);
+    const norm_after = normL2F32(&block);
+    try std.testing.expectApproxEqRel(norm_after, norm_before, 1e-6);
+    try hadamardBlockInPlace(&block);
+    try std.testing.expect(maxAbsDiff(&original, &block) < 1e-5);
+    var unit: [len]f32 = [_]f32{0} ** len;
+    unit[0] = 1.0;
+    try hadamardBlockInPlace(&unit);
+    const expected_magnitude: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(len))));
+    for (unit) |v| try std.testing.expectApproxEqAbs(@abs(v), expected_magnitude, 1e-6);
+    var one: [1]f32 = [_]f32{2.5};
+    try hadamardBlockInPlace(&one);
+    try std.testing.expectEqual(@as(f32, 2.5), one[0]);
+    var three: [3]f32 = [_]f32{ 1, 2, 3 };
+    try std.testing.expectError(Error.InvalidShape, hadamardBlockInPlace(&three));
+}
+
+test "hadamard f64 reference matches f32 path" {
+    const len: usize = 64;
+    var block: [len]f32 = undefined;
+    var out: [len]f64 = undefined;
+    fillSliceDeterministic(&block, 73, 1.0);
+    try hadamardBlockF64(&block, &out);
+    var f32_block: [len]f32 = undefined;
+    @memcpy(&f32_block, &block);
+    try hadamardBlockInPlace(&f32_block);
+    for (0..len) |i| {
+        try std.testing.expectApproxEqAbs(@as(f64, @floatCast(f32_block[i])), out[i], 1e-5);
+    }
+}
+
+test "global diffusion involution and mixing on power of two rows" {
+    const row_len: usize = 32;
+    const layout = types.rsfDiffusionLayout(row_len).?;
+    try std.testing.expectEqual(@as(usize, 1), layout.radix);
+    try std.testing.expectEqual(@as(usize, 5), layout.stages);
+    var row: [row_len]f32 = undefined;
+    var original: [row_len]f32 = undefined;
+    var scratch: [row_len]f32 = undefined;
+    fillSliceDeterministic(&row, 81, 1.0);
+    @memcpy(&original, &row);
+    const norm_before = normL2F32(&row);
+    try globalDiffuseRowInPlace(&row, layout, &scratch);
+    try std.testing.expectApproxEqRel(normL2F32(&row), norm_before, 1e-5);
+    var nonzero: usize = 0;
+    for (row) |v| {
+        if (@abs(v) > 1e-6) nonzero += 1;
+    }
+    try std.testing.expectEqual(row_len, nonzero);
+    try globalDiffuseRowInPlace(&row, layout, &scratch);
+    try std.testing.expect(maxAbsDiff(&original, &row) < 1e-4);
+    var delta: [row_len]f32 = [_]f32{0} ** row_len;
+    delta[7] = 1.0;
+    try globalDiffuseRowInPlace(&delta, layout, &scratch);
+    const expected: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(row_len))));
+    for (delta) |v| try std.testing.expectApproxEqAbs(@abs(v), expected, 1e-6);
+    try std.testing.expectError(Error.InvalidShape, globalDiffuseRowInPlace(row[0..16], layout, &scratch));
+}
+
+test "global diffusion eliminates cross block isolation with radix three" {
+    const row_len: usize = 48;
+    const layout = types.rsfDiffusionLayout(row_len).?;
+    try std.testing.expectEqual(@as(usize, 3), layout.radix);
+    try std.testing.expectEqual(@as(usize, 16), layout.block);
+    try std.testing.expectEqual(@as(usize, 4), layout.stages);
+    var row: [row_len]f32 = [_]f32{0} ** row_len;
+    var original: [row_len]f32 = [_]f32{0} ** row_len;
+    var scratch: [row_len]f32 = undefined;
+    row[5] = 1.0;
+    @memcpy(&original, &row);
+    try globalDiffuseRowInPlace(&row, layout, &scratch);
+    for (0..3) |b| {
+        var block_energy: f64 = 0.0;
+        for (0..layout.block) |o| {
+            const v: f64 = @floatCast(row[b * layout.block + o]);
+            block_energy += v * v;
+        }
+        try std.testing.expect(block_energy > 1e-4);
+    }
+    try globalDiffuseRowInPlace(&row, layout, &scratch);
+    try std.testing.expect(maxAbsDiff(&original, &row) < 1e-4);
+    try std.testing.expectApproxEqRel(normL2F32(&row), @as(f64, 1.0), 1e-5);
+    try std.testing.expectError(Error.InvalidShape, globalDiffuseRowInPlace(&row, layout, scratch[0..2]));
+}
+
+test "global diffusion f64 reference agrees with the f32 kernel" {
+    const row_len: usize = 96;
+    const layout = types.rsfDiffusionLayout(row_len).?;
+    try std.testing.expectEqual(@as(usize, 3), layout.radix);
+    try std.testing.expectEqual(@as(usize, 32), layout.block);
+    try std.testing.expectEqual(@as(usize, 5), layout.stages);
+    var row: [row_len]f32 = undefined;
+    var work: [row_len]f64 = undefined;
+    var scratch64: [row_len]f64 = undefined;
+    var f32_row: [row_len]f32 = undefined;
+    var scratch: [row_len]f32 = undefined;
+    fillSliceDeterministic(&row, 91, 1.0);
+    @memcpy(&f32_row, &row);
+    try globalDiffuseRowF64(&row, layout, &work, &scratch64);
+    try globalDiffuseRowInPlace(&f32_row, layout, &scratch);
+    for (0..row_len) |i| {
+        try std.testing.expectApproxEqAbs(@as(f64, @floatCast(f32_row[i])), work[i], 1e-5);
+    }
+    var pristine: [row_len]f32 = undefined;
+    fillSliceDeterministic(&pristine, 91, 1.0);
+    try globalDiffuseRowF64(&row, layout, &work, &scratch64);
+    for (0..row_len) |i| {
+        try std.testing.expectApproxEqAbs(@as(f64, @floatCast(row[i])), @as(f64, @floatCast(pristine[i])), 1e-4);
+    }
+}
+
+test "global diffusion pair gather matches contiguous row" {
+    const dim: usize = 24;
+    const row_len: usize = dim * 2;
+    const layout = types.rsfDiffusionLayout(row_len).?;
+    var x1: [dim]f32 = undefined;
+    var x2: [dim]f32 = undefined;
+    var row: [row_len]f32 = undefined;
+    var row_scratch: [row_len]f32 = undefined;
+    var block_scratch: [row_len]f32 = undefined;
+    var scratch: [row_len]f32 = undefined;
+    fillSliceDeterministic(&x1, 101, 1.0);
+    fillSliceDeterministic(&x2, 102, 1.0);
+    @memcpy(row[0..dim], &x1);
+    @memcpy(row[dim..], &x2);
+    try globalDiffuseRowInPlace(&row, layout, &scratch);
+    try globalDiffusePairInPlace(&x1, &x2, layout, &row_scratch, &block_scratch);
+    try std.testing.expectEqualSlices(f32, row[0..dim], &x1);
+    try std.testing.expectEqualSlices(f32, row[dim..], &x2);
+    try globalDiffusePairInPlace(&x1, &x2, layout, &row_scratch, &block_scratch);
+    try globalDiffuseRowInPlace(&row, layout, &scratch);
+    try std.testing.expectEqualSlices(f32, row[0..dim], &x1);
+    try std.testing.expectEqualSlices(f32, row[dim..], &x2);
+    var batch_rows: [2 * row_len]f32 = undefined;
+    fillSliceDeterministic(&batch_rows, 103, 1.0);
+    var batch_copy: [2 * row_len]f32 = undefined;
+    @memcpy(&batch_copy, &batch_rows);
+    try globalDiffuseRows(&batch_rows, 2, layout, &scratch);
+    try globalDiffuseRowInPlace(batch_copy[0..row_len], layout, &scratch);
+    try globalDiffuseRowInPlace(batch_copy[row_len..], layout, &scratch);
+    try std.testing.expectEqualSlices(f32, &batch_copy, &batch_rows);
+    try std.testing.expectError(Error.InvalidShape, globalDiffuseRows(&batch_rows, 3, layout, &scratch));
+}
+
+test "global diffusion stack tiled kernel matches the scratch kernel" {
+    const row_len: usize = 192;
+    const layout = types.rsfDiffusionLayout(row_len).?;
+    try std.testing.expectEqual(@as(usize, 3), layout.radix);
+    try std.testing.expectEqual(@as(usize, 64), layout.block);
+    var a: [row_len]f32 = undefined;
+    var b: [row_len]f32 = undefined;
+    var scratch: [row_len]f32 = undefined;
+    fillSliceDeterministic(&a, 171, 1.0);
+    @memcpy(&b, &a);
+    try globalDiffuseRowStack(&a, layout);
+    try globalDiffuseRowInPlace(&b, layout, &scratch);
+    try std.testing.expectEqualSlices(f32, &a, &b);
+    try std.testing.expect(diffusionLayoutIsApplicable(row_len, layout));
+    try std.testing.expect(!diffusionLayoutIsApplicable(row_len, .{ .row_len = row_len, .radix = 4, .block = 48, .stages = 4 }));
+    try std.testing.expect(!diffusionLayoutIsApplicable(row_len + 1, layout));
+    try std.testing.expectError(Error.InvalidDiffusionLayout, globalDiffuseRowStack(&a, .{ .row_len = row_len, .radix = 5, .block = 32, .stages = 5 }));
+    try globalDiffuseRowStack(&a, layout);
+    try globalDiffuseRowInPlace(&b, layout, &scratch);
+    try std.testing.expect(maxAbsDiff(&a, &b) < 1e-6);
+    var batch: [3 * row_len]f32 = undefined;
+    fillSliceDeterministic(&batch, 172, 1.0);
+    var single: [3 * row_len]f32 = undefined;
+    @memcpy(&single, &batch);
+    try globalDiffuseRowsStack(&batch, 3, layout);
+    for (0..3) |i| try globalDiffuseRowStack(single[i * row_len ..][0..row_len], layout);
+    try std.testing.expectEqualSlices(f32, &batch, &single);
+    try std.testing.expectError(Error.InvalidShape, globalDiffuseRowsStack(&batch, 4, layout));
+    try std.testing.expectError(Error.InvalidShape, globalDiffuseRowStack(batch[0..16], layout));
+}
+
+test "global diffusion stack kernel handles non tile aligned blocks" {
+    const row_len: usize = 3 * 16;
+    const layout = types.rsfDiffusionLayout(row_len).?;
+    try std.testing.expectEqual(@as(usize, 16), layout.block);
+    var row: [row_len]f32 = undefined;
+    var original: [row_len]f32 = undefined;
+    fillSliceDeterministic(&row, 173, 1.0);
+    @memcpy(&original, &row);
+    const norm_before = normL2F32(&row);
+    try globalDiffuseRowStack(&row, layout);
+    try std.testing.expectApproxEqRel(normL2F32(&row), norm_before, 1e-5);
+    try globalDiffuseRowStack(&row, layout);
+    try std.testing.expect(maxAbsDiff(&original, &row) < 1e-4);
+}
+
+test "causal coupling with zero mask reproduces the per token path" {
+    const dim: usize = 6;
+    const seq_len: usize = 5;
+    var mask = try types.RSFSequenceMask.initZero(std.testing.allocator, seq_len);
+    defer mask.deinit();
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = undefined;
+    var x1: [seq_len * dim]f32 = undefined;
+    var x2: [seq_len * dim]f32 = undefined;
+    var y1: [seq_len * dim]f32 = undefined;
+    var y2: [seq_len * dim]f32 = undefined;
+    var key: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    fillSliceDeterministic(&s_weight, 111, 0.3);
+    fillSliceDeterministic(&t_weight, 112, 0.3);
+    fillSliceDeterministic(&x1, 113, 1.0);
+    fillSliceDeterministic(&x2, 114, 1.0);
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const logdet_causal = try causalCouplingForward(params, mask, &x1, &x2, &y1, &y2, &key, &scale, &trans);
+    var per_token_x1: [seq_len * dim]f32 = undefined;
+    var per_token_x2: [seq_len * dim]f32 = undefined;
+    @memcpy(&per_token_x1, &x1);
+    @memcpy(&per_token_x2, &x2);
+    var logdet_per_token: f64 = 0.0;
+    for (0..seq_len) |t| {
+        logdet_per_token += try couplingForwardHalves(params, per_token_x1[t * dim ..][0..dim], per_token_x2[t * dim ..][0..dim], &scale, &trans);
+    }
+    try std.testing.expectApproxEqAbs(logdet_causal, logdet_per_token, 1e-9);
+    try std.testing.expectEqualSlices(f32, &per_token_x1, &y1);
+    try std.testing.expectEqualSlices(f32, &per_token_x2, &y2);
+}
+
+test "causal coupling full causal roundtrip and logdet" {
+    const dim: usize = 5;
+    const seq_len: usize = 7;
+    var mask = try types.RSFSequenceMask.initCausal(std.testing.allocator, seq_len);
+    defer mask.deinit();
+    try std.testing.expect(mask.full_causal);
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = undefined;
+    var x1: [seq_len * dim]f32 = undefined;
+    var x2: [seq_len * dim]f32 = undefined;
+    var original_x1: [seq_len * dim]f32 = undefined;
+    var original_x2: [seq_len * dim]f32 = undefined;
+    var y1: [seq_len * dim]f32 = undefined;
+    var y2: [seq_len * dim]f32 = undefined;
+    var key: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    fillSliceDeterministic(&s_weight, 121, 0.25);
+    fillSliceDeterministic(&t_weight, 122, 0.25);
+    fillSliceDeterministic(&x1, 123, 0.7);
+    fillSliceDeterministic(&x2, 124, 0.7);
+    @memcpy(&original_x1, &x1);
+    @memcpy(&original_x2, &x2);
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const logdet_forward = try causalCouplingForward(params, mask, &x1, &x2, &y1, &y2, &key, &scale, &trans);
+    var expected_logdet: f64 = 0.0;
+    for (0..seq_len) |t| {
+        for (0..dim) |d| {
+            var acc: f32 = 0.0;
+            for (0..t + 1) |j| acc += x2[j * dim + d];
+            expected_logdet += clipCoupling(s_weight[d * 2] * acc + s_weight[d * 2 + 1], -5.0, 5.0);
+        }
+    }
+    try std.testing.expectApproxEqAbs(logdet_forward, expected_logdet, 1e-8);
+    var recovered_x1: [seq_len * dim]f32 = undefined;
+    var recovered_x2: [seq_len * dim]f32 = undefined;
+    const logdet_inverse = try causalCouplingInverse(params, mask, &y1, &y2, &recovered_x1, &recovered_x2, &key, &scale, &trans);
+    try std.testing.expectApproxEqAbs(logdet_inverse, logdet_forward, 1e-5);
+    try std.testing.expect(maxAbsDiff(&original_x1, &recovered_x1) < 1e-4);
+    try std.testing.expect(maxAbsDiff(&original_x2, &recovered_x2) < 1e-4);
+    var in_place_y1: [seq_len * dim]f32 = undefined;
+    var in_place_y2: [seq_len * dim]f32 = undefined;
+    @memcpy(&in_place_y1, &x1);
+    @memcpy(&in_place_y2, &x2);
+    _ = try causalCouplingForward(params, mask, &in_place_y1, &in_place_y2, &in_place_y1, &in_place_y2, &key, &scale, &trans);
+    try std.testing.expectEqualSlices(f32, &y1, &in_place_y1);
+    try std.testing.expectEqualSlices(f32, &y2, &in_place_y2);
+    _ = try causalCouplingInverse(params, mask, &in_place_y1, &in_place_y2, &in_place_y1, &in_place_y2, &key, &scale, &trans);
+    try std.testing.expect(maxAbsDiff(&x1, &in_place_y1) < 1e-4);
+    try std.testing.expect(maxAbsDiff(&x2, &in_place_y2) < 1e-4);
+}
+
+test "causal coupling band mask roundtrip and rejection of aliasing" {
+    const dim: usize = 4;
+    const seq_len: usize = 9;
+    var mask = try types.RSFSequenceMask.initBand(std.testing.allocator, seq_len, 2);
+    defer mask.deinit();
+    try std.testing.expect(!mask.full_causal);
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = undefined;
+    var x1: [seq_len * dim]f32 = undefined;
+    var x2: [seq_len * dim]f32 = undefined;
+    var original_x1: [seq_len * dim]f32 = undefined;
+    var original_x2: [seq_len * dim]f32 = undefined;
+    var y1: [seq_len * dim]f32 = undefined;
+    var y2: [seq_len * dim]f32 = undefined;
+    var key: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    fillSliceDeterministic(&s_weight, 131, 0.3);
+    fillSliceDeterministic(&t_weight, 132, 0.3);
+    fillSliceDeterministic(&x1, 133, 0.9);
+    fillSliceDeterministic(&x2, 134, 0.9);
+    @memcpy(&original_x1, &x1);
+    @memcpy(&original_x2, &x2);
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    _ = try causalCouplingForward(params, mask, &x1, &x2, &y1, &y2, &key, &scale, &trans);
+    try std.testing.expectError(Error.InvalidArgument, causalCouplingForward(params, mask, &x1, &x2, &x1, &x2, &key, &scale, &trans));
+    var recovered_x1: [seq_len * dim]f32 = undefined;
+    var recovered_x2: [seq_len * dim]f32 = undefined;
+    const logdet_inverse = try causalCouplingInverse(params, mask, &y1, &y2, &recovered_x1, &recovered_x2, &key, &scale, &trans);
+    try std.testing.expect(maxAbsDiff(&original_x1, &recovered_x1) < 1e-4);
+    try std.testing.expect(maxAbsDiff(&original_x2, &recovered_x2) < 1e-4);
+    var in_place_x2: [seq_len * dim]f32 = undefined;
+    @memcpy(&in_place_x2, &x2);
+    const logdet_in_place = try causalCouplingInverse(params, mask, &y1, &y2, &recovered_x1, &in_place_x2, &key, &scale, &trans);
+    try std.testing.expectApproxEqAbs(logdet_inverse, logdet_in_place, 1e-9);
+    try std.testing.expect(maxAbsDiff(&recovered_x2, &in_place_x2) < 1e-5);
+}
+
+test "causal coupling fast path equals the sparse path bit for bit" {
+    const dim: usize = 4;
+    const seq_len: usize = 6;
+    const allocator = std.testing.allocator;
+    var fast = try types.RSFSequenceMask.initCausal(allocator, seq_len);
+    defer fast.deinit();
+    var bytes = try fast.toBytes(allocator);
+    defer allocator.free(bytes);
+    bytes[(seq_len - 1) * seq_len + (seq_len - 2)] = 0;
+    var sparse = try types.RSFSequenceMask.initFromBytes(allocator, seq_len, bytes);
+    defer sparse.deinit();
+    try std.testing.expect(fast.full_causal);
+    try std.testing.expect(!sparse.full_causal);
+    try std.testing.expectEqual(fast.nnz - 1, sparse.nnz);
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = undefined;
+    var x1: [seq_len * dim]f32 = undefined;
+    var x2: [seq_len * dim]f32 = undefined;
+    var y_fast1: [seq_len * dim]f32 = undefined;
+    var y_fast2: [seq_len * dim]f32 = undefined;
+    var y_sparse1: [seq_len * dim]f32 = undefined;
+    var y_sparse2: [seq_len * dim]f32 = undefined;
+    var key: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    fillSliceDeterministic(&s_weight, 141, 0.3);
+    fillSliceDeterministic(&t_weight, 142, 0.3);
+    fillSliceDeterministic(&x1, 143, 0.8);
+    fillSliceDeterministic(&x2, 144, 0.8);
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const logdet_fast = try causalCouplingForward(params, fast, &x1, &x2, &y_fast1, &y_fast2, &key, &scale, &trans);
+    const logdet_sparse = try causalCouplingForward(params, sparse, &x1, &x2, &y_sparse1, &y_sparse2, &key, &scale, &trans);
+    var sparse_reference_logdet: f64 = 0.0;
+    for (0..seq_len) |t| {
+        for (0..dim) |d| {
+            var acc: f32 = x2[t * dim + d];
+            for (0..t) |j| {
+                if (sparse.get(t, j)) acc += x2[j * dim + d];
+            }
+            sparse_reference_logdet += clipCoupling(s_weight[d * 2] * acc + s_weight[d * 2 + 1], -5.0, 5.0);
+        }
+    }
+    try std.testing.expectApproxEqAbs(logdet_sparse, sparse_reference_logdet, 1e-5);
+    try std.testing.expect(@abs(logdet_fast - logdet_sparse) > 1e-4);
+    for (0..seq_len - 1) |t| {
+        try std.testing.expectEqualSlices(f32, y_fast1[t * dim ..][0..dim], y_sparse1[t * dim ..][0..dim]);
+        try std.testing.expectEqualSlices(f32, y_fast2[t * dim ..][0..dim], y_sparse2[t * dim ..][0..dim]);
+    }
+    var reference_x1: [seq_len * dim]f32 = undefined;
+    var reference_x2: [seq_len * dim]f32 = undefined;
+    @memcpy(&reference_x1, &x1);
+    @memcpy(&reference_x2, &x2);
+    var reference_logdet: f64 = 0.0;
+    for (0..seq_len) |t| {
+        for (0..dim) |d| {
+            var acc: f32 = x2[t * dim + d];
+            for (0..t) |j| {
+                if (fast.get(t, j)) acc += x2[j * dim + d];
+            }
+            const clipped = clipCoupling(s_weight[d * 2] * acc + s_weight[d * 2 + 1], -5.0, 5.0);
+            reference_logdet += clipped;
+            reference_x1[t * dim + d] = x1[t * dim + d] * @exp(clipped);
+        }
+        for (0..dim) |d| {
+            reference_x2[t * dim + d] = x2[t * dim + d] + t_weight[d * 2] * reference_x1[t * dim + d] + t_weight[d * 2 + 1];
+        }
+    }
+    try std.testing.expectApproxEqAbs(logdet_fast, reference_logdet, 1e-6);
+    try std.testing.expect(maxAbsDiff(&reference_x1, &y_fast1) < 1e-5);
+    try std.testing.expect(maxAbsDiff(&reference_x2, &y_fast2) < 1e-5);
+}
+
+test "causal coupling preserves strict causality" {
+    const dim: usize = 4;
+    const seq_len: usize = 6;
+    var mask = try types.RSFSequenceMask.initCausal(std.testing.allocator, seq_len);
+    defer mask.deinit();
+    var s_weight: [dim * 2]f32 = undefined;
+    var t_weight: [dim * 2]f32 = undefined;
+    var x1: [seq_len * dim]f32 = undefined;
+    var x2: [seq_len * dim]f32 = undefined;
+    var y1: [seq_len * dim]f32 = undefined;
+    var y2: [seq_len * dim]f32 = undefined;
+    var perturbed_y1: [seq_len * dim]f32 = undefined;
+    var perturbed_y2: [seq_len * dim]f32 = undefined;
+    var key: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    fillSliceDeterministic(&s_weight, 151, 0.3);
+    fillSliceDeterministic(&t_weight, 152, 0.3);
+    fillSliceDeterministic(&x1, 153, 1.0);
+    fillSliceDeterministic(&x2, 154, 1.0);
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    _ = try causalCouplingForward(params, mask, &x1, &x2, &y1, &y2, &key, &scale, &trans);
+    const perturbed_token: usize = 3;
+    var perturbed_x1: [seq_len * dim]f32 = undefined;
+    var perturbed_x2: [seq_len * dim]f32 = undefined;
+    @memcpy(&perturbed_x1, &x1);
+    @memcpy(&perturbed_x2, &x2);
+    for (0..dim) |d| {
+        perturbed_x1[perturbed_token * dim + d] += 0.37;
+        perturbed_x2[perturbed_token * dim + d] -= 0.41;
+    }
+    _ = try causalCouplingForward(params, mask, &perturbed_x1, &perturbed_x2, &perturbed_y1, &perturbed_y2, &key, &scale, &trans);
+    for (0..perturbed_token) |t| {
+        try std.testing.expectEqualSlices(f32, y1[t * dim ..][0..dim], perturbed_y1[t * dim ..][0..dim]);
+        try std.testing.expectEqualSlices(f32, y2[t * dim ..][0..dim], perturbed_y2[t * dim ..][0..dim]);
+    }
+    for (perturbed_token..seq_len) |t| {
+        try std.testing.expect(maxAbsDiff(y2[t * dim ..][0..dim], perturbed_y2[t * dim ..][0..dim]) > 0.0);
+    }
+    try std.testing.expectEqual(causalCouplingKeyCount(mask, 0), 1);
+    try std.testing.expectEqual(causalCouplingKeyCount(mask, seq_len - 1), seq_len);
+}
+
+test "causal coupling gradients match finite differences" {
+    const dim: usize = 3;
+    const seq_len: usize = 5;
+    const allocator = std.testing.allocator;
+    var mask = try types.RSFSequenceMask.initBand(allocator, seq_len, 2);
+    defer mask.deinit();
+    const Case = struct {
+        mask: types.RSFSequenceMask,
+        s_weight: [dim * 2]f32,
+        t_weight: [dim * 2]f32,
+        x1: [seq_len * dim]f32,
+        x2: [seq_len * dim]f32,
+        a: [seq_len * dim]f32,
+        b: [seq_len * dim]f32,
+        volume: f32,
+
+        fn loss(self: *@This(), s_override: ?[]const f32, t_override: ?[]const f32, x1_override: ?[]const f32, x2_override: ?[]const f32) !f64 {
+            const s = s_override orelse &self.s_weight;
+            const t = t_override orelse &self.t_weight;
+            const in1 = x1_override orelse &self.x1;
+            const in2 = x2_override orelse &self.x2;
+            const params = try RSFCouplingParams.init(s, t, dim, -5.0, 5.0);
+            var y1: [seq_len * dim]f32 = undefined;
+            var y2: [seq_len * dim]f32 = undefined;
+            var key: [dim]f32 = undefined;
+            var scale: [dim]f32 = undefined;
+            var trans: [dim]f32 = undefined;
+            const logdet = try causalCouplingForward(params, self.mask, in1, in2, &y1, &y2, &key, &scale, &trans);
+            var total: f64 = self.volume * logdet;
+            for (0..seq_len * dim) |i| {
+                total += @as(f64, @floatCast(self.a[i])) * @as(f64, @floatCast(y1[i]));
+                total += @as(f64, @floatCast(self.b[i])) * @as(f64, @floatCast(y2[i]));
+            }
+            return total;
+        }
+    };
+    var case = Case{
+        .mask = mask,
+        .s_weight = undefined,
+        .t_weight = undefined,
+        .x1 = undefined,
+        .x2 = undefined,
+        .a = undefined,
+        .b = undefined,
+        .volume = -0.001,
+    };
+    fillSliceDeterministic(&case.s_weight, 161, 0.2);
+    fillSliceDeterministic(&case.t_weight, 162, 0.2);
+    fillSliceDeterministic(&case.x1, 163, 0.5);
+    fillSliceDeterministic(&case.x2, 164, 0.5);
+    fillSliceDeterministic(&case.a, 165, 1.0);
+    fillSliceDeterministic(&case.b, 166, 1.0);
+    const params = try RSFCouplingParams.init(&case.s_weight, &case.t_weight, dim, -5.0, 5.0);
+    var y1: [seq_len * dim]f32 = undefined;
+    var y2: [seq_len * dim]f32 = undefined;
+    var key: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    _ = try causalCouplingForward(params, mask, &case.x1, &case.x2, &y1, &y2, &key, &scale, &trans);
+    var ds_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var dt_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var dx1: [seq_len * dim]f32 = undefined;
+    var dx2: [seq_len * dim]f32 = undefined;
+    var ds_scratch: [seq_len * dim]f32 = undefined;
+    _ = try causalCouplingBackward(params, mask, &case.x2, &y1, &case.a, &case.b, case.volume, &ds_weight, &dt_weight, &dx1, &dx2, &key, &ds_scratch);
+    const h: f32 = 1e-3;
+    const inv2h: f64 = 1.0 / (2.0 * @as(f64, @floatCast(h)));
+    for (0..seq_len * dim) |i| {
+        var plus = case.x1;
+        var minus = case.x1;
+        plus[i] += h;
+        minus[i] -= h;
+        const lp = try case.loss(null, null, &plus, null);
+        const lm = try case.loss(null, null, &minus, null);
+        try std.testing.expectApproxEqAbs(dx1[i], (lp - lm) * inv2h, 5e-3);
+
+        var plus2 = case.x2;
+        var minus2 = case.x2;
+        plus2[i] += h;
+        minus2[i] -= h;
+        const lp2 = try case.loss(null, null, null, &plus2);
+        const lm2 = try case.loss(null, null, null, &minus2);
+        try std.testing.expectApproxEqAbs(dx2[i], (lp2 - lm2) * inv2h, 5e-3);
+    }
+    for (0..dim) |d| {
+        for (0..2) |col| {
+            var plus_s = case.s_weight;
+            var minus_s = case.s_weight;
+            plus_s[d * 2 + col] += h;
+            minus_s[d * 2 + col] -= h;
+            const lps = try case.loss(&plus_s, null, null, null);
+            const lms = try case.loss(&minus_s, null, null, null);
+            try std.testing.expectApproxEqAbs(ds_weight[d * 2 + col], (lps - lms) * inv2h, 5e-3);
+
+            var plus_t = case.t_weight;
+            var minus_t = case.t_weight;
+            plus_t[d * 2 + col] += h;
+            minus_t[d * 2 + col] -= h;
+            const lpt = try case.loss(null, &plus_t, null, null);
+            const lmt = try case.loss(null, &minus_t, null, null);
+            try std.testing.expectApproxEqAbs(dt_weight[d * 2 + col], (lpt - lmt) * inv2h, 5e-3);
+        }
+    }
+    var causal_mask = try types.RSFSequenceMask.initCausal(allocator, seq_len);
+    defer causal_mask.deinit();
+    case.mask = causal_mask;
+    @memset(&ds_weight, 0.0);
+    @memset(&dt_weight, 0.0);
+    _ = try causalCouplingForward(params, causal_mask, &case.x1, &case.x2, &y1, &y2, &key, &scale, &trans);
+    _ = try causalCouplingBackward(params, causal_mask, &case.x2, &y1, &case.a, &case.b, case.volume, &ds_weight, &dt_weight, &dx1, &dx2, &key, &ds_scratch);
+    for (0..seq_len * dim) |i| {
+        var plus2 = case.x2;
+        var minus2 = case.x2;
+        plus2[i] += h;
+        minus2[i] -= h;
+        const lp2 = try case.loss(null, null, null, &plus2);
+        const lm2 = try case.loss(null, null, null, &minus2);
+        try std.testing.expectApproxEqAbs(dx2[i], (lp2 - lm2) * inv2h, 5e-3);
+    }
+    for (0..dim) |d| {
+        for (0..2) |col| {
+            var plus_s = case.s_weight;
+            var minus_s = case.s_weight;
+            plus_s[d * 2 + col] += h;
+            minus_s[d * 2 + col] -= h;
+            const lps = try case.loss(&plus_s, null, null, null);
+            const lms = try case.loss(&minus_s, null, null, null);
+            try std.testing.expectApproxEqAbs(ds_weight[d * 2 + col], (lps - lms) * inv2h, 5e-3);
+        }
+    }
+    try std.testing.expectError(Error.InvalidShape, causalCouplingBackward(params, causal_mask, &case.x2, &y1, &case.a, &case.b, 0.0, &ds_weight, &dt_weight, &dx1, &dx2, &key, ds_scratch[0..2]));
+}
+
+test "causal coupling rejects malformed shapes" {
+    const dim: usize = 4;
+    const seq_len: usize = 4;
+    var mask = try types.RSFSequenceMask.initCausal(std.testing.allocator, seq_len);
+    defer mask.deinit();
+    var s_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var t_weight: [dim * 2]f32 = [_]f32{0} ** (dim * 2);
+    var x1: [seq_len * dim]f32 = [_]f32{0} ** (seq_len * dim);
+    var x2: [seq_len * dim]f32 = [_]f32{0} ** (seq_len * dim);
+    var y1: [seq_len * dim]f32 = undefined;
+    var y2: [seq_len * dim]f32 = undefined;
+    var key: [dim]f32 = undefined;
+    var scale: [dim]f32 = undefined;
+    var trans: [dim]f32 = undefined;
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    try std.testing.expectError(Error.InvalidShape, causalCouplingForward(params, mask, &x1, &x2, &y1, &y2, key[0..2], &scale, &trans));
+    try std.testing.expectError(Error.InvalidShape, causalCouplingForward(params, mask, x1[0..4], &x2, &y1, &y2, &key, &scale, &trans));
+    var empty = try types.RSFSequenceMask.initZero(std.testing.allocator, 0);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(f64, 0.0), try causalCouplingForward(params, empty, &x1, &x2, &y1, &y2, &key, &scale, &trans));
+    try std.testing.expectEqual(@as(f64, 0.0), try causalCouplingInverse(params, empty, &x1, &x2, &y1, &y2, &key, &scale, &trans));
+}
