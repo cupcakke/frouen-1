@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const Tensor = @import("../core/tensor.zig").Tensor;
+const tensor = @import("../core/tensor.zig");
+const Tensor = tensor.Tensor;
 const memory = @import("../core/memory.zig");
 const core_io = @import("../core/io.zig");
 const accel = @import("../hw/accel/accel_interface.zig");
@@ -9,15 +10,14 @@ const OFTB = @import("oftb.zig").OFTB;
 const types = @import("../core/types.zig");
 const Thread = std.Thread;
 const LAYER_TARGET_SPECTRAL_NORM: f32 = 0.9;
-const LAYER_SPECTRAL_POWER_ITERATIONS: usize = 30;
 const WEIGHT_COLUMN: usize = 0;
 const BIAS_COLUMN: usize = 1;
-const GRADIENT_STEP_SEED_BASE: u64 = 5_000_011;
 const GPU_VALIDATION_SEED: u64 = 0x5D9F_1C33_A17B_0E45;
 const GPU_VALIDATION_BATCH: usize = 2;
 const MODEL_CROSS_CHECK_ABS_TOL: f32 = 5.0e-2;
 const MODEL_CROSS_CHECK_REL_TOL: f32 = 5.0e-2;
-const SAVE_VERSION: u32 = 6;
+const SAVE_VERSION: u32 = 7;
+const SAVE_VERSION_LEGACY: u32 = 6;
 const TENSOR_RANK_TAG: u64 = 2;
 const coupling_width: usize = accel.rsf_coupling_width;
 comptime {
@@ -44,76 +44,38 @@ fn checkedCastU64ToUsize(v: u64) !usize {
     if (v > std.math.maxInt(usize)) return error.TooLarge;
     return @intCast(v);
 }
-fn spectralNormPowerIteration(allocator: Allocator, data: []const f32, rows: usize, cols: usize, iterations: usize, seed: u64) !f32 {
+fn constrainSpectralNorm(weight: *Tensor, rows: usize, cols: usize, target: f32) !void {
+    if (!std.math.isFinite(target) or !(target > 0.0)) return error.InvalidConfig;
     if (rows == 0 or cols == 0) return error.InvalidDimension;
-    if (iterations == 0) return error.InvalidIterationCount;
+    if (cols != coupling_width) return error.ShapeMismatch;
     const expected = try checkedMul(rows, cols);
-    if (data.len != expected) return error.DataLengthMismatch;
-    const u = try allocator.alloc(f32, rows);
-    defer allocator.free(u);
-    @memset(u, @as(f32, 0.0));
-    const v = try allocator.alloc(f32, cols);
-    defer allocator.free(v);
-    var prng = types.PRNG.init(seed);
-    for (v) |*x| x.* = prng.float() * 2.0 - 1.0;
-    var v_seed_norm_sq: f32 = 0.0;
-    for (v) |x| v_seed_norm_sq += x * x;
-    if (!(v_seed_norm_sq > 0.0)) {
-        for (v) |*x| x.* = 1.0;
-    }
-    var iter: usize = 0;
-    while (iter < iterations) : (iter += 1) {
-        for (u) |*x| x.* = 0.0;
-        var i: usize = 0;
-        while (i < rows) : (i += 1) {
-            const row = data[i * cols .. i * cols + cols];
-            var sum: f32 = 0.0;
-            var j: usize = 0;
-            while (j < cols) : (j += 1) sum += row[j] * v[j];
-            u[i] = sum;
-        }
-        var u_norm_sq: f32 = 0.0;
-        for (u) |x| u_norm_sq += x * x;
-        const u_norm = @sqrt(u_norm_sq);
-        if (u_norm > 1e-12) {
-            for (u) |*x| x.* /= u_norm;
-        }
-        for (v) |*x| x.* = 0.0;
-        i = 0;
-        while (i < rows) : (i += 1) {
-            const row = data[i * cols .. i * cols + cols];
-            const ui = u[i];
-            var j: usize = 0;
-            while (j < cols) : (j += 1) v[j] += row[j] * ui;
-        }
-        var v_norm_sq: f32 = 0.0;
-        for (v) |x| v_norm_sq += x * x;
-        const v_norm = @sqrt(v_norm_sq);
-        if (v_norm > 1e-12) {
-            for (v) |*x| x.* /= v_norm;
-        }
-    }
-    var sigma: f64 = 0.0;
-    var i: usize = 0;
-    while (i < rows) : (i += 1) {
-        const row = data[i * cols .. i * cols + cols];
-        var partial: f64 = 0.0;
-        var j: usize = 0;
-        while (j < cols) : (j += 1) partial += @as(f64, row[j]) * @as(f64, v[j]);
-        sigma += @as(f64, u[i]) * partial;
-    }
+    if (weight.data.len < expected) return error.DataLengthMismatch;
+    try ensureFiniteSlice(weight.data[0..expected]);
+    const sigma = try tensor.constrainCouplingSpectralNorm(weight.data[0..expected], rows, target);
     const sigma_f32: f32 = @floatCast(sigma);
     if (!std.math.isFinite(sigma_f32)) return error.NonFinite;
-    return if (sigma_f32 >= 0) sigma_f32 else -sigma_f32;
 }
-fn constrainSpectralNorm(allocator: Allocator, weight: *Tensor, rows: usize, cols: usize, target: f32, seed: u64) !void {
-    if (!std.math.isFinite(target) or !(target > 0.0)) return error.InvalidConfig;
-    const norm = try spectralNormPowerIteration(allocator, weight.data, rows, cols, LAYER_SPECTRAL_POWER_ITERATIONS, seed);
-    if (norm > target and norm > 1e-12) {
-        const factor = target / norm;
-        for (weight.data) |*x| x.* *= factor;
-    }
+
+pub fn exactSpectralNormRank2(weight: []const f32, dim: usize) !f32 {
+    if (dim == 0) return error.InvalidDimension;
+    const expected = try checkedMul(dim, coupling_width);
+    if (weight.len < expected) return error.DataLengthMismatch;
+    const sigma = try tensor.exactSpectralNormRank2(weight[0..expected], dim);
+    const sigma_f32: f32 = @floatCast(sigma);
+    if (!std.math.isFinite(sigma_f32)) return error.NonFinite;
+    return sigma_f32;
 }
+
+pub fn layerTargetSpectralNorm() f32 {
+    return LAYER_TARGET_SPECTRAL_NORM;
+}
+
+pub fn diffusionLayoutForRowLen(row_len: usize) !types.RSFDiffusionLayout {
+    const layout = types.rsfDiffusionLayout(row_len) orelse return error.InvalidConfig;
+    if (!tensor.diffusionLayoutIsApplicable(row_len, layout)) return error.InvalidConfig;
+    return layout;
+}
+
 pub const RSFLayerConfig = struct {
     clip_min: f32 = -5.0,
     clip_max: f32 = 5.0,
@@ -126,6 +88,7 @@ pub const RSFConfig = struct {
     grad_mean: bool = true,
     max_dim: usize = 1 << 20,
     max_layers: usize = 1 << 20,
+    global_diffusion: bool = true,
 };
 fn validateClipRange(clip_min: f32, clip_max: f32) !void {
     if (!std.math.isFinite(clip_min) or !std.math.isFinite(clip_max)) return error.NonFinite;
@@ -200,6 +163,15 @@ fn validateModelConfigValues(dim: usize, num_layers: usize, cfg: RSFConfig) !voi
     try validateClipRange(cfg.clip_min, cfg.clip_max);
     if (cfg.max_dim == 0 or cfg.max_layers == 0) return error.InvalidConfig;
     if (dim > cfg.max_dim or num_layers > cfg.max_layers) return error.InvalidConfig;
+    if (cfg.global_diffusion) _ = try diffusionLayoutForRowLen(try checkedMul(dim, 2));
+}
+
+fn initOFTBForConfig(dim: usize, global_diffusion: bool) !OFTB {
+    if (global_diffusion) {
+        _ = try diffusionLayoutForRowLen(try checkedMul(dim, 2));
+        return OFTB.initWithDiffusion(dim, true);
+    }
+    return OFTB.init(dim);
 }
 const LayerCore = struct {
     s_weight: Tensor,
@@ -211,6 +183,9 @@ const LayerCore = struct {
     clip_min: f32,
     clip_max: f32,
     grad_mean: bool,
+    gn_block: ?[]f32,
+    model_id: u64,
+    layer_index: usize,
     rwlock: Thread.RwLock,
     fn initOwned(allocator: Allocator, dim: usize, config: RSFLayerConfig) !LayerCore {
         if (dim == 0) return error.InvalidDimension;
@@ -234,8 +209,8 @@ const LayerCore = struct {
             s_w.data[d * coupling_width + BIAS_COLUMN] = 0.0;
             t_w.data[d * coupling_width + BIAS_COLUMN] = 0.0;
         }
-        try constrainSpectralNorm(allocator, &s_w, dim, coupling_width, LAYER_TARGET_SPECTRAL_NORM, checkedAddU64(seed1, 9_000_000) catch seed1);
-        try constrainSpectralNorm(allocator, &t_w, dim, coupling_width, LAYER_TARGET_SPECTRAL_NORM, checkedAddU64(seed2, 9_000_000) catch seed2);
+        try constrainSpectralNorm(&s_w, dim, coupling_width, LAYER_TARGET_SPECTRAL_NORM);
+        try constrainSpectralNorm(&t_w, dim, coupling_width, LAYER_TARGET_SPECTRAL_NORM);
         return LayerCore{
             .s_weight = s_w,
             .t_weight = t_w,
@@ -246,6 +221,9 @@ const LayerCore = struct {
             .clip_min = config.clip_min,
             .clip_max = config.clip_max,
             .grad_mean = config.grad_mean,
+            .gn_block = null,
+            .model_id = 0,
+            .layer_index = 0,
             .rwlock = .{},
         };
     }
@@ -254,8 +232,10 @@ const LayerCore = struct {
         self.t_weight.deinit();
         if (self.s_weight_grad) |*g| g.deinit();
         if (self.t_weight_grad) |*g| g.deinit();
+        if (self.gn_block) |blk| self.allocator.free(blk);
         self.s_weight_grad = null;
         self.t_weight_grad = null;
+        self.gn_block = null;
     }
     pub fn ensureGradients(self: *LayerCore) !void {
         const need_swg = self.s_weight_grad == null;
@@ -291,7 +271,7 @@ const LayerCore = struct {
         }
         return total;
     }
-    fn applyGradientStep(self: *LayerCore, learning_rate: f32, seed: u64) !void {
+    fn applyGradientStep(self: *LayerCore, learning_rate: f32) !void {
         if (!std.math.isFinite(learning_rate)) return error.NonFinite;
         if (!(learning_rate > 0.0)) return error.InvalidLearningRate;
         const s_grad: *Tensor = if (self.s_weight_grad) |*g| g else return error.NoGradients;
@@ -302,7 +282,6 @@ const LayerCore = struct {
         try validateTensor2DShape(t_grad, self.dim, coupling_width);
         try ensureFiniteSlice(s_grad.data);
         try ensureFiniteSlice(t_grad.data);
-        const scratch = scratchAllocator();
         var s_next = try tensorClone(self.allocator, &self.s_weight);
         errdefer s_next.deinit();
         var t_next = try tensorClone(self.allocator, &self.t_weight);
@@ -319,10 +298,8 @@ const LayerCore = struct {
             if (!std.math.isFinite(updated)) return error.NonFinite;
             t_next.data[i] = updated;
         }
-        const seed_s = try checkedAddU64(seed, 11);
-        const seed_t = try checkedAddU64(seed, 13);
-        try constrainSpectralNorm(scratch, &s_next, self.dim, coupling_width, LAYER_TARGET_SPECTRAL_NORM, seed_s);
-        try constrainSpectralNorm(scratch, &t_next, self.dim, coupling_width, LAYER_TARGET_SPECTRAL_NORM, seed_t);
+        try constrainSpectralNorm(&s_next, self.dim, coupling_width, LAYER_TARGET_SPECTRAL_NORM);
+        try constrainSpectralNorm(&t_next, self.dim, coupling_width, LAYER_TARGET_SPECTRAL_NORM);
         try ensureFiniteSlice(s_next.data);
         try ensureFiniteSlice(t_next.data);
         self.s_weight.deinit();
@@ -340,113 +317,87 @@ const LayerCore = struct {
         _ = try checkedMul(batch_size, self.dim);
         return batch_size;
     }
-    fn computeTranslationRow(self: *const LayerCore, input_row: []const f32, out_row: []f32) void {
-        const dim = self.dim;
-        var d: usize = 0;
-        while (d < dim) : (d += 1) {
-            const w = self.t_weight.data[d * coupling_width + WEIGHT_COLUMN];
-            const bias = self.t_weight.data[d * coupling_width + BIAS_COLUMN];
-            out_row[d] = w * input_row[d] + bias;
-        }
-    }
-    fn computeScaleRow(self: *const LayerCore, input_row: []const f32, out_row: []f32) void {
-        const dim = self.dim;
-        var d: usize = 0;
-        while (d < dim) : (d += 1) {
-            const w = self.s_weight.data[d * coupling_width + WEIGHT_COLUMN];
-            const bias = self.s_weight.data[d * coupling_width + BIAS_COLUMN];
-            const sum = w * input_row[d] + bias;
-            const clipped = if (sum < self.clip_min) self.clip_min else if (sum > self.clip_max) self.clip_max else sum;
-            out_row[d] = @exp(clipped);
-        }
-    }
-    fn computeScaleLogDetRow(self: *const LayerCore, input_row: []const f32, out_row: []f32) f32 {
-        const dim = self.dim;
-        var logdet: f32 = 0.0;
-        var d: usize = 0;
-        while (d < dim) : (d += 1) {
-            const w = self.s_weight.data[d * coupling_width + WEIGHT_COLUMN];
-            const bias = self.s_weight.data[d * coupling_width + BIAS_COLUMN];
-            const sum = w * input_row[d] + bias;
-            const clipped = if (sum < self.clip_min) self.clip_min else if (sum > self.clip_max) self.clip_max else sum;
-            logdet += clipped;
-            out_row[d] = @exp(clipped);
-        }
-        return logdet;
+    fn couplingParams(self: *const LayerCore) !tensor.RSFCouplingParams {
+        const expected = try checkedMul(self.dim, coupling_width);
+        if (self.s_weight.data.len < expected) return error.DataLengthMismatch;
+        if (self.t_weight.data.len < expected) return error.DataLengthMismatch;
+        return tensor.RSFCouplingParams.init(self.s_weight.data[0..expected], self.t_weight.data[0..expected], self.dim, self.clip_min, self.clip_max);
     }
     fn couplingForwardRow(self: *const LayerCore, row: []f32, scale: []f32, trans: []f32) !void {
         const dim = self.dim;
         const total = try checkedMul(dim, 2);
         if (row.len != total) return error.DataLengthMismatch;
         if (scale.len < dim or trans.len < dim) return error.DataLengthMismatch;
-        const x1_row = row[0..dim];
-        const x2_row = row[dim..total];
-        self.computeScaleRow(x2_row, scale);
-        var i: usize = 0;
-        while (i < dim) : (i += 1) x1_row[i] *= scale[i];
-        self.computeTranslationRow(x1_row, trans);
-        i = 0;
-        while (i < dim) : (i += 1) x2_row[i] += trans[i];
+        const params = try self.couplingParams();
+        _ = try tensor.couplingForwardHalves(params, row[0..dim], row[dim..total], scale, trans);
     }
     fn couplingForwardLogDetRow(self: *const LayerCore, row: []f32, scale: []f32, trans: []f32) !f32 {
         const dim = self.dim;
         const total = try checkedMul(dim, 2);
         if (row.len != total) return error.DataLengthMismatch;
         if (scale.len < dim or trans.len < dim) return error.DataLengthMismatch;
-        const x1_row = row[0..dim];
-        const x2_row = row[dim..total];
-        const logdet = self.computeScaleLogDetRow(x2_row, scale);
-        var i: usize = 0;
-        while (i < dim) : (i += 1) x1_row[i] *= scale[i];
-        self.computeTranslationRow(x1_row, trans);
-        i = 0;
-        while (i < dim) : (i += 1) x2_row[i] += trans[i];
-        return logdet;
+        const params = try self.couplingParams();
+        const logdet = try tensor.couplingForwardHalves(params, row[0..dim], row[dim..total], scale, trans);
+        const logdet_f32: f32 = @floatCast(logdet);
+        if (!std.math.isFinite(logdet_f32)) return error.NonFinite;
+        return logdet_f32;
     }
     fn couplingInverseRow(self: *const LayerCore, row: []f32, scale: []f32, trans: []f32) !void {
         const dim = self.dim;
         const total = try checkedMul(dim, 2);
         if (row.len != total) return error.DataLengthMismatch;
         if (scale.len < dim or trans.len < dim) return error.DataLengthMismatch;
-        const y1_row = row[0..dim];
-        const y2_row = row[dim..total];
-        self.computeTranslationRow(y1_row, trans);
-        var i: usize = 0;
-        while (i < dim) : (i += 1) y2_row[i] -= trans[i];
-        self.computeScaleRow(y2_row, scale);
-        i = 0;
-        while (i < dim) : (i += 1) y1_row[i] /= scale[i];
+        const params = try self.couplingParams();
+        _ = try tensor.couplingInverseHalves(params, row[0..dim], row[dim..total], scale, trans);
+    }
+    fn couplingInverseLogDetRow(self: *const LayerCore, row: []f32, scale: []f32, trans: []f32) !f32 {
+        const dim = self.dim;
+        const total = try checkedMul(dim, 2);
+        if (row.len != total) return error.DataLengthMismatch;
+        if (scale.len < dim or trans.len < dim) return error.DataLengthMismatch;
+        const params = try self.couplingParams();
+        const logdet = try tensor.couplingInverseHalves(params, row[0..dim], row[dim..total], scale, trans);
+        const logdet_f32: f32 = @floatCast(logdet);
+        if (!std.math.isFinite(logdet_f32)) return error.NonFinite;
+        return logdet_f32;
     }
     fn forwardInPlace(self: *const LayerCore, x1: *Tensor, x2: *Tensor, scale: []f32, trans: []f32) !void {
         if (scale.len < self.dim or trans.len < self.dim) return error.DataLengthMismatch;
         if (tensorsOverlap(x1, x2)) return error.AliasedBuffers;
         const batch_size = try self.validatePair(x1, x2);
-        var b: usize = 0;
-        while (b < batch_size) : (b += 1) {
-            const x1_row = x1.data[b * self.dim .. b * self.dim + self.dim];
-            const x2_row = x2.data[b * self.dim .. b * self.dim + self.dim];
-            self.computeScaleRow(x2_row, scale);
-            var i: usize = 0;
-            while (i < self.dim) : (i += 1) x1_row[i] *= scale[i];
-            self.computeTranslationRow(x1_row, trans);
-            i = 0;
-            while (i < self.dim) : (i += 1) x2_row[i] += trans[i];
-        }
+        const params = try self.couplingParams();
+        _ = try tensor.couplingForwardStrided(params, x1.data, x2.data, batch_size, self.dim, self.dim, scale, trans);
     }
     fn inverseInPlace(self: *const LayerCore, y1: *Tensor, y2: *Tensor, scale: []f32, trans: []f32) !void {
         if (scale.len < self.dim or trans.len < self.dim) return error.DataLengthMismatch;
         if (tensorsOverlap(y1, y2)) return error.AliasedBuffers;
         const batch_size = try self.validatePair(y1, y2);
-        var b: usize = 0;
-        while (b < batch_size) : (b += 1) {
-            const y1_row = y1.data[b * self.dim .. b * self.dim + self.dim];
-            const y2_row = y2.data[b * self.dim .. b * self.dim + self.dim];
-            self.computeTranslationRow(y1_row, trans);
-            var i: usize = 0;
-            while (i < self.dim) : (i += 1) y2_row[i] -= trans[i];
-            self.computeScaleRow(y2_row, scale);
-            i = 0;
-            while (i < self.dim) : (i += 1) y1_row[i] /= scale[i];
+        const params = try self.couplingParams();
+        _ = try tensor.couplingInverseStrided(params, y1.data, y2.data, batch_size, self.dim, self.dim, scale, trans);
+    }
+    fn ensureGaussNewton(self: *LayerCore) !void {
+        if (self.gn_block != null) return;
+        const len = try checkedMul(self.dim, 3);
+        const blk = try self.allocator.alloc(f32, len);
+        @memset(blk, 0.0);
+        self.gn_block = blk;
+    }
+    fn zeroGaussNewton(self: *LayerCore) void {
+        if (self.gn_block) |blk| @memset(blk, 0.0);
+    }
+    fn recordGaussNewtonRow(self: *LayerCore, x2_row: []const f32, params: tensor.RSFCouplingParams, logdet_adjoint: f32) !void {
+        if (logdet_adjoint == 0.0) return;
+        try self.ensureGaussNewton();
+        const blk = self.gn_block orelse return error.NoGaussNewtonBlock;
+        const dim = self.dim;
+        var d: usize = 0;
+        while (d < dim) : (d += 1) {
+            const raw = params.scaleWeight(d) * x2_row[d] + params.scaleBias(d);
+            const active: f32 = if (tensor.couplingSaturates(raw, params.clip_min, params.clip_max)) 0.0 else logdet_adjoint;
+            const g_w = active * x2_row[d];
+            blk[d * 3 + 0] += g_w * g_w;
+            blk[d * 3 + 1] += g_w * active;
+            blk[d * 3 + 2] += active * active;
         }
     }
     fn backwardFromInputsRow(
@@ -457,10 +408,10 @@ const LayerCore = struct {
         dy2_row: []const f32,
         dx1_row_out: []f32,
         dx2_row_out: []f32,
-        scale_buf: []f32,
         y1_buf: []f32,
-        dy1_total: []f32,
-        ds: []f32,
+        scale_buf: []f32,
+        ds_weight_buf: []f32,
+        dt_weight_buf: []f32,
         grad_scale: f32,
         logdet_adjoint: f32,
     ) !void {
@@ -470,51 +421,75 @@ const LayerCore = struct {
         if (x1_row.len != dim or x2_row.len != dim) return error.ShapeMismatch;
         if (dy1_row.len != dim or dy2_row.len != dim) return error.ShapeMismatch;
         if (dx1_row_out.len != dim or dx2_row_out.len != dim) return error.ShapeMismatch;
-        if (scale_buf.len != dim or y1_buf.len != dim) return error.DataLengthMismatch;
-        if (dy1_total.len != dim or ds.len != dim) return error.DataLengthMismatch;
-        {
-            var d: usize = 0;
-            while (d < dim) : (d += 1) {
-                dy1_total[d] = dy1_row[d] + self.t_weight.data[d * coupling_width + WEIGHT_COLUMN] * dy2_row[d];
-            }
+        if (y1_buf.len != dim or scale_buf.len != dim) return error.DataLengthMismatch;
+        const params = try self.couplingParams();
+        const expected = try checkedMul(dim, coupling_width);
+        if (ds_weight_buf.len < expected or dt_weight_buf.len < expected) return error.DataLengthMismatch;
+        @memset(ds_weight_buf[0..expected], 0.0);
+        @memset(dt_weight_buf[0..expected], 0.0);
+        var d: usize = 0;
+        while (d < dim) : (d += 1) {
+            const scale = tensor.couplingScaleFromInput(params, x2_row[d], d);
+            scale_buf[d] = scale;
+            y1_buf[d] = x1_row[d] * scale;
         }
-        {
-            var d: usize = 0;
-            while (d < dim) : (d += 1) {
-                const pre_sum = self.s_weight.data[d * coupling_width + WEIGHT_COLUMN] * x2_row[d] + self.s_weight.data[d * coupling_width + BIAS_COLUMN];
-                const saturated = pre_sum < self.clip_min or pre_sum > self.clip_max;
-                const clipped = if (pre_sum < self.clip_min) self.clip_min else if (pre_sum > self.clip_max) self.clip_max else pre_sum;
-                const scale = @exp(clipped);
-                scale_buf[d] = scale;
-                y1_buf[d] = x1_row[d] * scale;
-                dx1_row_out[d] = dy1_total[d] * scale;
-                ds[d] = if (saturated) 0.0 else dy1_total[d] * y1_buf[d] + logdet_adjoint;
+        _ = try tensor.couplingBackwardHalves(
+            params,
+            x1_row,
+            x2_row,
+            y1_buf,
+            dy1_row,
+            dy2_row,
+            logdet_adjoint,
+            ds_weight_buf[0..expected],
+            dt_weight_buf[0..expected],
+            dx1_row_out,
+            dx2_row_out,
+        );
+        try self.recordGaussNewtonRow(x2_row, params, logdet_adjoint);
+        if (self.s_weight_grad) |*swg| {
+            if (swg.data.len >= expected) {
+                d = 0;
+                while (d < expected) : (d += 1) swg.data[d] += grad_scale * ds_weight_buf[d];
             }
         }
         if (self.t_weight_grad) |*twg| {
-            var d: usize = 0;
-            while (d < dim) : (d += 1) {
-                const dyv = dy2_row[d] * grad_scale;
-                twg.data[d * coupling_width + WEIGHT_COLUMN] += dyv * y1_buf[d];
-                twg.data[d * coupling_width + BIAS_COLUMN] += dyv;
-            }
-        }
-        if (self.s_weight_grad) |*swg| {
-            var d: usize = 0;
-            while (d < dim) : (d += 1) {
-                const dsv = ds[d] * grad_scale;
-                swg.data[d * coupling_width + WEIGHT_COLUMN] += dsv * x2_row[d];
-                swg.data[d * coupling_width + BIAS_COLUMN] += dsv;
-            }
-        }
-        {
-            var d: usize = 0;
-            while (d < dim) : (d += 1) {
-                dx2_row_out[d] = dy2_row[d] + self.s_weight.data[d * coupling_width + WEIGHT_COLUMN] * ds[d];
+            if (twg.data.len >= expected) {
+                d = 0;
+                while (d < expected) : (d += 1) twg.data[d] += grad_scale * dt_weight_buf[d];
             }
         }
     }
 };
+const LayerBindings = struct {
+    s_weight: types.RSFBinding,
+    t_weight: types.RSFBinding,
+    gradient: types.RSFBinding,
+    fisher_block: types.RSFBinding,
+};
+
+fn layerBindings(model_id: u64, layer_index: usize, dim: usize) LayerBindings {
+    return .{
+        .s_weight = types.RSFBinding.layer(.layer_weight_s, model_id, layer_index, dim),
+        .t_weight = types.RSFBinding.layer(.layer_weight_t, model_id, layer_index, dim),
+        .gradient = types.RSFBinding.layer(.gradient, model_id, layer_index, dim),
+        .fisher_block = types.RSFBinding.layer(.fisher_block, model_id, layer_index, dim),
+    };
+}
+
+fn checkedLayerIndex(core: *const RSFCore, layer: usize) !*LayerCore {
+    const count = try checkedModelLayerCount(core);
+    if (layer >= count) return error.LayerIndexOutOfBounds;
+    return &core.layers[layer];
+}
+
+fn assignLayerBindings(core: *RSFCore, model_id: u64) void {
+    for (core.layers, 0..) |*layer, index| {
+        layer.model_id = model_id;
+        layer.layer_index = index;
+    }
+}
+
 const LayerRegistryEntry = struct {
     core: *LayerCore,
     active_ops: usize,
@@ -682,7 +657,7 @@ pub const RSFLayer = struct {
         defer releaseLayerCore(id);
         core.rwlock.lock();
         defer core.rwlock.unlock();
-        try core.applyGradientStep(learning_rate, GRADIENT_STEP_SEED_BASE);
+        try core.applyGradientStep(learning_rate);
     }
     pub fn gradientL2Norm(self: *const RSFLayer) !f32 {
         const id = try handleId(self.id);
@@ -899,6 +874,34 @@ fn forwardLogDetOnCore(core: *const RSFCore, x: *Tensor, logdet_per_row: []f32) 
         }
     }
 }
+fn inverseLogDetOnCore(core: *const RSFCore, y: *Tensor, logdet_per_row: []f32) !void {
+    try validateTensor2D(y);
+    try validateModelMetadata(core);
+    const layer_count = try checkedModelLayerCount(core);
+    const dim2 = try checkedMul(core.dim, 2);
+    if (y.shape.dims[1] != dim2) return error.ShapeMismatch;
+    const batch_size = y.shape.dims[0];
+    if (batch_size == 0) return error.InvalidBatchSize;
+    if (logdet_per_row.len < batch_size) return error.DataLengthMismatch;
+    @memset(logdet_per_row[0..batch_size], 0.0);
+    const allocator = scratchAllocator();
+    const trans = try allocator.alloc(f32, core.dim);
+    defer allocator.free(trans);
+    const scale = try allocator.alloc(f32, core.dim);
+    defer allocator.free(scale);
+    var idx = layer_count;
+    while (idx > 0) : (idx -= 1) {
+        const layer = &core.layers[idx - 1];
+        var b: usize = 0;
+        while (b < batch_size) : (b += 1) {
+            const row = y.data[b * dim2 .. b * dim2 + dim2];
+            core.oftb.inverseSliceInPlace(row);
+            const row_logdet = try layer.couplingInverseLogDetRow(row, scale, trans);
+            logdet_per_row[b] += row_logdet;
+        }
+    }
+}
+
 fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tensor, output: *const Tensor, grad_input_out: *Tensor, logdet_weight: f32) !void {
     try validateModelMetadata(core);
     try validateTensor2D(grad_output);
@@ -944,10 +947,11 @@ fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tens
     defer allocator.free(y1_buf);
     const trans_buf = try allocator.alloc(f32, dim);
     defer allocator.free(trans_buf);
-    const dy1_total = try allocator.alloc(f32, dim);
-    defer allocator.free(dy1_total);
-    const ds = try allocator.alloc(f32, dim);
-    defer allocator.free(ds);
+    const per_layer_params = try checkedMul(dim, coupling_width);
+    const ds_weight_buf = try allocator.alloc(f32, per_layer_params);
+    defer allocator.free(ds_weight_buf);
+    const dt_weight_buf = try allocator.alloc(f32, per_layer_params);
+    defer allocator.free(dt_weight_buf);
     var b: usize = 0;
     while (b < batch_size) : (b += 1) {
         @memcpy(cur, input.data[b * dim2 .. b * dim2 + dim2]);
@@ -973,10 +977,10 @@ fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tens
                 dy[dim..dim2],
                 dx[0..dim],
                 dx[dim..dim2],
-                scale_buf,
                 y1_buf,
-                dy1_total,
-                ds,
+                scale_buf,
+                ds_weight_buf,
+                dt_weight_buf,
                 grad_scale,
                 logdet_weight,
             );
@@ -1162,6 +1166,7 @@ const SavedLayerSnapshot = struct {
     grad_mean: bool,
     s_weight: Tensor,
     t_weight: Tensor,
+    gn_block: []f32,
 };
 const SavedModelSnapshot = struct {
     allocator: Allocator,
@@ -1175,6 +1180,7 @@ const SavedModelSnapshot = struct {
         for (layers) |*layer| {
             layer.s_weight.deinit();
             layer.t_weight.deinit();
+            self.allocator.free(layer.gn_block);
         }
         if (layers.len != 0) self.allocator.free(layers);
     }
@@ -1184,12 +1190,14 @@ fn snapshotModelForSave(allocator: Allocator, core: *const RSFCore) !SavedModelS
     const layer_count = core.layers.len;
     const layers = try allocator.alloc(SavedLayerSnapshot, layer_count);
     errdefer allocator.free(layers);
+    const gn_len = try checkedMul(core.dim, 3);
     var initialized: usize = 0;
     errdefer {
         var i: usize = 0;
         while (i < initialized) : (i += 1) {
             layers[i].s_weight.deinit();
             layers[i].t_weight.deinit();
+            allocator.free(layers[i].gn_block);
         }
     }
     var i: usize = 0;
@@ -1200,13 +1208,24 @@ fn snapshotModelForSave(allocator: Allocator, core: *const RSFCore) !SavedModelS
         try ensureFiniteSlice(layer.t_weight.data);
         var sw = try tensorClone(allocator, &layer.s_weight);
         errdefer sw.deinit();
-        const tw = try tensorClone(allocator, &layer.t_weight);
+        var tw = try tensorClone(allocator, &layer.t_weight);
+        errdefer tw.deinit();
+        const gn = try allocator.alloc(f32, gn_len);
+        errdefer allocator.free(gn);
+        @memset(gn, 0.0);
+        if (layer.gn_block) |blk| {
+            if (blk.len >= gn_len) {
+                try ensureFiniteSlice(blk[0..gn_len]);
+                @memcpy(gn, blk[0..gn_len]);
+            }
+        }
         layers[i] = .{
             .clip_min = layer.clip_min,
             .clip_max = layer.clip_max,
             .grad_mean = layer.grad_mean,
             .s_weight = sw,
             .t_weight = tw,
+            .gn_block = gn,
         };
         initialized += 1;
     }
@@ -1218,21 +1237,229 @@ fn snapshotModelForSave(allocator: Allocator, core: *const RSFCore) !SavedModelS
         .layers = layers,
     };
 }
+pub const RSFBranch = enum { s, t };
+
+const LatentShape = struct {
+    batch: usize,
+    dim: usize,
+};
+
+fn latentShapeOf(state: *const RSFLatentState) !LatentShape {
+    if (state.data.shape.dims.len != 3) return error.ShapeMismatch;
+    if (state.data.shape.dims[2] != 2) return error.ShapeMismatch;
+    const batch = state.data.shape.dims[0];
+    const dim = state.data.shape.dims[1];
+    if (batch == 0) return error.InvalidBatchSize;
+    if (dim == 0) return error.InvalidDimension;
+    _ = try checkedMul(try checkedMul(batch, dim), 2);
+    return .{ .batch = batch, .dim = dim };
+}
+
+pub const LatentHalfView = struct {
+    data: []f32,
+    batch: usize,
+    dim: usize,
+    offset: usize,
+
+    pub fn index(self: *const LatentHalfView, b: usize, d: usize) !usize {
+        if (b >= self.batch or d >= self.dim) return error.OutOfBounds;
+        return (b * self.dim + d) * 2 + self.offset;
+    }
+
+    pub fn get(self: *const LatentHalfView, b: usize, d: usize) !f32 {
+        return self.data[try self.index(b, d)];
+    }
+
+    pub fn set(self: *const LatentHalfView, b: usize, d: usize, value: f32) !void {
+        if (!std.math.isFinite(value)) return error.NonFinite;
+        self.data[try self.index(b, d)] = value;
+    }
+
+    pub fn copyRowTo(self: *const LatentHalfView, b: usize, out: []f32) !void {
+        if (b >= self.batch) return error.OutOfBounds;
+        if (out.len < self.dim) return error.DataLengthMismatch;
+        var d: usize = 0;
+        while (d < self.dim) : (d += 1) out[d] = self.data[(b * self.dim + d) * 2 + self.offset];
+    }
+
+    pub fn copyRowFrom(self: *const LatentHalfView, b: usize, src: []const f32) !void {
+        if (b >= self.batch) return error.OutOfBounds;
+        if (src.len < self.dim) return error.DataLengthMismatch;
+        try ensureFiniteSlice(src[0..self.dim]);
+        var d: usize = 0;
+        while (d < self.dim) : (d += 1) self.data[(b * self.dim + d) * 2 + self.offset] = src[d];
+    }
+};
+
+fn latentToBlockedTensor(state: *const RSFLatentState, blocked: *Tensor) !void {
+    const shape = try latentShapeOf(state);
+    const dim2 = try checkedMul(shape.dim, 2);
+    if (blocked.shape.dims.len != 2) return error.ShapeMismatch;
+    if (blocked.shape.dims[0] != shape.batch or blocked.shape.dims[1] != dim2) return error.ShapeMismatch;
+    if (blocked.data.len < try checkedMul(shape.batch, dim2)) return error.DataLengthMismatch;
+    var b: usize = 0;
+    while (b < shape.batch) : (b += 1) {
+        const dst = blocked.data[b * dim2 .. b * dim2 + dim2];
+        var d: usize = 0;
+        while (d < shape.dim) : (d += 1) {
+            const src = (b * shape.dim + d) * 2;
+            dst[d] = state.data.data[src];
+            dst[shape.dim + d] = state.data.data[src + 1];
+        }
+    }
+}
+
+fn blockedTensorToLatent(blocked: *const Tensor, state: *RSFLatentState) !void {
+    const shape = try latentShapeOf(state);
+    const dim2 = try checkedMul(shape.dim, 2);
+    if (blocked.shape.dims.len != 2) return error.ShapeMismatch;
+    if (blocked.shape.dims[0] != shape.batch or blocked.shape.dims[1] != dim2) return error.ShapeMismatch;
+    if (blocked.data.len < try checkedMul(shape.batch, dim2)) return error.DataLengthMismatch;
+    try ensureFiniteSlice(blocked.data[0 .. shape.batch * dim2]);
+    var b: usize = 0;
+    while (b < shape.batch) : (b += 1) {
+        const src = blocked.data[b * dim2 .. b * dim2 + dim2];
+        var d: usize = 0;
+        while (d < shape.dim) : (d += 1) {
+            const dst = (b * shape.dim + d) * 2;
+            state.data.data[dst] = src[d];
+            state.data.data[dst + 1] = src[shape.dim + d];
+        }
+    }
+}
+
+fn allocBlockedLatentTensor(allocator: Allocator, state: *const RSFLatentState) !Tensor {
+    const shape = try latentShapeOf(state);
+    return Tensor.init(allocator, &[_]usize{ shape.batch, try checkedMul(shape.dim, 2) });
+}
+
+fn meanLogDet(per_row: []const f32, batch: usize) !f32 {
+    if (per_row.len < batch or batch == 0) return error.DataLengthMismatch;
+    var sum: f64 = 0.0;
+    for (per_row[0..batch]) |v| sum += @as(f64, @floatCast(v));
+    const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(batch)));
+    if (!std.math.isFinite(mean)) return error.NonFinite;
+    return mean;
+}
+
+pub const RSFLatentState = struct {
+    data: Tensor,
+    log_det: f32,
+    binding: types.RSFBinding,
+
+    pub fn init(allocator: Allocator, model: *const RSF, batch: usize) !RSFLatentState {
+        if (batch == 0) return error.InvalidBatchSize;
+        const dim = try model.dim();
+        const model_id = try handleId(model.id);
+        var data = try Tensor.init(allocator, &[_]usize{ batch, dim, 2 });
+        errdefer data.deinit();
+        return .{ .data = data, .log_det = 0.0, .binding = types.RSFBinding.model(.latent_state, model_id, dim) };
+    }
+
+    pub fn fromHalves(allocator: Allocator, model: *const RSF, x1: *const Tensor, x2: *const Tensor) !RSFLatentState {
+        try validateTensor2D(x1);
+        try validateTensor2D(x2);
+        const dim = try model.dim();
+        if (x1.shape.dims[1] != dim or x2.shape.dims[1] != dim) return error.ShapeMismatch;
+        if (x1.shape.dims[0] != x2.shape.dims[0]) return error.ShapeMismatch;
+        const batch = x1.shape.dims[0];
+        try ensureFiniteSlice(x1.data);
+        try ensureFiniteSlice(x2.data);
+        var state = try init(allocator, model, batch);
+        errdefer state.deinit();
+        const even = try state.evenView();
+        const odd = try state.oddView();
+        var b: usize = 0;
+        while (b < batch) : (b += 1) {
+            try even.copyRowFrom(b, x1.data[b * dim .. b * dim + dim]);
+            try odd.copyRowFrom(b, x2.data[b * dim .. b * dim + dim]);
+        }
+        return state;
+    }
+
+    pub fn deinit(self: *RSFLatentState) void {
+        self.data.deinit();
+        self.log_det = 0.0;
+    }
+
+    pub fn clone(self: *const RSFLatentState, allocator: Allocator) !RSFLatentState {
+        const shape = try latentShapeOf(self);
+        var data = try Tensor.init(allocator, &[_]usize{ shape.batch, shape.dim, 2 });
+        errdefer data.deinit();
+        try ensureFiniteSlice(self.data.data);
+        @memcpy(data.data, self.data.data);
+        return .{ .data = data, .log_det = self.log_det, .binding = self.binding };
+    }
+
+    pub fn evenView(self: *RSFLatentState) !LatentHalfView {
+        const shape = try latentShapeOf(self);
+        return .{ .data = self.data.data, .batch = shape.batch, .dim = shape.dim, .offset = 0 };
+    }
+
+    pub fn oddView(self: *RSFLatentState) !LatentHalfView {
+        const shape = try latentShapeOf(self);
+        return .{ .data = self.data.data, .batch = shape.batch, .dim = shape.dim, .offset = 1 };
+    }
+
+    pub fn requireModel(self: *const RSFLatentState, model: *const RSF) !void {
+        const model_id = try handleId(model.id);
+        const dim = try model.dim();
+        try self.binding.requireSpace(.latent_state);
+        try self.binding.requireModel(model_id);
+        try self.binding.requireDim(dim);
+        const shape = try latentShapeOf(self);
+        if (shape.dim != dim) return types.RSFBindingError.RSFDimMismatch;
+    }
+
+    pub fn blockedLength(self: *const RSFLatentState) !usize {
+        const shape = try latentShapeOf(self);
+        return try checkedMul(shape.batch, try checkedMul(shape.dim, 2));
+    }
+
+    pub fn forwardThrough(self: *RSFLatentState, model: *RSF) !void {
+        self.log_det += try model.forwardLatentWithLogDet(self);
+    }
+
+    pub fn inverseThrough(self: *RSFLatentState, model: *RSF) !void {
+        self.log_det -= try model.inverseLatentWithLogDet(self);
+    }
+
+    pub fn roundtripError(self: *const RSFLatentState, model: *RSF, allocator: Allocator) !f32 {
+        var working = try self.clone(allocator);
+        defer working.deinit();
+        try working.forwardThrough(model);
+        try working.inverseThrough(model);
+        const total = try self.blockedLength();
+        var num: f64 = 0.0;
+        var den: f64 = 0.0;
+        var k: usize = 0;
+        while (k < total) : (k += 1) {
+            const original: f64 = @floatCast(self.data.data[k]);
+            const recovered: f64 = @floatCast(working.data.data[k]);
+            const diff = recovered - original;
+            num += diff * diff;
+            den += original * original;
+        }
+        if (den <= 0.0) return @as(f32, @floatCast(@sqrt(num)));
+        return @as(f32, @floatCast(@sqrt(num / den)));
+    }
+};
+
 pub const RSF = struct {
     id: u64 = 0,
     ctrl: ?*RSFCore = null,
-    pub fn init(allocator: Allocator, dim: usize, num_layers: usize) !RSF {
-        return initWithConfig(allocator, dim, num_layers, .{});
+    pub fn init(allocator: Allocator, model_dim: usize, num_layers: usize) !RSF {
+        return initWithConfig(allocator, model_dim, num_layers, .{});
     }
-    pub fn initWithConfig(allocator: Allocator, dim: usize, num_layers: usize, cfg: RSFConfig) !RSF {
-        try validateModelConfigValues(dim, num_layers, cfg);
-        _ = try checkedMul(dim, coupling_width);
-        _ = try checkedMul(dim, 2);
+    pub fn initWithConfig(allocator: Allocator, model_dim: usize, num_layers: usize, cfg: RSFConfig) !RSF {
+        try validateModelConfigValues(model_dim, num_layers, cfg);
+        _ = try checkedMul(model_dim, coupling_width);
+        _ = try checkedMul(model_dim, 2);
         const core = try allocator.create(RSFCore);
         errdefer allocator.destroy(core);
         core.* = .{
             .allocator = allocator,
-            .dim = dim,
+            .dim = model_dim,
             .num_layers = num_layers,
             .layers = try allocator.alloc(LayerCore, num_layers),
             .cfg = cfg,
@@ -1242,7 +1469,7 @@ pub const RSF = struct {
             .gpu_weight_version = 0,
             .cpu_weight_version = 1,
             .f16_buf = null,
-            .oftb = OFTB.init(dim),
+            .oftb = try initOFTBForConfig(model_dim, cfg.global_diffusion),
         };
         errdefer {
             if (core.gpu_accel) |*ga| {
@@ -1271,7 +1498,7 @@ pub const RSF = struct {
                 .seed_offset = seed_base,
                 .grad_mean = cfg.grad_mean,
             };
-            core.layers[l] = try LayerCore.initOwned(allocator, dim, layer_cfg);
+            core.layers[l] = try LayerCore.initOwned(allocator, model_dim, layer_cfg);
             initialized += 1;
         }
         try validateModelMetadata(core);
@@ -1279,6 +1506,7 @@ pub const RSF = struct {
             syncAllLayersGPU(core) catch disableGPU(core);
         }
         const id = try registerModelCore(core);
+        assignLayerBindings(core, id);
         return RSF{ .id = id, .ctrl = core };
     }
     pub fn deinit(self: *RSF) void {
@@ -1350,9 +1578,7 @@ pub const RSF = struct {
         defer refreshGPUAfterWeightChange(core);
         var i: usize = 0;
         while (i < layer_count) : (i += 1) {
-            const offset = try checkedMulU64(@as(u64, @intCast(i)), 7919);
-            const seed = try checkedAddU64(GRADIENT_STEP_SEED_BASE, offset);
-            try core.layers[i].applyGradientStep(learning_rate, seed);
+            try core.layers[i].applyGradientStep(learning_rate);
         }
         try validateModelMetadata(core);
     }
@@ -1466,6 +1692,320 @@ pub const RSF = struct {
         }
         return tensorAllCloseEq(x, &y, abs_tol, rel_tol);
     }
+    pub fn dim(self: *const RSF) !usize {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        return core.dim;
+    }
+
+    pub fn layerCount(self: *const RSF) !usize {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        return try checkedModelLayerCount(core);
+    }
+
+    pub fn globalDiffusionEnabled(self: *const RSF) !bool {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        return core.cfg.global_diffusion and core.oftb.diffusionEnabled();
+    }
+
+    pub fn diffusionLayout(self: *const RSF) !types.RSFDiffusionLayout {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        return core.oftb.diffusionLayout() orelse error.DiffusionDisabled;
+    }
+
+    pub fn latentBinding(self: *const RSF) !types.RSFBinding {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        return types.RSFBinding.model(.latent_state, id, core.dim);
+    }
+
+    pub fn layerBindingsFor(self: *RSF, layer: usize) !LayerBindings {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        const target = try checkedLayerIndex(core, layer);
+        if (target.model_id != id or target.layer_index != layer) {
+            core.rwlock.lock();
+            defer core.rwlock.unlock();
+            target.model_id = id;
+            target.layer_index = layer;
+        }
+        return layerBindings(id, layer, core.dim);
+    }
+
+    pub fn readLayerWeights(self: *const RSF, layer: usize, s_out: []f32, t_out: []f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const target = try checkedLayerIndex(core, layer);
+        const expected = try checkedMul(core.dim, coupling_width);
+        if (s_out.len < expected or t_out.len < expected) return error.DataLengthMismatch;
+        target.rwlock.lockShared();
+        defer target.rwlock.unlockShared();
+        try validateTensor2DShape(&target.s_weight, core.dim, coupling_width);
+        try validateTensor2DShape(&target.t_weight, core.dim, coupling_width);
+        try ensureFiniteSlice(target.s_weight.data[0..expected]);
+        try ensureFiniteSlice(target.t_weight.data[0..expected]);
+        @memcpy(s_out[0..expected], target.s_weight.data[0..expected]);
+        @memcpy(t_out[0..expected], target.t_weight.data[0..expected]);
+    }
+
+    pub fn writeLayerWeights(self: *RSF, layer: usize, s_in: []const f32, t_in: []const f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        const target = try checkedLayerIndex(core, layer);
+        const expected = try checkedMul(core.dim, coupling_width);
+        if (s_in.len < expected or t_in.len < expected) return error.DataLengthMismatch;
+        try ensureFiniteSlice(s_in[0..expected]);
+        try ensureFiniteSlice(t_in[0..expected]);
+        target.rwlock.lock();
+        defer target.rwlock.unlock();
+        try validateTensor2DShape(&target.s_weight, core.dim, coupling_width);
+        try validateTensor2DShape(&target.t_weight, core.dim, coupling_width);
+        @memcpy(target.s_weight.data[0..expected], s_in[0..expected]);
+        @memcpy(target.t_weight.data[0..expected], t_in[0..expected]);
+        bumpWeightVersion(core);
+        core.gpu_available.store(0, .monotonic);
+        try validateModelMetadata(core);
+        refreshGPUAfterWeightChange(core);
+    }
+
+    pub fn readLayerGradients(self: *const RSF, layer: usize, s_out: []f32, t_out: []f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const target = try checkedLayerIndex(core, layer);
+        const expected = try checkedMul(core.dim, coupling_width);
+        if (s_out.len < expected or t_out.len < expected) return error.DataLengthMismatch;
+        const s_grad = target.s_weight_grad orelse return error.NoGradients;
+        const t_grad = target.t_weight_grad orelse return error.NoGradients;
+        target.rwlock.lockShared();
+        defer target.rwlock.unlockShared();
+        try validateTensor2DShape(&s_grad, core.dim, coupling_width);
+        try validateTensor2DShape(&t_grad, core.dim, coupling_width);
+        try ensureFiniteSlice(s_grad.data[0..expected]);
+        try ensureFiniteSlice(t_grad.data[0..expected]);
+        @memcpy(s_out[0..expected], s_grad.data[0..expected]);
+        @memcpy(t_out[0..expected], t_grad.data[0..expected]);
+    }
+
+    pub fn readLayerGradientProducts(self: *const RSF, layer: usize, branch: RSFBranch, out: []f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const target = try checkedLayerIndex(core, layer);
+        const model_dim = core.dim;
+        const expected = try checkedMul(model_dim, 3);
+        if (out.len < expected) return error.InvalidDataLength;
+        const grad = switch (branch) {
+            .s => target.s_weight_grad orelse return error.NoGradients,
+            .t => target.t_weight_grad orelse return error.NoGradients,
+        };
+        target.rwlock.lockShared();
+        defer target.rwlock.unlockShared();
+        try validateTensor2DShape(&grad, model_dim, coupling_width);
+        try ensureFiniteSlice(grad.data);
+        var d: usize = 0;
+        while (d < model_dim) : (d += 1) {
+            const g_w = grad.data[d * coupling_width + WEIGHT_COLUMN];
+            const g_b = grad.data[d * coupling_width + BIAS_COLUMN];
+            out[d * 3 + 0] = g_w * g_w;
+            out[d * 3 + 1] = g_w * g_b;
+            out[d * 3 + 2] = g_b * g_b;
+        }
+    }
+
+    pub fn readLayerGaussNewton(self: *const RSF, layer: usize, s_block_out: []f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const target = try checkedLayerIndex(core, layer);
+        const expected = try checkedMul(core.dim, 3);
+        if (s_block_out.len != expected) return error.InvalidDataLength;
+        target.rwlock.lockShared();
+        defer target.rwlock.unlockShared();
+        if (target.gn_block) |blk| {
+            if (blk.len < expected) return error.InvalidModelState;
+            try ensureFiniteSlice(blk[0..expected]);
+            @memcpy(s_block_out[0..expected], blk[0..expected]);
+            return;
+        }
+        @memset(s_block_out[0..expected], 0.0);
+    }
+
+    pub fn zeroLayerGaussNewton(self: *RSF, layer: usize) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        const target = try checkedLayerIndex(core, layer);
+        target.rwlock.lock();
+        defer target.rwlock.unlock();
+        target.zeroGaussNewton();
+    }
+
+    pub fn scaleLayerGradients(self: *RSF, scale: f32) !void {
+        if (!std.math.isFinite(scale)) return error.NonFinite;
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        const layer_count = try checkedModelLayerCount(core);
+        var i: usize = 0;
+        while (i < layer_count) : (i += 1) {
+            const target = &core.layers[i];
+            try target.ensureGradients();
+            const s_grad = target.s_weight_grad orelse return error.NoGradients;
+            const t_grad = target.t_weight_grad orelse return error.NoGradients;
+            try ensureFiniteSlice(s_grad.data);
+            try ensureFiniteSlice(t_grad.data);
+            for (s_grad.data) |v| {
+                if (!std.math.isFinite(v * scale)) return error.NonFinite;
+            }
+            for (t_grad.data) |v| {
+                if (!std.math.isFinite(v * scale)) return error.NonFinite;
+            }
+            target.rwlock.lock();
+            defer target.rwlock.unlock();
+            for (s_grad.data) |*v| v.* *= scale;
+            for (t_grad.data) |*v| v.* *= scale;
+        }
+    }
+
+    pub fn accumulateLayerGradients(self: *RSF, layer: usize, s_in: []const f32, t_in: []const f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        const target = try checkedLayerIndex(core, layer);
+        const expected = try checkedMul(core.dim, coupling_width);
+        if (s_in.len < expected or t_in.len < expected) return error.DataLengthMismatch;
+        try ensureFiniteSlice(s_in[0..expected]);
+        try ensureFiniteSlice(t_in[0..expected]);
+        try target.ensureGradients();
+        const s_grad = target.s_weight_grad orelse return error.NoGradients;
+        const t_grad = target.t_weight_grad orelse return error.NoGradients;
+        try validateTensor2DShape(&s_grad, core.dim, coupling_width);
+        try validateTensor2DShape(&t_grad, core.dim, coupling_width);
+        try ensureFiniteSlice(s_grad.data);
+        try ensureFiniteSlice(t_grad.data);
+        var k: usize = 0;
+        while (k < expected) : (k += 1) {
+            if (!std.math.isFinite(s_grad.data[k] + s_in[k])) return error.NonFinite;
+            if (!std.math.isFinite(t_grad.data[k] + t_in[k])) return error.NonFinite;
+        }
+        target.rwlock.lock();
+        defer target.rwlock.unlock();
+        k = 0;
+        while (k < expected) : (k += 1) {
+            s_grad.data[k] += s_in[k];
+            t_grad.data[k] += t_in[k];
+        }
+    }
+
+    pub fn inverseWithLogDet(self: *RSF, y: *Tensor, logdet_per_row: []f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        try inverseLogDetOnCore(core, y, logdet_per_row);
+    }
+
+    pub fn forwardLatentWithLogDet(self: *RSF, state: *RSFLatentState) !f32 {
+        try state.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        const shape = try latentShapeOf(state);
+        const allocator = scratchAllocator();
+        var blocked = try allocBlockedLatentTensor(allocator, state);
+        defer blocked.deinit();
+        try latentToBlockedTensor(state, &blocked);
+        const per_row = try allocator.alloc(f32, shape.batch);
+        defer allocator.free(per_row);
+        core.rwlock.lockShared();
+        try forwardLogDetOnCore(core, &blocked, per_row);
+        core.rwlock.unlockShared();
+        try blockedTensorToLatent(&blocked, state);
+        return try meanLogDet(per_row, shape.batch);
+    }
+
+    pub fn inverseLatentWithLogDet(self: *RSF, state: *RSFLatentState) !f32 {
+        try state.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        const shape = try latentShapeOf(state);
+        const allocator = scratchAllocator();
+        var blocked = try allocBlockedLatentTensor(allocator, state);
+        defer blocked.deinit();
+        try latentToBlockedTensor(state, &blocked);
+        const per_row = try allocator.alloc(f32, shape.batch);
+        defer allocator.free(per_row);
+        core.rwlock.lockShared();
+        try inverseLogDetOnCore(core, &blocked, per_row);
+        core.rwlock.unlockShared();
+        try blockedTensorToLatent(&blocked, state);
+        return try meanLogDet(per_row, shape.batch);
+    }
+
+    pub fn forwardLatent(self: *RSF, state: *RSFLatentState) !void {
+        _ = try self.forwardLatentWithLogDet(state);
+    }
+
+    pub fn inverseLatent(self: *RSF, state: *RSFLatentState) !void {
+        _ = try self.inverseLatentWithLogDet(state);
+    }
+
+    pub fn backwardLatent(self: *RSF, grad_output: *const RSFLatentState, input: *const RSFLatentState, output: *const RSFLatentState, grad_input_out: *RSFLatentState, logdet_weight: f32) !void {
+        try grad_output.requireModel(self);
+        try input.requireModel(self);
+        try output.requireModel(self);
+        try grad_input_out.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        const allocator = scratchAllocator();
+        var g_out = try allocBlockedLatentTensor(allocator, grad_output);
+        defer g_out.deinit();
+        var x_in = try allocBlockedLatentTensor(allocator, input);
+        defer x_in.deinit();
+        var y_out = try allocBlockedLatentTensor(allocator, output);
+        defer y_out.deinit();
+        var dx = try allocBlockedLatentTensor(allocator, grad_input_out);
+        defer dx.deinit();
+        try latentToBlockedTensor(grad_output, &g_out);
+        try latentToBlockedTensor(input, &x_in);
+        try latentToBlockedTensor(output, &y_out);
+        try backwardOnCore(core, &g_out, &x_in, &y_out, &dx, logdet_weight);
+        try blockedTensorToLatent(&dx, grad_input_out);
+    }
+
     pub fn save(self: *const RSF, path: []const u8) !void {
         const id = try handleId(self.id);
         const core = try acquireModelCore(id);
@@ -1496,7 +2036,7 @@ pub const RSF = struct {
         try r.readNoEof(&magic);
         if (!std.mem.eql(u8, &magic, "RSF0")) return error.BadFileFormat;
         const version = try r.readInt(u32, .little);
-        if (version != SAVE_VERSION) return error.UnsupportedVersion;
+        if (version != SAVE_VERSION and version != SAVE_VERSION_LEGACY) return error.UnsupportedVersion;
         const num_layers_u64 = try r.readInt(u64, .little);
         const dim_u64 = try r.readInt(u64, .little);
         if (num_layers_u64 == 0) return error.InvalidLayerCount;
@@ -1505,9 +2045,9 @@ pub const RSF = struct {
         const policy_max_layers: usize = if (policy) |p| p.max_layers else (1 << 20);
         if (num_layers_u64 > @as(u64, @intCast(policy_max_layers)) or dim_u64 > @as(u64, @intCast(policy_max_dim))) return error.TooLarge;
         const num_layers = try checkedCastU64ToUsize(num_layers_u64);
-        const dim = try checkedCastU64ToUsize(dim_u64);
-        _ = try checkedMul(dim, coupling_width);
-        _ = try checkedMul(dim, 2);
+        const model_dim = try checkedCastU64ToUsize(dim_u64);
+        _ = try checkedMul(model_dim, coupling_width);
+        _ = try checkedMul(model_dim, 2);
         var hasher = std.hash.Crc32.init();
         hasher.update("RSF0");
         crcUpdateU32LE(&hasher, version);
@@ -1533,19 +2073,28 @@ pub const RSF = struct {
         if (saved_max_dim_u64 < dim_u64 or saved_max_layers_u64 < num_layers_u64) return error.InvalidConfig;
         const effective_max_dim: usize = if (policy) |p| p.max_dim else try checkedCastU64ToUsize(saved_max_dim_u64);
         const effective_max_layers: usize = if (policy) |p| p.max_layers else try checkedCastU64ToUsize(saved_max_layers_u64);
+        var global_diffusion = false;
+        if (version == SAVE_VERSION) {
+            global_diffusion = try readEncodedBool(r);
+            crcUpdateU8(&hasher, if (global_diffusion) @as(u8, 1) else @as(u8, 0));
+        }
+        if (policy) |p| {
+            if (p.global_diffusion != global_diffusion) return error.PolicyMismatch;
+        }
         const loaded_cfg = RSFConfig{
             .clip_min = clip_min,
             .clip_max = clip_max,
             .grad_mean = grad_mean,
             .max_dim = effective_max_dim,
             .max_layers = effective_max_layers,
+            .global_diffusion = global_diffusion,
         };
-        try validateModelConfigValues(dim, num_layers, loaded_cfg);
+        try validateModelConfigValues(model_dim, num_layers, loaded_cfg);
         const core = try allocator.create(RSFCore);
         errdefer allocator.destroy(core);
         core.* = .{
             .allocator = allocator,
-            .dim = dim,
+            .dim = model_dim,
             .num_layers = num_layers,
             .layers = try allocator.alloc(LayerCore, num_layers),
             .cfg = loaded_cfg,
@@ -1555,7 +2104,7 @@ pub const RSF = struct {
             .gpu_weight_version = 0,
             .cpu_weight_version = 1,
             .f16_buf = null,
-            .oftb = OFTB.init(dim),
+            .oftb = try initOFTBForConfig(model_dim, loaded_cfg.global_diffusion),
         };
         errdefer {
             if (core.gpu_accel) |*ga| {
@@ -1587,12 +2136,12 @@ pub const RSF = struct {
             crcUpdateU32LE(&hasher, layer_clip_min_bits);
             crcUpdateU32LE(&hasher, layer_clip_max_bits);
             crcUpdateU8(&hasher, if (layer_grad_mean) @as(u8, 1) else @as(u8, 0));
-            var s_w_new = try readTensorData(allocator, r, dim, coupling_width);
+            var s_w_new = try readTensorData(allocator, r, model_dim, coupling_width);
             errdefer s_w_new.deinit();
-            var t_w_new = try readTensorData(allocator, r, dim, coupling_width);
+            var t_w_new = try readTensorData(allocator, r, model_dim, coupling_width);
             errdefer t_w_new.deinit();
-            try validateTensor2DShape(&s_w_new, dim, coupling_width);
-            try validateTensor2DShape(&t_w_new, dim, coupling_width);
+            try validateTensor2DShape(&s_w_new, model_dim, coupling_width);
+            try validateTensor2DShape(&t_w_new, model_dim, coupling_width);
             try ensureFiniteSlice(s_w_new.data);
             try ensureFiniteSlice(t_w_new.data);
             hashTensorData(&hasher, &s_w_new);
@@ -1602,14 +2151,34 @@ pub const RSF = struct {
                 .t_weight = t_w_new,
                 .s_weight_grad = null,
                 .t_weight_grad = null,
-                .dim = dim,
+                .dim = model_dim,
                 .allocator = allocator,
                 .clip_min = layer_clip_min,
                 .clip_max = layer_clip_max,
                 .grad_mean = layer_grad_mean,
+                .gn_block = null,
+                .model_id = 0,
+                .layer_index = i,
                 .rwlock = .{},
             };
             initialized += 1;
+        }
+        if (version == SAVE_VERSION) {
+            const gn_len = try checkedMul(model_dim, 3);
+            var g: usize = 0;
+            while (g < num_layers) : (g += 1) {
+                const blk = try allocator.alloc(f32, gn_len);
+                errdefer if (core.layers[g].gn_block == null) allocator.free(blk);
+                var k: usize = 0;
+                while (k < gn_len) : (k += 1) {
+                    const bits = try r.readInt(u32, .little);
+                    crcUpdateU32LE(&hasher, bits);
+                    const value: f32 = @bitCast(bits);
+                    if (!std.math.isFinite(value) or value < 0.0) return error.NonFinite;
+                    blk[k] = value;
+                }
+                core.layers[g].gn_block = blk;
+            }
         }
         const stored_crc = try r.readInt(u32, .little);
         if (stored_crc != hasher.final()) return error.ChecksumMismatch;
@@ -1620,6 +2189,7 @@ pub const RSF = struct {
             syncAllLayersGPU(core) catch disableGPU(core);
         }
         const id = try registerModelCore(core);
+        assignLayerBindings(core, id);
         return RSF{ .id = id, .ctrl = core };
     }
     pub fn saveLoadRoundtrip(allocator: Allocator, self: *const RSF, path: []const u8, abs_tol: f32, rel_tol: f32) !bool {
@@ -1795,6 +2365,9 @@ fn writeSnapshotToPath(snapshot: *const SavedModelSnapshot, path: []const u8, al
     try w.writeInt(u64, @intCast(snapshot.cfg.max_layers), .little);
     crcUpdateU64LE(&hasher, @intCast(snapshot.cfg.max_dim));
     crcUpdateU64LE(&hasher, @intCast(snapshot.cfg.max_layers));
+    const gd_byte: u8 = if (snapshot.cfg.global_diffusion) 1 else 0;
+    try w.writeByte(gd_byte);
+    crcUpdateU8(&hasher, gd_byte);
     var i: usize = 0;
     while (i < snapshot.layers.len) : (i += 1) {
         const layer = &snapshot.layers[i];
@@ -1810,6 +2383,18 @@ fn writeSnapshotToPath(snapshot: *const SavedModelSnapshot, path: []const u8, al
         crcUpdateU8(&hasher, lgm);
         try writeTensorData(w, &hasher, &layer.s_weight);
         try writeTensorData(w, &hasher, &layer.t_weight);
+    }
+    const gn_len = try checkedMul(snapshot.dim, 3);
+    var g: usize = 0;
+    while (g < snapshot.layers.len) : (g += 1) {
+        const gn = snapshot.layers[g].gn_block;
+        if (gn.len < gn_len) return error.InvalidModelState;
+        var k: usize = 0;
+        while (k < gn_len) : (k += 1) {
+            const bits = @as(u32, @bitCast(gn[k]));
+            try w.writeInt(u32, bits, .little);
+            crcUpdateU32LE(&hasher, bits);
+        }
     }
     try w.writeInt(u32, hasher.final(), .little);
     try buffered.flush();
@@ -2015,13 +2600,49 @@ test "RSF save and load round-trip preserves weights" {
     try std.testing.expectEqual(num_layers, strict_core.num_layers);
     try std.testing.expectError(error.PolicyMismatch, RSF.loadWithConfig(allocator, file_path, .{ .clip_min = -4.0, .clip_max = 4.0 }));
 }
-test "RSF spectral power iteration rejects a zero iteration budget" {
+test "RSF exact rank-2 spectral norm replaces the power iteration" {
     const allocator = std.testing.allocator;
-    const data = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
-    try std.testing.expectError(error.InvalidIterationCount, spectralNormPowerIteration(allocator, data[0..], 2, 2, 0, 7));
-    const norm = try spectralNormPowerIteration(allocator, data[0..], 2, 2, 8, 7);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), norm, 1e-4);
+    const identity = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), try exactSpectralNormRank2(identity[0..], 2), 1e-6);
+    const rank_one = [_]f32{ 3.0, 4.0, 0.0, 0.0 };
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), try exactSpectralNormRank2(rank_one[0..], 2), 1e-6);
+    try std.testing.expectError(error.InvalidDimension, exactSpectralNormRank2(identity[0..], 0));
+    try std.testing.expectError(error.DataLengthMismatch, exactSpectralNormRank2(identity[0..1], 2));
+
+    var weight = try Tensor.init(allocator, &[_]usize{ 2, coupling_width });
+    defer weight.deinit();
+    @memcpy(weight.data, rank_one[0..]);
+    try constrainSpectralNorm(&weight, 2, coupling_width, LAYER_TARGET_SPECTRAL_NORM);
+    const constrained = try exactSpectralNormRank2(weight.data, 2);
+    try std.testing.expectApproxEqAbs(LAYER_TARGET_SPECTRAL_NORM, constrained, 1e-6);
+    try std.testing.expect(constrained <= LAYER_TARGET_SPECTRAL_NORM * (1.0 + 1e-6));
+    const before_idempotence = weight.data[0];
+    try constrainSpectralNorm(&weight, 2, coupling_width, LAYER_TARGET_SPECTRAL_NORM);
+    try std.testing.expectEqual(before_idempotence, weight.data[0]);
+    try std.testing.expectApproxEqAbs(constrained, try exactSpectralNormRank2(weight.data, 2), 0.0);
+
+    var small = try Tensor.init(allocator, &[_]usize{ 2, coupling_width });
+    defer small.deinit();
+    const small_data = [_]f32{ 0.1, 0.0, 0.0, 0.1 };
+    @memcpy(small.data, small_data[0..]);
+    try constrainSpectralNorm(&small, 2, coupling_width, LAYER_TARGET_SPECTRAL_NORM);
+    for (0..small.data.len) |k| try std.testing.expectEqual(small_data[k], small.data[k]);
+
+    try std.testing.expectError(error.InvalidConfig, constrainSpectralNorm(&weight, 2, coupling_width, 0.0));
+    try std.testing.expectError(error.InvalidConfig, constrainSpectralNorm(&weight, 2, coupling_width, std.math.nan(f32)));
+    try std.testing.expectError(error.ShapeMismatch, constrainSpectralNorm(&weight, 1, 4, LAYER_TARGET_SPECTRAL_NORM));
+    try std.testing.expectError(error.InvalidDimension, constrainSpectralNorm(&weight, 0, coupling_width, LAYER_TARGET_SPECTRAL_NORM));
+    try std.testing.expectError(error.DataLengthMismatch, constrainSpectralNorm(&weight, 9, coupling_width, LAYER_TARGET_SPECTRAL_NORM));
+    try std.testing.expectEqual(LAYER_TARGET_SPECTRAL_NORM, layerTargetSpectralNorm());
+
+    var layer = try LayerCore.initOwned(allocator, 8, .{});
+    defer layer.deinitOwned();
+    const sigma_s = try exactSpectralNormRank2(layer.s_weight.data, 8);
+    const sigma_t = try exactSpectralNormRank2(layer.t_weight.data, 8);
+    try std.testing.expect(sigma_s <= LAYER_TARGET_SPECTRAL_NORM * (1.0 + 1e-6));
+    try std.testing.expect(sigma_t <= LAYER_TARGET_SPECTRAL_NORM * (1.0 + 1e-6));
 }
+
 test "RSF backward input gradients match central finite differences" {
     const allocator = std.testing.allocator;
     const dim: usize = 4;
@@ -2138,4 +2759,429 @@ test "RSF backward rejects an output that does not match the replayed forward pa
     var grad_input = try Tensor.init(allocator, &[_]usize{ 2, dim2 });
     defer grad_input.deinit();
     try std.testing.expectError(error.StateMismatch, rsf.backward(&grad_output, &input, &output, &grad_input));
+}
+
+test "RSF latent state carries bindings, roundtrips and accumulates log-det" {
+    const allocator = std.testing.allocator;
+    const model_dim: usize = 8;
+    const batch: usize = 3;
+    var rsf = try RSF.initWithConfig(allocator, model_dim, 2, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, model_dim }, -0.4, 0.4, 4242);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, model_dim }, -0.4, 0.4, 4243);
+    defer x2.deinit();
+    var state = try RSFLatentState.fromHalves(allocator, &rsf, &x1, &x2);
+    defer state.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), state.data.shape.dims.len);
+    try std.testing.expectEqual(batch, state.data.shape.dims[0]);
+    try std.testing.expectEqual(model_dim, state.data.shape.dims[1]);
+    try std.testing.expectEqual(@as(usize, 2), state.data.shape.dims[2]);
+    try std.testing.expectEqual(@as(f32, 0.0), state.log_det);
+    try std.testing.expectEqual(@as(usize, batch * model_dim * 2), try state.blockedLength());
+    try state.binding.requireSpace(.latent_state);
+    try state.binding.requireModel(rsf.id);
+    try state.binding.requireDim(model_dim);
+
+    const even = try state.evenView();
+    const odd = try state.oddView();
+    for (0..batch) |b| {
+        for (0..model_dim) |d| {
+            try std.testing.expectEqual(x1.data[b * model_dim + d], try even.get(b, d));
+            try std.testing.expectEqual(x2.data[b * model_dim + d], try odd.get(b, d));
+        }
+    }
+    try std.testing.expectError(error.OutOfBounds, even.get(batch, 0));
+    try std.testing.expectError(error.OutOfBounds, odd.get(0, model_dim));
+    try std.testing.expectError(error.NonFinite, even.set(0, 0, std.math.inf(f32)));
+    const row_buf = try allocator.alloc(f32, model_dim);
+    defer allocator.free(row_buf);
+    try even.copyRowTo(1, row_buf);
+    for (0..model_dim) |d| try std.testing.expectEqual(x1.data[1 * model_dim + d], row_buf[d]);
+    try std.testing.expectError(error.DataLengthMismatch, even.copyRowTo(0, row_buf[0..2]));
+
+    var other = try RSF.initWithConfig(allocator, model_dim, 1, .{ .global_diffusion = false });
+    defer other.deinit();
+    try std.testing.expectError(types.RSFBindingError.RSFModelMismatch, state.requireModel(&other));
+    const forward_logdet = try rsf.forwardLatentWithLogDet(&state);
+    try std.testing.expect(std.math.isFinite(forward_logdet));
+    const inverse_logdet = try rsf.inverseLatentWithLogDet(&state);
+    try std.testing.expectApproxEqAbs(forward_logdet, inverse_logdet, 1e-4);
+    for (0..batch) |b| {
+        for (0..model_dim) |d| {
+            try std.testing.expectApproxEqAbs(x1.data[b * model_dim + d], try even.get(b, d), 1e-4);
+            try std.testing.expectApproxEqAbs(x2.data[b * model_dim + d], try odd.get(b, d), 1e-4);
+        }
+    }
+
+    const relative = try state.roundtripError(&rsf, allocator);
+    try std.testing.expect(relative < 1e-4);
+
+    try state.forwardThrough(&rsf);
+    try std.testing.expectApproxEqAbs(forward_logdet, state.log_det, 1e-5);
+    try state.inverseThrough(&rsf);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), state.log_det, 1e-4);
+    for (0..batch) |b| {
+        for (0..model_dim) |d| {
+            try std.testing.expectApproxEqAbs(x1.data[b * model_dim + d], try even.get(b, d), 1e-4);
+        }
+    }
+
+    var zero_state = try RSFLatentState.init(allocator, &rsf, batch);
+    defer zero_state.deinit();
+    const zero_even = try zero_state.evenView();
+    for (0..batch) |b| {
+        for (0..model_dim) |d| try std.testing.expectEqual(@as(f32, 0.0), try zero_even.get(b, d));
+    }
+    try zero_even.set(0, 0, 0.25);
+    try std.testing.expectEqual(@as(f32, 0.25), try zero_even.get(0, 0));
+    var cloned = try zero_state.clone(allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqual(@as(f32, 0.25), try (try cloned.evenView()).get(0, 0));
+    var cloned_view = try cloned.evenView();
+    try cloned_view.set(0, 0, 0.5);
+    try std.testing.expectEqual(@as(f32, 0.5), try cloned_view.get(0, 0));
+    try std.testing.expectEqual(@as(f32, 0.25), try zero_even.get(0, 0));
+    try std.testing.expectError(error.InvalidBatchSize, RSFLatentState.init(allocator, &rsf, 0));
+}
+
+test "RSF optimizer surface reads and writes layer weights and gradients" {
+    const allocator = std.testing.allocator;
+    const model_dim: usize = 6;
+    const num_layers: usize = 2;
+    const per_layer = model_dim * coupling_width;
+    var rsf = try RSF.initWithConfig(allocator, model_dim, num_layers, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    try std.testing.expectEqual(model_dim, try rsf.dim());
+    try std.testing.expectEqual(num_layers, try rsf.layerCount());
+    try std.testing.expectEqual(false, try rsf.globalDiffusionEnabled());
+    try std.testing.expectError(error.DiffusionDisabled, rsf.diffusionLayout());
+
+    const s_buf = try allocator.alloc(f32, per_layer);
+    defer allocator.free(s_buf);
+    const t_buf = try allocator.alloc(f32, per_layer);
+    defer allocator.free(t_buf);
+    try rsf.readLayerWeights(0, s_buf, t_buf);
+    try std.testing.expect(try exactSpectralNormRank2(s_buf, model_dim) <= LAYER_TARGET_SPECTRAL_NORM * (1.0 + 1e-6));
+    try std.testing.expect(try exactSpectralNormRank2(t_buf, model_dim) <= LAYER_TARGET_SPECTRAL_NORM * (1.0 + 1e-6));
+    try std.testing.expectError(error.LayerIndexOutOfBounds, rsf.readLayerWeights(num_layers, s_buf, t_buf));
+    try std.testing.expectError(error.DataLengthMismatch, rsf.readLayerWeights(0, s_buf[0..2], t_buf));
+
+    const replacement = try allocator.alloc(f32, per_layer);
+    defer allocator.free(replacement);
+    for (replacement, 0..) |*v, k| v.* = if (k % coupling_width == WEIGHT_COLUMN) @as(f32, 0.05) else @as(f32, 0.01);
+    try rsf.writeLayerWeights(1, replacement, replacement);
+    try rsf.readLayerWeights(1, s_buf, t_buf);
+    for (0..per_layer) |k| {
+        try std.testing.expectEqual(replacement[k], s_buf[k]);
+        try std.testing.expectEqual(replacement[k], t_buf[k]);
+    }
+    const bad = try allocator.alloc(f32, per_layer);
+    defer allocator.free(bad);
+    @memcpy(bad, replacement);
+    bad[0] = std.math.inf(f32);
+    try std.testing.expectError(error.NonFinite, rsf.writeLayerWeights(0, bad, replacement));
+    try std.testing.expectError(error.DataLengthMismatch, rsf.writeLayerWeights(0, replacement[0..2], replacement));
+
+    try std.testing.expectError(error.NoGradients, rsf.readLayerGradients(0, s_buf, t_buf));
+    const products = try allocator.alloc(f32, model_dim * 3);
+    defer allocator.free(products);
+    try std.testing.expectError(error.NoGradients, rsf.readLayerGradientProducts(0, .t, products));
+    try rsf.ensureGradients();
+    try rsf.zeroGradients();
+    try rsf.readLayerGradients(0, s_buf, t_buf);
+    for (0..per_layer) |k| try std.testing.expectEqual(@as(f32, 0.0), s_buf[k]);
+
+    const block = try allocator.alloc(f32, model_dim * 3);
+    defer allocator.free(block);
+    try rsf.readLayerGaussNewton(0, block);
+    for (block) |v| try std.testing.expectEqual(@as(f32, 0.0), v);
+    try std.testing.expectError(error.InvalidDataLength, rsf.readLayerGaussNewton(0, block[0..2]));
+    try std.testing.expectError(error.InvalidDataLength, rsf.readLayerGradientProducts(0, .s, products[0..2]));
+
+    const s_add = try allocator.alloc(f32, per_layer);
+    defer allocator.free(s_add);
+    const t_add = try allocator.alloc(f32, per_layer);
+    defer allocator.free(t_add);
+    for (s_add, 0..) |*v, k| v.* = @as(f32, @floatFromInt(k + 1)) * 0.25;
+    for (t_add, 0..) |*v, k| v.* = -@as(f32, @floatFromInt(k + 1)) * 0.125;
+    try rsf.accumulateLayerGradients(0, s_add, t_add);
+    try rsf.accumulateLayerGradients(0, s_add, t_add);
+    try rsf.readLayerGradients(0, s_buf, t_buf);
+    for (0..per_layer) |k| {
+        try std.testing.expectApproxEqAbs(2.0 * s_add[k], s_buf[k], 1e-6);
+        try std.testing.expectApproxEqAbs(2.0 * t_add[k], t_buf[k], 1e-6);
+    }
+    try std.testing.expectError(error.DataLengthMismatch, rsf.accumulateLayerGradients(0, s_add[0..2], t_add));
+    const nan_add = try allocator.alloc(f32, per_layer);
+    defer allocator.free(nan_add);
+    @memcpy(nan_add, s_add);
+    nan_add[1] = std.math.nan(f32);
+    try std.testing.expectError(error.NonFinite, rsf.accumulateLayerGradients(0, nan_add, t_add));
+
+    try rsf.readLayerGradientProducts(0, .s, products);
+    for (0..model_dim) |d| {
+        const g_w = 2.0 * s_add[d * coupling_width + WEIGHT_COLUMN];
+        const g_b = 2.0 * s_add[d * coupling_width + BIAS_COLUMN];
+        try std.testing.expectApproxEqAbs(g_w * g_w, products[d * 3 + 0], 1e-5);
+        try std.testing.expectApproxEqAbs(g_w * g_b, products[d * 3 + 1], 1e-5);
+        try std.testing.expectApproxEqAbs(g_b * g_b, products[d * 3 + 2], 1e-5);
+    }
+    try rsf.readLayerGradientProducts(0, .t, products);
+    for (0..model_dim) |d| {
+        const g_w = 2.0 * t_add[d * coupling_width + WEIGHT_COLUMN];
+        const g_b = 2.0 * t_add[d * coupling_width + BIAS_COLUMN];
+        try std.testing.expectApproxEqAbs(g_w * g_b, products[d * 3 + 1], 1e-5);
+    }
+
+    try rsf.scaleLayerGradients(0.5);
+    try rsf.readLayerGradients(0, s_buf, t_buf);
+    for (0..per_layer) |k| {
+        try std.testing.expectApproxEqAbs(s_add[k], s_buf[k], 1e-6);
+        try std.testing.expectApproxEqAbs(t_add[k], t_buf[k], 1e-6);
+    }
+    try std.testing.expectError(error.NonFinite, rsf.scaleLayerGradients(std.math.nan(f32)));
+    try rsf.scaleLayerGradients(0.0);
+    try rsf.readLayerGradients(0, s_buf, t_buf);
+    for (0..per_layer) |k| try std.testing.expectEqual(@as(f32, 0.0), s_buf[k]);
+
+    const bindings = try rsf.layerBindingsFor(0);
+    try bindings.s_weight.requireSpace(.layer_weight_s);
+    try bindings.s_weight.requireModel(rsf.id);
+    try bindings.s_weight.requireLayer(0);
+    try bindings.s_weight.requireDim(model_dim);
+    try bindings.t_weight.requireSpace(.layer_weight_t);
+    try bindings.gradient.requireSpace(.gradient);
+    try bindings.fisher_block.requireSpace(.fisher_block);
+    const latent_binding = try rsf.latentBinding();
+    try latent_binding.requireSpace(.latent_state);
+    try latent_binding.requireModel(rsf.id);
+    try latent_binding.requireDim(model_dim);
+    try std.testing.expectError(error.LayerIndexOutOfBounds, rsf.layerBindingsFor(num_layers));
+}
+
+test "RSF records gauss-newton blocks for the log-det objective" {
+    const allocator = std.testing.allocator;
+    const model_dim: usize = 4;
+    const batch: usize = 1;
+    var rsf = try RSF.initWithConfig(allocator, model_dim, 1, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var input = try Tensor.randomUniform(allocator, &[_]usize{ batch, 2 * model_dim }, -0.3, 0.3, 5150);
+    defer input.deinit();
+    var output = try tensorClone(allocator, &input);
+    defer output.deinit();
+    var grad_output = try Tensor.randomUniform(allocator, &[_]usize{ batch, 2 * model_dim }, -0.2, 0.2, 5151);
+    defer grad_output.deinit();
+    var grad_input = try Tensor.init(allocator, &[_]usize{ batch, 2 * model_dim });
+    defer grad_input.deinit();
+    try rsf.zeroGradients();
+    try rsf.backwardWithLogDet(&grad_output, &input, &output, &grad_input, 1.0);
+    const gn_len = model_dim * 3;
+    const block = try allocator.alloc(f32, gn_len);
+    defer allocator.free(block);
+    try rsf.readLayerGaussNewton(0, block);
+    var positive: usize = 0;
+    for (block) |v| {
+        try std.testing.expect(std.math.isFinite(v));
+        try std.testing.expect(v >= 0.0);
+        if (v > 0.0) positive += 1;
+    }
+    try std.testing.expect(positive > 0);
+    for (0..model_dim) |d| {
+        try std.testing.expectApproxEqAbs(block[d * 3 + 0] * block[d * 3 + 2], block[d * 3 + 1] * block[d * 3 + 1], 1e-8);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), block[d * 3 + 2], 1e-6);
+    }
+    try rsf.zeroLayerGaussNewton(0);
+    try rsf.readLayerGaussNewton(0, block);
+    for (block) |v| try std.testing.expectEqual(@as(f32, 0.0), v);
+
+    try rsf.zeroGradients();
+    try rsf.backwardWithLogDet(&grad_output, &input, &output, &grad_input, 0.0);
+    try rsf.readLayerGaussNewton(0, block);
+    for (block) |v| try std.testing.expectEqual(@as(f32, 0.0), v);
+
+    try rsf.zeroGradients();
+    try rsf.backwardWithLogDet(&grad_output, &input, &output, &grad_input, 2.0);
+    try rsf.readLayerGaussNewton(0, block);
+    for (0..model_dim) |d| try std.testing.expectApproxEqAbs(@as(f32, 4.0), block[d * 3 + 2], 1e-5);
+}
+
+test "RSF save format v7 roundtrips the diffusion flag and gauss-newton blocks" {
+    const allocator = std.testing.allocator;
+    const model_dim: usize = 8;
+    const num_layers: usize = 2;
+    const batch: usize = 1;
+    const per_layer = model_dim * coupling_width;
+    const gn_len = model_dim * 3;
+    var rsf = try RSF.initWithConfig(allocator, model_dim, num_layers, .{});
+    defer rsf.deinit();
+    try std.testing.expectEqual(true, try rsf.globalDiffusionEnabled());
+    const layout = try rsf.diffusionLayout();
+    try std.testing.expectEqual(2 * model_dim, layout.row_len);
+    try std.testing.expect(layout.radix * layout.block == layout.row_len);
+
+    var input = try Tensor.randomUniform(allocator, &[_]usize{ batch, 2 * model_dim }, -0.3, 0.3, 7070);
+    defer input.deinit();
+    var output = try tensorClone(allocator, &input);
+    defer output.deinit();
+    try rsf.forward(&output);
+    var grad_output = try Tensor.randomUniform(allocator, &[_]usize{ batch, 2 * model_dim }, -0.2, 0.2, 7071);
+    defer grad_output.deinit();
+    var grad_input = try Tensor.init(allocator, &[_]usize{ batch, 2 * model_dim });
+    defer grad_input.deinit();
+    try rsf.zeroGradients();
+    try rsf.backwardWithLogDet(&grad_output, &input, &output, &grad_input, 1.0);
+
+    const block = try allocator.alloc(f32, gn_len);
+    defer allocator.free(block);
+    try rsf.readLayerGaussNewton(1, block);
+    const s_buf = try allocator.alloc(f32, per_layer);
+    defer allocator.free(s_buf);
+    const t_buf = try allocator.alloc(f32, per_layer);
+    defer allocator.free(t_buf);
+    try rsf.readLayerWeights(1, s_buf, t_buf);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const file_path = try std.fs.path.join(allocator, &.{ dir_path, "model_v7.rsf" });
+    defer allocator.free(file_path);
+    try rsf.save(file_path);
+
+    var loaded = try RSF.load(allocator, file_path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(model_dim, try loaded.dim());
+    try std.testing.expectEqual(num_layers, try loaded.layerCount());
+    try std.testing.expectEqual(true, try loaded.globalDiffusionEnabled());
+    const loaded_layout = try loaded.diffusionLayout();
+    try std.testing.expectEqual(layout.row_len, loaded_layout.row_len);
+    try std.testing.expectEqual(layout.radix, loaded_layout.radix);
+    try std.testing.expectEqual(layout.block, loaded_layout.block);
+    try std.testing.expectEqual(layout.stages, loaded_layout.stages);
+
+    const loaded_block = try allocator.alloc(f32, gn_len);
+    defer allocator.free(loaded_block);
+    try loaded.readLayerGaussNewton(1, loaded_block);
+    for (0..gn_len) |k| try std.testing.expectEqual(block[k], loaded_block[k]);
+    const loaded_s = try allocator.alloc(f32, per_layer);
+    defer allocator.free(loaded_s);
+    const loaded_t = try allocator.alloc(f32, per_layer);
+    defer allocator.free(loaded_t);
+    try loaded.readLayerWeights(1, loaded_s, loaded_t);
+    for (0..per_layer) |k| {
+        try std.testing.expectEqual(s_buf[k], loaded_s[k]);
+        try std.testing.expectEqual(t_buf[k], loaded_t[k]);
+    }
+    try std.testing.expect(try loaded.verifyInvertible(&input, 1e-4, 1e-4));
+    try std.testing.expectError(error.PolicyMismatch, RSF.loadWithConfig(allocator, file_path, .{ .global_diffusion = false }));
+    var policy_loaded = try RSF.loadWithConfig(allocator, file_path, .{ .global_diffusion = true });
+    defer policy_loaded.deinit();
+    try std.testing.expectEqual(true, try policy_loaded.globalDiffusionEnabled());
+    try std.testing.expect(try RSF.saveLoadRoundtrip(allocator, &rsf, file_path, 0.0, 0.0));
+}
+
+test "RSF loads a v6 snapshot without diffusion and with zero gauss-newton blocks" {
+    const allocator = std.testing.allocator;
+    const model_dim: usize = 4;
+    const num_layers: usize = 2;
+    const per_layer = model_dim * coupling_width;
+    const cfg = RSFConfig{
+        .clip_min = -5.0,
+        .clip_max = 5.0,
+        .grad_mean = true,
+        .max_dim = 1 << 20,
+        .max_layers = 1 << 20,
+        .global_diffusion = false,
+    };
+    var source = try RSF.initWithConfig(allocator, model_dim, num_layers, cfg);
+    defer source.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const file_path = try std.fs.path.join(allocator, &.{ dir_path, "legacy_v6.rsf" });
+    defer allocator.free(file_path);
+
+    const s_buf = try allocator.alloc(f32, per_layer);
+    defer allocator.free(s_buf);
+    const t_buf = try allocator.alloc(f32, per_layer);
+    defer allocator.free(t_buf);
+
+    const file = try std.fs.cwd().createFile(file_path, .{});
+    defer file.close();
+    var buffered = std.io.bufferedWriter(file.writer());
+    const w = buffered.writer();
+    var hasher = std.hash.Crc32.init();
+    try w.writeAll("RSF0");
+    hasher.update("RSF0");
+    try w.writeInt(u32, SAVE_VERSION_LEGACY, .little);
+    crcUpdateU32LE(&hasher, SAVE_VERSION_LEGACY);
+    try w.writeInt(u64, @intCast(num_layers), .little);
+    crcUpdateU64LE(&hasher, @intCast(num_layers));
+    try w.writeInt(u64, @intCast(model_dim), .little);
+    crcUpdateU64LE(&hasher, @intCast(model_dim));
+    const clip_min_bits = @as(u32, @bitCast(cfg.clip_min));
+    const clip_max_bits = @as(u32, @bitCast(cfg.clip_max));
+    try w.writeInt(u32, clip_min_bits, .little);
+    try w.writeInt(u32, clip_max_bits, .little);
+    crcUpdateU32LE(&hasher, clip_min_bits);
+    crcUpdateU32LE(&hasher, clip_max_bits);
+    const gm_byte: u8 = if (cfg.grad_mean) 1 else 0;
+    try w.writeByte(gm_byte);
+    crcUpdateU8(&hasher, gm_byte);
+    try w.writeInt(u64, @intCast(cfg.max_dim), .little);
+    try w.writeInt(u64, @intCast(cfg.max_layers), .little);
+    crcUpdateU64LE(&hasher, @intCast(cfg.max_dim));
+    crcUpdateU64LE(&hasher, @intCast(cfg.max_layers));
+    var l: usize = 0;
+    while (l < num_layers) : (l += 1) {
+        try source.readLayerWeights(l, s_buf, t_buf);
+        try w.writeInt(u32, clip_min_bits, .little);
+        try w.writeInt(u32, clip_max_bits, .little);
+        crcUpdateU32LE(&hasher, clip_min_bits);
+        crcUpdateU32LE(&hasher, clip_max_bits);
+        try w.writeByte(gm_byte);
+        crcUpdateU8(&hasher, gm_byte);
+        var s_w = try Tensor.init(allocator, &[_]usize{ model_dim, coupling_width });
+        defer s_w.deinit();
+        @memcpy(s_w.data, s_buf);
+        var t_w = try Tensor.init(allocator, &[_]usize{ model_dim, coupling_width });
+        defer t_w.deinit();
+        @memcpy(t_w.data, t_buf);
+        try writeTensorData(w, &hasher, &s_w);
+        try writeTensorData(w, &hasher, &t_w);
+    }
+    try w.writeInt(u32, hasher.final(), .little);
+    try buffered.flush();
+    try file.sync();
+
+    var loaded = try RSF.load(allocator, file_path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(model_dim, try loaded.dim());
+    try std.testing.expectEqual(num_layers, try loaded.layerCount());
+    try std.testing.expectEqual(false, try loaded.globalDiffusionEnabled());
+    try std.testing.expectError(error.DiffusionDisabled, loaded.diffusionLayout());
+    const gn = try allocator.alloc(f32, model_dim * 3);
+    defer allocator.free(gn);
+    const s_out = try allocator.alloc(f32, per_layer);
+    defer allocator.free(s_out);
+    const t_out = try allocator.alloc(f32, per_layer);
+    defer allocator.free(t_out);
+    for (0..num_layers) |i| {
+        try loaded.readLayerGaussNewton(i, gn);
+        for (gn) |v| try std.testing.expectEqual(@as(f32, 0.0), v);
+        try loaded.readLayerWeights(i, s_out, t_out);
+        try source.readLayerWeights(i, s_buf, t_buf);
+        for (0..per_layer) |k| {
+            try std.testing.expectEqual(s_buf[k], s_out[k]);
+            try std.testing.expectEqual(t_buf[k], t_out[k]);
+        }
+    }
+    try std.testing.expectError(error.PolicyMismatch, RSF.loadWithConfig(allocator, file_path, .{ .global_diffusion = true }));
+    var policy_loaded = try RSF.loadWithConfig(allocator, file_path, cfg);
+    defer policy_loaded.deinit();
+    try std.testing.expectEqual(false, try policy_loaded.globalDiffusionEnabled());
 }
