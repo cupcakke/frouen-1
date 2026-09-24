@@ -3191,6 +3191,34 @@ pub fn globalDiffuseRowsStack(rows: []f32, count: usize, layout: types.RSFDiffus
     }
 }
 
+pub const CausalKeyAccumulator = struct {
+    src: []const f32,
+    dst: []f32,
+    row_len: usize,
+
+    pub fn add(self: *CausalKeyAccumulator, j: usize) void {
+        const row = j * self.row_len;
+        for (0..self.dst.len) |d| self.dst[d] += self.src[row + d];
+    }
+};
+
+pub fn causalKeyReset(mask: types.RSFSequenceMask, key_out: []f32) void {
+    if (mask.full_causal) return;
+    @memset(key_out, 0.0);
+}
+
+pub fn causalKeyAccumulate(mask: types.RSFSequenceMask, x2_in: []const f32, t: usize, key_out: []f32) void {
+    const dim = key_out.len;
+    causalKeyReset(mask, key_out);
+    if (!mask.full_causal) {
+        var accumulator = CausalKeyAccumulator{ .src = x2_in, .dst = key_out, .row_len = dim };
+        mask.rowSetBits(t, &accumulator, CausalKeyAccumulator.add);
+    }
+    const base = t * dim;
+    var d: usize = 0;
+    while (d < dim) : (d += 1) key_out[d] += x2_in[base + d];
+}
+
 pub fn causalCouplingKeyCount(mask: types.RSFSequenceMask, t: usize) usize {
     return mask.rowNnz(t) + 1;
 }
@@ -3215,32 +3243,13 @@ pub fn causalCouplingForward(
     if (!mask.full_causal) {
         if (slicesOverlap(x2, y2) or slicesOverlap(x1, y1)) return Error.InvalidArgument;
     }
-    const RowAccumulator = struct {
-        src: []const f32,
-        dst: []f32,
-        row_len: usize,
-
-        fn add(self: *@This(), j: usize) void {
-            const row = j * self.row_len;
-            for (0..self.dst.len) |d| self.dst[d] += self.src[row + d];
-        }
-    };
     const k = key[0..dim];
     @memset(k, 0.0);
     var logdet: f64 = 0.0;
     var t: usize = 0;
     while (t < seq_len) : (t += 1) {
         const base = t * dim;
-        if (mask.full_causal) {
-            var d: usize = 0;
-            while (d < dim) : (d += 1) k[d] += x2[base + d];
-        } else {
-            @memset(k, 0.0);
-            var accumulator = RowAccumulator{ .src = x2, .dst = k, .row_len = dim };
-            mask.rowSetBits(t, &accumulator, RowAccumulator.add);
-            var d: usize = 0;
-            while (d < dim) : (d += 1) k[d] += x2[base + d];
-        }
+        causalKeyAccumulate(mask, x2, t, k);
         var d: usize = 0;
         while (d < dim) : (d += 1) {
             const raw = params.scaleWeight(d) * k[d] + params.scaleBias(d);
@@ -3286,32 +3295,13 @@ pub fn causalCouplingInverse(
             x2[base + d] = y2[base + d] - shift;
         }
     }
-    const RowAccumulator = struct {
-        src: []const f32,
-        dst: []f32,
-        row_len: usize,
-
-        fn add(self: *@This(), j: usize) void {
-            const row = j * self.row_len;
-            for (0..self.dst.len) |d| self.dst[d] += self.src[row + d];
-        }
-    };
     const k = key[0..dim];
     @memset(k, 0.0);
     var logdet: f64 = 0.0;
     t = 0;
     while (t < seq_len) : (t += 1) {
         const base = t * dim;
-        if (mask.full_causal) {
-            var d: usize = 0;
-            while (d < dim) : (d += 1) k[d] += x2[base + d];
-        } else {
-            @memset(k, 0.0);
-            var accumulator = RowAccumulator{ .src = x2, .dst = k, .row_len = dim };
-            mask.rowSetBits(t, &accumulator, RowAccumulator.add);
-            var d: usize = 0;
-            while (d < dim) : (d += 1) k[d] += x2[base + d];
-        }
+        causalKeyAccumulate(mask, x2, t, k);
         for (0..dim) |d| {
             const raw = params.scaleWeight(d) * k[d] + params.scaleBias(d);
             const clipped = clipCoupling(raw, params.clip_min, params.clip_max);
@@ -3349,29 +3339,12 @@ pub fn causalCouplingBackward(
     if (g_y2.len < required or dx1.len < required or dx2.len < required) return Error.InvalidShape;
     if (ds_scratch.len < required) return Error.InvalidShape;
     if (slicesOverlap(x2_in, dx2) or slicesOverlap(y1, dx1) or slicesOverlap(y1, dx2)) return Error.InvalidArgument;
-    const RowAccumulator = struct {
-        src: []const f32,
-        dst: []f32,
-        row_len: usize,
-
-        fn add(self: *@This(), j: usize) void {
-            const row = j * self.row_len;
-            for (0..self.dst.len) |d| self.dst[d] += self.src[row + d];
-        }
-    };
     const k = key[0..dim];
     @memset(k, 0.0);
     var logdet: f64 = 0.0;
     for (0..seq_len) |t| {
         const base = t * dim;
-        if (mask.full_causal) {
-            for (0..dim) |d| k[d] += x2_in[base + d];
-        } else {
-            @memset(k, 0.0);
-            var accumulator = RowAccumulator{ .src = x2_in, .dst = k, .row_len = dim };
-            mask.rowSetBits(t, &accumulator, RowAccumulator.add);
-            for (0..dim) |d| k[d] += x2_in[base + d];
-        }
+        causalKeyAccumulate(mask, x2_in, t, k);
         for (0..dim) |d| {
             const w_s = params.scaleWeight(d);
             const w_t = params.translationWeight(d);

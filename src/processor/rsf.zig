@@ -400,6 +400,31 @@ const LayerCore = struct {
             blk[d * 3 + 2] += active * active;
         }
     }
+    fn recordCausalGaussNewton(self: *LayerCore, params: tensor.RSFCouplingParams, mask: *const types.RSFSequenceMask, x2_in: []const f32, logdet_weight: f32, key: []f32) !void {
+        if (logdet_weight == 0.0) return;
+        try self.ensureGaussNewton();
+        const blk = self.gn_block orelse return error.NoGaussNewtonBlock;
+        const dim = self.dim;
+        const seq_len = mask.seq_len;
+        if (key.len < dim) return error.DataLengthMismatch;
+        const required = try checkedMul(seq_len, dim);
+        if (x2_in.len < required) return error.DataLengthMismatch;
+        const k = key[0..dim];
+        @memset(k, 0.0);
+        var t: usize = 0;
+        while (t < seq_len) : (t += 1) {
+            tensor.causalKeyAccumulate(mask.*, x2_in[0..required], t, k);
+            var d: usize = 0;
+            while (d < dim) : (d += 1) {
+                const raw = params.scaleWeight(d) * k[d] + params.scaleBias(d);
+                const active: f32 = if (tensor.couplingSaturates(raw, params.clip_min, params.clip_max)) 0.0 else logdet_weight;
+                const g_w = active * k[d];
+                blk[d * 3 + 0] += g_w * g_w;
+                blk[d * 3 + 1] += g_w * active;
+                blk[d * 3 + 2] += active * active;
+            }
+        }
+    }
     fn backwardFromInputsRow(
         self: *LayerCore,
         x1_row: []const f32,
@@ -989,6 +1014,406 @@ fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tens
         @memcpy(grad_input_out.data[b * dim2 .. b * dim2 + dim2], dy);
     }
 }
+const SequenceShape = struct {
+    num_sequences: usize,
+    seq_len: usize,
+    dim: usize,
+    dim2: usize,
+    tokens: usize,
+
+    fn seqDim(self: SequenceShape) !usize {
+        return checkedMul(self.seq_len, self.dim);
+    }
+
+    fn stateLen(self: SequenceShape) !usize {
+        return checkedMul(self.seq_len, self.dim2);
+    }
+};
+
+fn sequenceShapeOf(x: *const Tensor, mask: *const types.RSFSequenceMask, core: *const RSFCore) !SequenceShape {
+    try validateTensor2D(x);
+    const dim = core.dim;
+    const dim2 = try checkedMul(dim, 2);
+    if (x.shape.dims[1] != dim2) return error.ShapeMismatch;
+    const tokens = x.shape.dims[0];
+    const seq_len = mask.seq_len;
+    if (seq_len == 0 or tokens == 0) return error.DimensionMismatch;
+    if (tokens % seq_len != 0) return error.DimensionMismatch;
+    return .{
+        .num_sequences = tokens / seq_len,
+        .seq_len = seq_len,
+        .dim = dim,
+        .dim2 = dim2,
+        .tokens = tokens,
+    };
+}
+
+const SequenceScratch = struct {
+    allocator: Allocator,
+    x1: []f32,
+    x2: []f32,
+    y1: []f32,
+    y2: []f32,
+    key: []f32,
+    scale: []f32,
+    trans: []f32,
+    row: []f32,
+    ds_weight: []f32,
+    dt_weight: []f32,
+    ds_scratch: []f32,
+
+    fn init(allocator: Allocator, shape: SequenceShape) !SequenceScratch {
+        const seq_dim = try shape.seqDim();
+        const params_len = try checkedMul(shape.dim, coupling_width);
+        const x1 = try allocator.alloc(f32, seq_dim);
+        errdefer allocator.free(x1);
+        const x2 = try allocator.alloc(f32, seq_dim);
+        errdefer allocator.free(x2);
+        const y1 = try allocator.alloc(f32, seq_dim);
+        errdefer allocator.free(y1);
+        const y2 = try allocator.alloc(f32, seq_dim);
+        errdefer allocator.free(y2);
+        const key = try allocator.alloc(f32, shape.dim);
+        errdefer allocator.free(key);
+        const scale = try allocator.alloc(f32, shape.dim);
+        errdefer allocator.free(scale);
+        const trans = try allocator.alloc(f32, shape.dim);
+        errdefer allocator.free(trans);
+        const row = try allocator.alloc(f32, shape.dim2);
+        errdefer allocator.free(row);
+        const ds_weight = try allocator.alloc(f32, params_len);
+        errdefer allocator.free(ds_weight);
+        const dt_weight = try allocator.alloc(f32, params_len);
+        errdefer allocator.free(dt_weight);
+        const ds_scratch = try allocator.alloc(f32, seq_dim);
+        errdefer allocator.free(ds_scratch);
+        return .{
+            .allocator = allocator,
+            .x1 = x1,
+            .x2 = x2,
+            .y1 = y1,
+            .y2 = y2,
+            .key = key,
+            .scale = scale,
+            .trans = trans,
+            .row = row,
+            .ds_weight = ds_weight,
+            .dt_weight = dt_weight,
+            .ds_scratch = ds_scratch,
+        };
+    }
+
+    fn deinit(self: *SequenceScratch) void {
+        self.allocator.free(self.x1);
+        self.allocator.free(self.x2);
+        self.allocator.free(self.y1);
+        self.allocator.free(self.y2);
+        self.allocator.free(self.key);
+        self.allocator.free(self.scale);
+        self.allocator.free(self.trans);
+        self.allocator.free(self.row);
+        self.allocator.free(self.ds_weight);
+        self.allocator.free(self.dt_weight);
+        self.allocator.free(self.ds_scratch);
+    }
+
+    fn assembleRow(self: *SequenceScratch, shape: SequenceShape, t: usize) void {
+        @memcpy(self.row[0..shape.dim], self.x1[t * shape.dim ..][0..shape.dim]);
+        @memcpy(self.row[shape.dim..shape.dim2], self.x2[t * shape.dim ..][0..shape.dim]);
+    }
+
+    fn splitRow(self: *SequenceScratch, shape: SequenceShape, t: usize) void {
+        @memcpy(self.x1[t * shape.dim ..][0..shape.dim], self.row[0..shape.dim]);
+        @memcpy(self.x2[t * shape.dim ..][0..shape.dim], self.row[shape.dim..shape.dim2]);
+    }
+
+    fn assembleGradientRow(self: *SequenceScratch, shape: SequenceShape, t: usize, g1: []const f32, g2: []const f32) void {
+        @memcpy(self.row[0..shape.dim], g1[t * shape.dim ..][0..shape.dim]);
+        @memcpy(self.row[shape.dim..shape.dim2], g2[t * shape.dim ..][0..shape.dim]);
+    }
+
+    fn splitGradientRow(self: *SequenceScratch, shape: SequenceShape, t: usize, g1: []f32, g2: []f32) void {
+        @memcpy(g1[t * shape.dim ..][0..shape.dim], self.row[0..shape.dim]);
+        @memcpy(g2[t * shape.dim ..][0..shape.dim], self.row[shape.dim..shape.dim2]);
+    }
+};
+
+fn gatherSequence(x: *const Tensor, shape: SequenceShape, sequence: usize, even: []f32, odd: []f32) !void {
+    const seq_dim = try shape.seqDim();
+    if (even.len < seq_dim or odd.len < seq_dim) return error.DataLengthMismatch;
+    const base_token = try checkedMul(sequence, shape.seq_len);
+    var t: usize = 0;
+    while (t < shape.seq_len) : (t += 1) {
+        const row = x.data[(base_token + t) * shape.dim2 ..][0..shape.dim2];
+        @memcpy(even[t * shape.dim ..][0..shape.dim], row[0..shape.dim]);
+        @memcpy(odd[t * shape.dim ..][0..shape.dim], row[shape.dim..shape.dim2]);
+    }
+}
+
+fn scatterSequence(x: *Tensor, shape: SequenceShape, sequence: usize, even: []const f32, odd: []const f32) !void {
+    const seq_dim = try shape.seqDim();
+    if (even.len < seq_dim or odd.len < seq_dim) return error.DataLengthMismatch;
+    try ensureFiniteSlice(even[0..seq_dim]);
+    try ensureFiniteSlice(odd[0..seq_dim]);
+    const base_token = try checkedMul(sequence, shape.seq_len);
+    var t: usize = 0;
+    while (t < shape.seq_len) : (t += 1) {
+        const row = x.data[(base_token + t) * shape.dim2 ..][0..shape.dim2];
+        @memcpy(row[0..shape.dim], even[t * shape.dim ..][0..shape.dim]);
+        @memcpy(row[shape.dim..shape.dim2], odd[t * shape.dim ..][0..shape.dim]);
+    }
+}
+
+fn storeSequenceState(states: []f32, shape: SequenceShape, layer_count: usize, slot: usize, even: []const f32, odd: []const f32) !void {
+    if (slot > layer_count) return error.LayerIndexOutOfBounds;
+    const state_len = try shape.stateLen();
+    const seq_dim = try shape.seqDim();
+    const base = try checkedMul(slot, state_len);
+    if (states.len < base + state_len) return error.DataLengthMismatch;
+    if (even.len < seq_dim or odd.len < seq_dim) return error.DataLengthMismatch;
+    var t: usize = 0;
+    while (t < shape.seq_len) : (t += 1) {
+        const row = states[base + t * shape.dim2 ..][0..shape.dim2];
+        @memcpy(row[0..shape.dim], even[t * shape.dim ..][0..shape.dim]);
+        @memcpy(row[shape.dim..shape.dim2], odd[t * shape.dim ..][0..shape.dim]);
+    }
+}
+
+fn loadSequenceState(states: []const f32, shape: SequenceShape, layer_count: usize, slot: usize, even: []f32, odd: []f32) !void {
+    if (slot > layer_count) return error.LayerIndexOutOfBounds;
+    const state_len = try shape.stateLen();
+    const seq_dim = try shape.seqDim();
+    const base = try checkedMul(slot, state_len);
+    if (states.len < base + state_len) return error.DataLengthMismatch;
+    if (even.len < seq_dim or odd.len < seq_dim) return error.DataLengthMismatch;
+    var t: usize = 0;
+    while (t < shape.seq_len) : (t += 1) {
+        const row = states[base + t * shape.dim2 ..][0..shape.dim2];
+        @memcpy(even[t * shape.dim ..][0..shape.dim], row[0..shape.dim]);
+        @memcpy(odd[t * shape.dim ..][0..shape.dim], row[shape.dim..shape.dim2]);
+    }
+}
+
+fn forwardSequenceOnCore(core: *const RSFCore, x: *Tensor, mask: *const types.RSFSequenceMask, logdet_per_sequence: ?[]f32) !void {
+    try validateModelMetadata(core);
+    const shape = try sequenceShapeOf(x, mask, core);
+    const layer_count = try checkedModelLayerCount(core);
+    if (logdet_per_sequence) |buf| {
+        if (buf.len < shape.num_sequences) return error.DataLengthMismatch;
+        @memset(buf[0..shape.num_sequences], 0.0);
+    }
+    try ensureFiniteSlice(x.data);
+    const seq_dim = try shape.seqDim();
+    const allocator = scratchAllocator();
+    var scratch = try SequenceScratch.init(allocator, shape);
+    defer scratch.deinit();
+    var seq: usize = 0;
+    while (seq < shape.num_sequences) : (seq += 1) {
+        try gatherSequence(x, shape, seq, scratch.x1, scratch.x2);
+        var l: usize = 0;
+        while (l < layer_count) : (l += 1) {
+            const params = try core.layers[l].couplingParams();
+            const logdet = try tensor.causalCouplingForward(params, mask.*, scratch.x1, scratch.x2, scratch.y1, scratch.y2, scratch.key, scratch.scale, scratch.trans);
+            if (logdet_per_sequence) |buf| {
+                const value: f32 = @floatCast(logdet);
+                if (!std.math.isFinite(value)) return error.NonFinite;
+                buf[seq] += value;
+            }
+            @memcpy(scratch.x1[0..seq_dim], scratch.y1[0..seq_dim]);
+            @memcpy(scratch.x2[0..seq_dim], scratch.y2[0..seq_dim]);
+            var t: usize = 0;
+            while (t < shape.seq_len) : (t += 1) {
+                scratch.assembleRow(shape, t);
+                core.oftb.forwardSliceInPlace(scratch.row);
+                scratch.splitRow(shape, t);
+            }
+        }
+        try scatterSequence(x, shape, seq, scratch.x1, scratch.x2);
+    }
+}
+
+fn inverseSequenceOnCore(core: *const RSFCore, y: *Tensor, mask: *const types.RSFSequenceMask, logdet_per_sequence: ?[]f32) !void {
+    try validateModelMetadata(core);
+    const shape = try sequenceShapeOf(y, mask, core);
+    const layer_count = try checkedModelLayerCount(core);
+    if (logdet_per_sequence) |buf| {
+        if (buf.len < shape.num_sequences) return error.DataLengthMismatch;
+        @memset(buf[0..shape.num_sequences], 0.0);
+    }
+    try ensureFiniteSlice(y.data);
+    const seq_dim = try shape.seqDim();
+    const allocator = scratchAllocator();
+    var scratch = try SequenceScratch.init(allocator, shape);
+    defer scratch.deinit();
+    var seq: usize = 0;
+    while (seq < shape.num_sequences) : (seq += 1) {
+        try gatherSequence(y, shape, seq, scratch.x1, scratch.x2);
+        var idx = layer_count;
+        while (idx > 0) : (idx -= 1) {
+            var t: usize = 0;
+            while (t < shape.seq_len) : (t += 1) {
+                scratch.assembleRow(shape, t);
+                core.oftb.inverseSliceInPlace(scratch.row);
+                scratch.splitRow(shape, t);
+            }
+            const params = try core.layers[idx - 1].couplingParams();
+            const logdet = try tensor.causalCouplingInverse(params, mask.*, scratch.x1, scratch.x2, scratch.y1, scratch.y2, scratch.key, scratch.scale, scratch.trans);
+            if (logdet_per_sequence) |buf| {
+                const value: f32 = @floatCast(logdet);
+                if (!std.math.isFinite(value)) return error.NonFinite;
+                buf[seq] += value;
+            }
+            @memcpy(scratch.x1[0..seq_dim], scratch.y1[0..seq_dim]);
+            @memcpy(scratch.x2[0..seq_dim], scratch.y2[0..seq_dim]);
+        }
+        try scatterSequence(y, shape, seq, scratch.x1, scratch.x2);
+    }
+}
+
+fn backwardSequenceOnCore(
+    core: *RSFCore,
+    grad_output: *const Tensor,
+    input: *const Tensor,
+    output: *const Tensor,
+    mask: *const types.RSFSequenceMask,
+    grad_input_out: *Tensor,
+    logdet_weight: f32,
+) !void {
+    try validateModelMetadata(core);
+    try validateTensor2D(grad_output);
+    try validateTensor2D(input);
+    try validateTensor2D(output);
+    try validateTensor2D(grad_input_out);
+    const shape = try sequenceShapeOf(input, mask, core);
+    if (!tensorsSameShape(grad_output, input)) return error.ShapeMismatch;
+    if (!tensorsSameShape(output, input)) return error.ShapeMismatch;
+    if (!tensorsSameShape(grad_input_out, input)) return error.ShapeMismatch;
+    if (!std.math.isFinite(logdet_weight)) return error.NonFinite;
+    if (tensorsOverlap(grad_input_out, grad_output)) return error.AliasedBuffers;
+    if (tensorsOverlap(grad_input_out, input)) return error.AliasedBuffers;
+    if (tensorsOverlap(grad_input_out, output)) return error.AliasedBuffers;
+    try ensureFiniteSlice(input.data);
+    try ensureFiniteSlice(output.data);
+    try ensureFiniteSlice(grad_output.data);
+    const layer_count = try checkedModelLayerCount(core);
+    var li: usize = 0;
+    while (li < layer_count) : (li += 1) try core.layers[li].ensureGradients();
+    const grad_scale: f32 = blk: {
+        if (!core.cfg.grad_mean) break :blk 1.0;
+        const value = 1.0 / @as(f32, @floatFromInt(shape.tokens));
+        break :blk if (std.math.isFinite(value)) value else 1.0;
+    };
+    const seq_dim = try shape.seqDim();
+    const state_len = try shape.stateLen();
+    const allocator = scratchAllocator();
+    var scratch = try SequenceScratch.init(allocator, shape);
+    defer scratch.deinit();
+    const states_len = try checkedMul(layer_count + 1, state_len);
+    const states = try allocator.alloc(f32, states_len);
+    defer allocator.free(states);
+    const g1 = try allocator.alloc(f32, seq_dim);
+    defer allocator.free(g1);
+    const g2 = try allocator.alloc(f32, seq_dim);
+    defer allocator.free(g2);
+    const dx1 = try allocator.alloc(f32, seq_dim);
+    defer allocator.free(dx1);
+    const dx2 = try allocator.alloc(f32, seq_dim);
+    defer allocator.free(dx2);
+    const recovered1 = try allocator.alloc(f32, seq_dim);
+    defer allocator.free(recovered1);
+    const recovered2 = try allocator.alloc(f32, seq_dim);
+    defer allocator.free(recovered2);
+    const params_len = try checkedMul(shape.dim, coupling_width);
+
+    var seq: usize = 0;
+    while (seq < shape.num_sequences) : (seq += 1) {
+        try gatherSequence(input, shape, seq, scratch.x1, scratch.x2);
+        try storeSequenceState(states, shape, layer_count, 0, scratch.x1, scratch.x2);
+        var l: usize = 0;
+        while (l < layer_count) : (l += 1) {
+            const params = try core.layers[l].couplingParams();
+            _ = try tensor.causalCouplingForward(params, mask.*, scratch.x1, scratch.x2, scratch.y1, scratch.y2, scratch.key, scratch.scale, scratch.trans);
+            @memcpy(scratch.x1[0..seq_dim], scratch.y1[0..seq_dim]);
+            @memcpy(scratch.x2[0..seq_dim], scratch.y2[0..seq_dim]);
+            var t: usize = 0;
+            while (t < shape.seq_len) : (t += 1) {
+                scratch.assembleRow(shape, t);
+                core.oftb.forwardSliceInPlace(scratch.row);
+                scratch.splitRow(shape, t);
+            }
+            try storeSequenceState(states, shape, layer_count, l + 1, scratch.x1, scratch.x2);
+        }
+        var check: usize = 0;
+        while (check < state_len) : (check += 1) {
+            var expected: f32 = undefined;
+            const token = check / shape.dim2;
+            const within = check % shape.dim2;
+            expected = output.data[(seq * shape.seq_len + token) * shape.dim2 + within];
+            const produced = states[layer_count * state_len + check];
+            if (!valuesWithinTolerance(produced, expected, MODEL_CROSS_CHECK_ABS_TOL, MODEL_CROSS_CHECK_REL_TOL)) return error.StateMismatch;
+        }
+        try gatherSequence(grad_output, shape, seq, g1, g2);
+        var idx = layer_count;
+        while (idx > 0) : (idx -= 1) {
+            const layer = &core.layers[idx - 1];
+            var t: usize = 0;
+            while (t < shape.seq_len) : (t += 1) {
+                scratch.assembleGradientRow(shape, t, g1, g2);
+                core.oftb.backwardSliceInPlace(scratch.row);
+                scratch.splitGradientRow(shape, t, g1, g2);
+            }
+            try loadSequenceState(states, shape, layer_count, idx - 1, scratch.x1, scratch.x2);
+            try loadSequenceState(states, shape, layer_count, idx, recovered1, recovered2);
+            t = 0;
+            while (t < shape.seq_len) : (t += 1) {
+                scratch.assembleGradientRow(shape, t, recovered1, recovered2);
+                core.oftb.inverseSliceInPlace(scratch.row);
+                scratch.splitGradientRow(shape, t, recovered1, recovered2);
+            }
+            const params = try layer.couplingParams();
+            @memset(scratch.ds_weight[0..params_len], 0.0);
+            @memset(scratch.dt_weight[0..params_len], 0.0);
+            _ = try tensor.causalCouplingBackward(
+                params,
+                mask.*,
+                scratch.x2,
+                recovered1,
+                g1,
+                g2,
+                logdet_weight,
+                scratch.ds_weight,
+                scratch.dt_weight,
+                dx1,
+                dx2,
+                scratch.key,
+                scratch.ds_scratch,
+            );
+            try layer.recordCausalGaussNewton(params, mask, scratch.x2, logdet_weight, scratch.key);
+            layer.rwlock.lock();
+            defer layer.rwlock.unlock();
+            if (layer.s_weight_grad) |*swg| {
+                if (swg.data.len >= params_len) {
+                    var k: usize = 0;
+                    while (k < params_len) : (k += 1) swg.data[k] += grad_scale * scratch.ds_weight[k];
+                }
+            }
+            if (layer.t_weight_grad) |*twg| {
+                if (twg.data.len >= params_len) {
+                    var k: usize = 0;
+                    while (k < params_len) : (k += 1) twg.data[k] += grad_scale * scratch.dt_weight[k];
+                }
+            }
+            @memcpy(g1[0..seq_dim], dx1[0..seq_dim]);
+            @memcpy(g2[0..seq_dim], dx2[0..seq_dim]);
+        }
+        try scatterSequence(grad_input_out, shape, seq, g1, g2);
+    }
+}
+
+fn meanSequenceLogDet(per_sequence: []const f32, num_sequences: usize) !f32 {
+    return meanLogDet(per_sequence, num_sequences);
+}
+
 fn layerGPUCompatible(layer: *const LayerCore, cfg: *const RSFConfig, dim: usize) bool {
     if (layer.dim != dim) return false;
     if (layer.clip_min != cfg.clip_min or layer.clip_max != cfg.clip_max or layer.grad_mean != cfg.grad_mean) return false;
@@ -1923,6 +2348,82 @@ pub const RSF = struct {
             s_grad.data[k] += s_in[k];
             t_grad.data[k] += t_in[k];
         }
+    }
+
+    pub fn forwardSequence(self: *RSF, x: *Tensor, mask: *const types.RSFSequenceMask) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        try forwardSequenceOnCore(core, x, mask, null);
+    }
+
+    pub fn forwardSequenceWithLogDet(self: *RSF, x: *Tensor, mask: *const types.RSFSequenceMask, logdet_per_sequence: []f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        try forwardSequenceOnCore(core, x, mask, logdet_per_sequence);
+    }
+
+    pub fn inverseSequence(self: *RSF, y: *Tensor, mask: *const types.RSFSequenceMask) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        try inverseSequenceOnCore(core, y, mask, null);
+    }
+
+    pub fn inverseSequenceWithLogDet(self: *RSF, y: *Tensor, mask: *const types.RSFSequenceMask, logdet_per_sequence: []f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        try inverseSequenceOnCore(core, y, mask, logdet_per_sequence);
+    }
+
+    pub fn meanLogDetJacobianSequence(self: *RSF, x: *const Tensor, mask: *const types.RSFSequenceMask) !f32 {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const shape = try sequenceShapeOf(x, mask, core);
+        const allocator = scratchAllocator();
+        var working = try tensorClone(allocator, x);
+        defer working.deinit();
+        const per_sequence = try allocator.alloc(f32, shape.num_sequences);
+        defer allocator.free(per_sequence);
+        try forwardSequenceOnCore(core, &working, mask, per_sequence);
+        return try meanSequenceLogDet(per_sequence, shape.num_sequences);
+    }
+
+    pub fn verifySequenceInvertible(self: *RSF, x: *const Tensor, mask: *const types.RSFSequenceMask, abs_tol: f32, rel_tol: f32) !bool {
+        try validateComparisonTolerances(abs_tol, rel_tol);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const allocator = scratchAllocator();
+        var y = try tensorClone(allocator, x);
+        defer y.deinit();
+        try forwardSequenceOnCore(core, &y, mask, null);
+        try inverseSequenceOnCore(core, &y, mask, null);
+        return tensorAllCloseEq(x, &y, abs_tol, rel_tol);
+    }
+
+    pub fn backwardSequence(self: *RSF, grad_output: *const Tensor, input: *const Tensor, output: *const Tensor, mask: *const types.RSFSequenceMask, grad_input_out: *Tensor, logdet_weight: f32) !void {
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        try backwardSequenceOnCore(core, grad_output, input, output, mask, grad_input_out, logdet_weight);
     }
 
     pub fn inverseWithLogDet(self: *RSF, y: *Tensor, logdet_per_row: []f32) !void {
@@ -3184,4 +3685,177 @@ test "RSF loads a v6 snapshot without diffusion and with zero gauss-newton block
     var policy_loaded = try RSF.loadWithConfig(allocator, file_path, cfg);
     defer policy_loaded.deinit();
     try std.testing.expectEqual(false, try policy_loaded.globalDiffusionEnabled());
+}
+
+test "RSF causal sequence flow with an all-zero mask equals the per-token flow" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const dim2: usize = dim * 2;
+    const seq_len: usize = 3;
+    const num_sequences: usize = 2;
+    var rsf = try RSF.init(allocator, dim, 2);
+    defer rsf.deinit();
+    var mask = try types.RSFSequenceMask.initZero(allocator, seq_len);
+    defer mask.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ num_sequences * seq_len, dim2 }, -0.5, 0.5, 71001);
+    defer x.deinit();
+    var sequence_flow = try tensorClone(allocator, &x);
+    defer sequence_flow.deinit();
+    try rsf.forwardSequence(&sequence_flow, &mask);
+    var token_flow = try tensorClone(allocator, &x);
+    defer token_flow.deinit();
+    try rsf.forwardCPU(&token_flow);
+    for (sequence_flow.data, token_flow.data) |a, b| try std.testing.expectEqual(b, a);
+    try rsf.inverseSequence(&sequence_flow, &mask);
+    for (sequence_flow.data, x.data) |a, b| try std.testing.expectEqual(b, a);
+}
+test "RSF causal sequence flow is invertible and tracks the analytic volume" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const dim2: usize = dim * 2;
+    const seq_len: usize = 4;
+    const num_sequences: usize = 2;
+    var rsf = try RSF.init(allocator, dim, 2);
+    defer rsf.deinit();
+    var mask = try types.RSFSequenceMask.initCausal(allocator, seq_len);
+    defer mask.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ num_sequences * seq_len, dim2 }, -0.5, 0.5, 71002);
+    defer x.deinit();
+    try std.testing.expect(try rsf.verifySequenceInvertible(&x, &mask, 1.0e-4, 1.0e-4));
+    var y = try tensorClone(allocator, &x);
+    defer y.deinit();
+    const forward = try allocator.alloc(f32, num_sequences);
+    defer allocator.free(forward);
+    const inverse = try allocator.alloc(f32, num_sequences);
+    defer allocator.free(inverse);
+    try rsf.forwardSequenceWithLogDet(&y, &mask, forward);
+    try rsf.inverseSequenceWithLogDet(&y, &mask, inverse);
+    for (forward, inverse) |f, i| try std.testing.expect(valuesWithinTolerance(f, i, 1.0e-4, 1.0e-4));
+    for (y.data, x.data) |a, b| try std.testing.expect(valuesWithinTolerance(a, b, 1.0e-4, 1.0e-4));
+    const mean_forward = try rsf.meanLogDetJacobianSequence(&x, &mask);
+    try std.testing.expect(std.math.isFinite(mean_forward));
+}
+test "RSF causal sequence flow never lets a later token reach an earlier one" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 3;
+    const dim2: usize = dim * 2;
+    const seq_len: usize = 5;
+    var rsf = try RSF.init(allocator, dim, 2);
+    defer rsf.deinit();
+    var mask = try types.RSFSequenceMask.initCausal(allocator, seq_len);
+    defer mask.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ seq_len, dim2 }, -0.4, 0.4, 71003);
+    defer x.deinit();
+    var base = try tensorClone(allocator, &x);
+    defer base.deinit();
+    try rsf.forwardSequence(&base, &mask);
+    const perturbed_token: usize = 3;
+    var perturbed = try tensorClone(allocator, &x);
+    defer perturbed.deinit();
+    for (0..dim2) |d| perturbed.data[perturbed_token * dim2 + d] += 0.25;
+    try rsf.forwardSequence(&perturbed, &mask);
+    var t: usize = 0;
+    while (t < perturbed_token) : (t += 1) {
+        for (0..dim2) |d| try std.testing.expectEqual(base.data[t * dim2 + d], perturbed.data[t * dim2 + d]);
+    }
+    var changed = false;
+    for (0..dim2) |d| {
+        if (base.data[perturbed_token * dim2 + d] != perturbed.data[perturbed_token * dim2 + d]) changed = true;
+    }
+    try std.testing.expect(changed);
+}
+test "RSF relational sequence mask couples only the linked tokens" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 3;
+    const dim2: usize = dim * 2;
+    const seq_len: usize = 6;
+    var rsf = try RSF.init(allocator, dim, 1);
+    defer rsf.deinit();
+    var mask = try types.RSFSequenceMask.initBand(allocator, seq_len, 1);
+    defer mask.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ seq_len, dim2 }, -0.4, 0.4, 71004);
+    defer x.deinit();
+    var base = try tensorClone(allocator, &x);
+    defer base.deinit();
+    try rsf.forwardSequence(&base, &mask);
+    var perturbed = try tensorClone(allocator, &x);
+    defer perturbed.deinit();
+    for (0..dim2) |d| perturbed.data[5 * dim2 + d] += 0.25;
+    try rsf.forwardSequence(&perturbed, &mask);
+    for (0..4) |t| {
+        for (0..dim2) |d| try std.testing.expectEqual(base.data[t * dim2 + d], perturbed.data[t * dim2 + d]);
+    }
+    try std.testing.expect(try rsf.verifySequenceInvertible(&x, &mask, 1.0e-4, 1.0e-4));
+}
+test "RSF backwardSequence input gradients match central finite differences" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 2;
+    const dim2: usize = dim * 2;
+    const seq_len: usize = 2;
+    const cfg = RSFConfig{ .grad_mean = false };
+    var rsf = try RSF.initWithConfig(allocator, dim, 1, cfg);
+    defer rsf.deinit();
+    var mask = try types.RSFSequenceMask.initCausal(allocator, seq_len);
+    defer mask.deinit();
+    var input = try Tensor.randomUniform(allocator, &[_]usize{ seq_len, dim2 }, -0.3, 0.3, 71005);
+    defer input.deinit();
+    var seeds = try Tensor.randomUniform(allocator, &[_]usize{ seq_len, dim2 }, -0.7, 0.7, 71006);
+    defer seeds.deinit();
+    var output = try tensorClone(allocator, &input);
+    defer output.deinit();
+    try rsf.forwardSequence(&output, &mask);
+    var grad_input = try Tensor.init(allocator, &[_]usize{ seq_len, dim2 });
+    defer grad_input.deinit();
+    try rsf.zeroGradients();
+    try rsf.backwardSequence(&seeds, &input, &output, &mask, &grad_input, 0.0);
+    const h: f32 = 1.0e-3;
+    var k: usize = 0;
+    while (k < input.data.len) : (k += 1) {
+        var plus = try tensorClone(allocator, &input);
+        defer plus.deinit();
+        plus.data[k] += h;
+        try rsf.forwardSequence(&plus, &mask);
+        var minus = try tensorClone(allocator, &input);
+        defer minus.deinit();
+        minus.data[k] -= h;
+        try rsf.forwardSequence(&minus, &mask);
+        var loss_plus: f32 = 0.0;
+        var loss_minus: f32 = 0.0;
+        for (0..seeds.data.len) |j| {
+            loss_plus += seeds.data[j] * plus.data[j];
+            loss_minus += seeds.data[j] * minus.data[j];
+        }
+        const numeric = (loss_plus - loss_minus) / (2.0 * h);
+        try std.testing.expect(valuesWithinTolerance(numeric, grad_input.data[k], 4.0e-3, 4.0e-2));
+    }
+}
+test "RSF backwardSequence records the causal Natural Gradient block" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 2;
+    const dim2: usize = dim * 2;
+    const seq_len: usize = 3;
+    var rsf = try RSF.init(allocator, dim, 1);
+    defer rsf.deinit();
+    var mask = try types.RSFSequenceMask.initZero(allocator, seq_len);
+    defer mask.deinit();
+    var input = try Tensor.randomUniform(allocator, &[_]usize{ seq_len, dim2 }, -0.2, 0.2, 71007);
+    defer input.deinit();
+    var seeds = try Tensor.randomUniform(allocator, &[_]usize{ seq_len, dim2 }, -0.6, 0.6, 71008);
+    defer seeds.deinit();
+    var output = try tensorClone(allocator, &input);
+    defer output.deinit();
+    try rsf.forwardSequence(&output, &mask);
+    var grad_input = try Tensor.init(allocator, &[_]usize{ seq_len, dim2 });
+    defer grad_input.deinit();
+    try rsf.zeroGradients();
+    try rsf.backwardSequence(&seeds, &input, &output, &mask, &grad_input, 1.0);
+    const block = try allocator.alloc(f32, dim * 3);
+    defer allocator.free(block);
+    try rsf.readLayerGaussNewton(0, block);
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        try std.testing.expect(valuesWithinTolerance(block[d * 3 + 2], @as(f32, @floatFromInt(seq_len)), 1.0e-5, 1.0e-5));
+        try std.testing.expect(block[d * 3 + 0] >= 0.0);
+        try std.testing.expect(std.math.isFinite(block[d * 3 + 1]));
+    }
 }
