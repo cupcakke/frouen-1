@@ -3,6 +3,9 @@ const nsir_core = @import("nsir_core.zig");
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const Complex = std.math.Complex;
+const core_tensor = @import("../core/tensor.zig");
+const core_types = @import("../core/types.zig");
+const builtin = @import("builtin");
 
 pub const SelfSimilarRelationalGraph = nsir_core.SelfSimilarRelationalGraph;
 pub const Node = nsir_core.Node;
@@ -205,27 +208,31 @@ pub const BitmaskMatrix = struct {
     }
 
     pub fn signalPropagate(self: *const BitmaskMatrix, signal: []const f32, decay: f32, out: []f32) BitmaskMatrixError!void {
-        if (signal.len < self.cols or out.len < self.rows) return BitmaskMatrixError.StateShapeMismatch;
+        const required = @max(self.rows, self.cols);
+        if (signal.len < required or out.len < self.rows) return BitmaskMatrixError.StateShapeMismatch;
+        if (self.words.len < self.rows * self.words_per_row) return BitmaskMatrixError.StateShapeMismatch;
+        nsir_core.bitmaskSignalPropagateExactStrided(self.words, self.words_per_row, self.rows, self.cols, signal, decay, out);
+    }
+
+    pub fn signalPropagateBitPlane(self: *const BitmaskMatrix, signal: []const f32, decay: f32, out: []f32) BitmaskMatrixError!void {
+        const required = @max(self.rows, self.cols);
+        if (signal.len < required or out.len < self.rows) return BitmaskMatrixError.StateShapeMismatch;
+        if (self.words.len < self.rows * self.words_per_row) return BitmaskMatrixError.StateShapeMismatch;
+        nsir_core.bitmaskSignalPropagateBitPlaneStrided(self.allocator, self.words, self.words_per_row, self.rows, self.cols, signal, decay, out) catch {
+            nsir_core.bitmaskSignalPropagateExactStrided(self.words, self.words_per_row, self.rows, self.cols, signal, decay, out);
+        };
+    }
+
+    pub fn signalPropagateBound(self: *const BitmaskMatrix, signal: []const f32, decay: f32) f32 {
+        var max_abs: f32 = 0.0;
+        for (signal[0..@min(signal.len, self.cols)]) |v| max_abs = @max(max_abs, @abs(v));
+        var worst: usize = 0;
         var src: usize = 0;
         while (src < self.rows) : (src += 1) {
-            const row_words = self.words[src * self.words_per_row ..][0..self.words_per_row];
-            var acc: f32 = 0.0;
-            var w: usize = 0;
-            while (w + 2 <= self.words_per_row) : (w += 2) {
-                const block: U64x2 = row_words[w..][0..2].*;
-                var lane: usize = 0;
-                while (lane < 2) : (lane += 1) {
-                    var bits = block[lane];
-                    while (bits != 0) {
-                        const bit: u6 = @intCast(@ctz(bits));
-                        const tgt = (w + lane) * 64 + @as(usize, bit);
-                        if (tgt < self.cols) acc += signal[tgt];
-                        bits &= bits -% 1;
-                    }
-                }
-            }
-            out[src] = signal[src] + decay * acc;
+            const count = nsir_core.bitmaskRowNeighborCount(self.words[src * self.words_per_row ..][0..self.words_per_row], self.cols, nsir_core.bitmaskWordCount(self.cols));
+            worst = @max(worst, count);
         }
+        return nsir_core.bitmaskSignalPropagateBound(decay, max_abs, worst);
     }
 
     pub fn accumulateWeightedCounts(self: *const BitmaskMatrix, state: []const u64, weights: []const f32, out: []f32) BitmaskMatrixError!void {
@@ -1705,6 +1712,10 @@ pub const VPUStatistics = struct {
     graph_operations: usize,
     bitmask_operations: usize,
     bitmask_popcount_lookups: usize,
+    coupling_ops: usize,
+    latents_flowed: usize,
+    diffusion_rows: usize,
+    causal_masks_built: usize,
 
     const Self = @This();
 
@@ -1721,6 +1732,10 @@ pub const VPUStatistics = struct {
             .graph_operations = 0,
             .bitmask_operations = 0,
             .bitmask_popcount_lookups = 0,
+            .coupling_ops = 0,
+            .latents_flowed = 0,
+            .diffusion_rows = 0,
+            .causal_masks_built = 0,
         };
     }
 
@@ -1736,6 +1751,10 @@ pub const VPUStatistics = struct {
         self.graph_operations = 0;
         self.bitmask_operations = 0;
         self.bitmask_popcount_lookups = 0;
+        self.coupling_ops = 0;
+        self.latents_flowed = 0;
+        self.diffusion_rows = 0;
+        self.causal_masks_built = 0;
     }
 
     pub fn clone(self: *const Self) Self {
@@ -1751,6 +1770,10 @@ pub const VPUStatistics = struct {
             .graph_operations = self.graph_operations,
             .bitmask_operations = self.bitmask_operations,
             .bitmask_popcount_lookups = self.bitmask_popcount_lookups,
+            .coupling_ops = self.coupling_ops,
+            .latents_flowed = self.latents_flowed,
+            .diffusion_rows = self.diffusion_rows,
+            .causal_masks_built = self.causal_masks_built,
         };
     }
 
@@ -2122,6 +2145,63 @@ pub const VPU = struct {
         self.cycle_count += matrix.rows;
     }
 
+    pub fn propagateBitmaskSignalBitPlane(self: *Self, matrix: *const BitmaskMatrix, signal: []const f32, decay: f32, out: []f32) !void {
+        try matrix.signalPropagateBitPlane(signal, decay, out);
+        self.statistics.bitmask_operations += 1;
+        self.statistics.bitmask_popcount_lookups += matrix.rows * matrix.words_per_row;
+        self.cycle_count += matrix.rows;
+    }
+
+    pub fn couplingForwardLanes8(self: *Self, lanes: *F32Coupling8, params: CouplingParamLanes(8)) @Vector(8, f32) {
+        const clipped = couplingForwardLanes(8, lanes, params);
+        self.statistics.coupling_ops += 1;
+        self.statistics.simd_instructions_used += 1;
+        return clipped;
+    }
+
+    pub fn couplingInverseLanes8(self: *Self, lanes: *F32Coupling8, params: CouplingParamLanes(8)) @Vector(8, f32) {
+        const clipped = couplingInverseLanes(8, lanes, params);
+        self.statistics.coupling_ops += 1;
+        self.statistics.simd_instructions_used += 1;
+        return clipped;
+    }
+
+    pub fn couplingForwardRows(self: *Self, params: core_tensor.RSFCouplingParams, rows: []f32, batch: usize, scale: []f32, trans: []f32) !f64 {
+        const logdet = try core_tensor.couplingForwardRows(params, rows, batch, scale, trans);
+        self.statistics.coupling_ops += batch;
+        self.statistics.latents_flowed += batch;
+        return logdet;
+    }
+
+    pub fn couplingInverseRows(self: *Self, params: core_tensor.RSFCouplingParams, rows: []f32, batch: usize, scale: []f32, trans: []f32) !f64 {
+        const logdet = try core_tensor.couplingInverseRows(params, rows, batch, scale, trans);
+        self.statistics.coupling_ops += batch;
+        self.statistics.latents_flowed += batch;
+        return logdet;
+    }
+
+    pub fn diffuseRows(self: *Self, rows: []f32, count: usize) !void {
+        if (count == 0 or rows.len != count * (rows.len / count)) return error.ZeroDimension;
+        const row_len = rows.len / count;
+        const layout = core_types.rsfDiffusionLayout(row_len) orelse return error.ZeroDimension;
+        if (!core_tensor.diffusionLayoutIsApplicable(row_len, layout)) return error.StateShapeMismatch;
+        try core_tensor.globalDiffuseRowsStack(rows, count, layout);
+        self.statistics.diffusion_rows += count;
+        self.statistics.simd_instructions_used += count * layout.stages;
+    }
+
+    pub fn buildCausalMaskFromSequence(self: *Self, allocator: Allocator, seq_len: usize) !core_types.RSFSequenceMask {
+        const mask = try causalMaskFromSequence(allocator, seq_len);
+        self.statistics.causal_masks_built += 1;
+        return mask;
+    }
+
+    pub fn buildRelationalCausalMask(self: *Self, allocator: Allocator, graph: *SelfSimilarRelationalGraph, node_order: []const []const u8) !core_types.RSFSequenceMask {
+        const mask = try relationalCausalMask(allocator, graph, node_order);
+        self.statistics.causal_masks_built += 1;
+        return mask;
+    }
+
     pub fn booleanPropagateBitmask(self: *Self, matrix: *const BitmaskMatrix, state: []const u64, out_state: []u64) !void {
         try matrix.booleanPropagate(state, out_state);
         self.statistics.bitmask_operations += 1;
@@ -2465,4 +2545,497 @@ test "VPU adjacency bitmask build and boolean propagation statistics" {
     const stats = vpu_unit.getStatistics();
     try std.testing.expect(stats.bitmask_operations >= 3);
     try std.testing.expect(stats.bitmask_popcount_lookups > 0);
+}
+
+pub fn CouplingLanes(comptime N: usize) type {
+    return struct {
+        even: @Vector(N, f32),
+        odd: @Vector(N, f32),
+    };
+}
+
+pub const F32Coupling8 = CouplingLanes(8);
+pub const F32Coupling16 = CouplingLanes(16);
+
+pub fn couplingLaneWidth() usize {
+    if (comptime builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f)) return 16;
+    return 8;
+}
+
+pub fn CouplingParamLanes(comptime N: usize) type {
+    return struct {
+        w_s: @Vector(N, f32),
+        b_s: @Vector(N, f32),
+        w_t: @Vector(N, f32),
+        b_t: @Vector(N, f32),
+        clip_min: f32,
+        clip_max: f32,
+    };
+}
+
+pub fn couplingParamLanes(comptime N: usize, params: core_tensor.RSFCouplingParams, offset: usize) CouplingParamLanes(N) {
+    var ws: [N]f32 = undefined;
+    var bs: [N]f32 = undefined;
+    var wt: [N]f32 = undefined;
+    var bt: [N]f32 = undefined;
+    for (0..N) |k| {
+        const d = offset + k;
+        ws[k] = params.scaleWeight(d);
+        bs[k] = params.scaleBias(d);
+        wt[k] = params.translationWeight(d);
+        bt[k] = params.translationBias(d);
+    }
+    return .{
+        .w_s = @as(@Vector(N, f32), ws),
+        .b_s = @as(@Vector(N, f32), bs),
+        .w_t = @as(@Vector(N, f32), wt),
+        .b_t = @as(@Vector(N, f32), bt),
+        .clip_min = params.clip_min,
+        .clip_max = params.clip_max,
+    };
+}
+
+pub fn couplingForwardLanes(comptime N: usize, lanes: *CouplingLanes(N), params: CouplingParamLanes(N)) @Vector(N, f32) {
+    const lo: @Vector(N, f32) = @splat(params.clip_min);
+    const hi: @Vector(N, f32) = @splat(params.clip_max);
+    const raw = params.w_s * lanes.odd + params.b_s;
+    const clipped = @min(@max(raw, lo), hi);
+    lanes.even = lanes.even * @exp(clipped);
+    lanes.odd = lanes.odd + params.w_t * lanes.even + params.b_t;
+    return clipped;
+}
+
+pub fn couplingInverseLanes(comptime N: usize, lanes: *CouplingLanes(N), params: CouplingParamLanes(N)) @Vector(N, f32) {
+    const lo: @Vector(N, f32) = @splat(params.clip_min);
+    const hi: @Vector(N, f32) = @splat(params.clip_max);
+    lanes.odd = lanes.odd - (params.w_t * lanes.even + params.b_t);
+    const raw = params.w_s * lanes.odd + params.b_s;
+    const clipped = @min(@max(raw, lo), hi);
+    lanes.even = lanes.even / @exp(clipped);
+    return clipped;
+}
+
+pub fn CouplingAdjointLanes(comptime N: usize) type {
+    return struct {
+        dx_even: @Vector(N, f32),
+        dx_odd: @Vector(N, f32),
+        ds_weight: @Vector(N, f32),
+        ds_bias: @Vector(N, f32),
+        dt_weight: @Vector(N, f32),
+        dt_bias: @Vector(N, f32),
+        clipped: @Vector(N, f32),
+    };
+}
+
+pub fn couplingBackwardLanes(
+    comptime N: usize,
+    odd_in: @Vector(N, f32),
+    scaled_even: @Vector(N, f32),
+    g_even: @Vector(N, f32),
+    g_odd: @Vector(N, f32),
+    volume_term: f32,
+    params: CouplingParamLanes(N),
+) CouplingAdjointLanes(N) {
+    const lo: @Vector(N, f32) = @splat(params.clip_min);
+    const hi: @Vector(N, f32) = @splat(params.clip_max);
+    const zero: @Vector(N, f32) = @splat(0.0);
+    const volume: @Vector(N, f32) = @splat(volume_term);
+    const raw = params.w_s * odd_in + params.b_s;
+    const clipped = @min(@max(raw, lo), hi);
+    const true_lanes: @Vector(N, bool) = @splat(true);
+    const saturated = @select(bool, raw < lo, true_lanes, raw > hi);
+    const exp_scale = @exp(clipped);
+    const mixed = g_even + params.w_t * g_odd;
+    const ds = @select(f32, saturated, zero, scaled_even * mixed + volume);
+    return .{
+        .dx_even = exp_scale * mixed,
+        .dx_odd = g_odd + params.w_s * ds,
+        .ds_weight = ds * odd_in,
+        .ds_bias = ds,
+        .dt_weight = g_odd * scaled_even,
+        .dt_bias = g_odd,
+        .clipped = clipped,
+    };
+}
+
+pub fn couplingHalfToVector(comptime N: usize, half: []const f32) @Vector(N, f32) {
+    var out: [N]f32 = undefined;
+    if (half.len < N) {
+        @memset(out[0..], 0.0);
+        return @as(@Vector(N, f32), out);
+    }
+    @memcpy(out[0..], half[0..N]);
+    return @as(@Vector(N, f32), out);
+}
+
+pub fn couplingLanesToRow(comptime N: usize, lanes: CouplingLanes(N), row: []f32) void {
+    if (row.len < 2 * N) return;
+    @memcpy(row[0..N], @as([N]f32, lanes.even)[0..]);
+    @memcpy(row[N .. 2 * N], @as([N]f32, lanes.odd)[0..]);
+}
+
+pub fn couplingRowToLanes(comptime N: usize, row: []const f32) CouplingLanes(N) {
+    if (row.len < 2 * N) return .{ .even = @splat(0.0), .odd = @splat(0.0) };
+    var even: [N]f32 = undefined;
+    var odd: [N]f32 = undefined;
+    @memcpy(even[0..], row[0..N]);
+    @memcpy(odd[0..], row[N .. 2 * N]);
+    return .{ .even = @as(@Vector(N, f32), even), .odd = @as(@Vector(N, f32), odd) };
+}
+
+pub fn walshHadamardInPlace(block: []f32) !void {
+    try core_tensor.hadamardBlockInPlace(block);
+}
+
+pub fn diffuseLanesRow(row: []f32) !void {
+    const layout = core_types.rsfDiffusionLayout(row.len) orelse return error.ZeroDimension;
+    if (!core_tensor.diffusionLayoutIsApplicable(row.len, layout)) return error.StateShapeMismatch;
+    try core_tensor.globalDiffuseRowStack(row, layout);
+}
+
+pub fn diffuseLanesBlock(allocator: Allocator, rows: []f32, count: usize) !void {
+    if (count == 0 or rows.len == 0) return error.ZeroDimension;
+    const row_len = rows.len / count;
+    if (row_len * count != rows.len) return error.StateShapeMismatch;
+    const layout = core_types.rsfDiffusionLayout(row_len) orelse return error.ZeroDimension;
+    if (!core_tensor.diffusionLayoutIsApplicable(row_len, layout)) return error.StateShapeMismatch;
+    try core_tensor.globalDiffuseRowsStack(rows, count, layout);
+    _ = allocator;
+}
+
+pub fn causalMaskFromSequence(allocator: Allocator, seq_len: usize) !core_types.RSFSequenceMask {
+    return core_types.RSFSequenceMask.initCausal(allocator, seq_len);
+}
+
+pub fn relationalCausalMask(allocator: Allocator, graph: *SelfSimilarRelationalGraph, node_order: []const []const u8) !core_types.RSFSequenceMask {
+    const seq_len = node_order.len;
+    var mask = try core_types.RSFSequenceMask.initZero(allocator, seq_len);
+    errdefer mask.deinit();
+    if (seq_len == 0) return mask;
+    const adjacency = try graph.exportAdjacencyBitmask(node_order, allocator);
+    defer allocator.free(adjacency);
+    const words = nsir_core.bitmaskWordCount(seq_len);
+    var i: usize = 0;
+    while (i < seq_len) : (i += 1) {
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            const forward = (adjacency[i * words + (j >> 6)] >> @as(u6, @intCast(j & 63))) & 1;
+            const backward = (adjacency[j * words + (i >> 6)] >> @as(u6, @intCast(i & 63))) & 1;
+            if (forward == 1 or backward == 1) try mask.set(i, j);
+        }
+    }
+    return mask;
+}
+
+pub fn causalMaskDensity(mask: *const core_types.RSFSequenceMask) f32 {
+    return mask.density();
+}
+
+pub fn causalMaskIsRelational(mask: *const core_types.RSFSequenceMask) bool {
+    for (0..mask.seq_len) |i| {
+        for (i..mask.seq_len) |j| {
+            if (mask.get(i, j)) return false;
+        }
+    }
+    return true;
+}
+
+test "coupling lane width matches the detected vector length" {
+    const width = couplingLaneWidth();
+    try std.testing.expect(width == 8 or width == 16);
+    try std.testing.expectEqual(@as(usize, @sizeOf(F32Coupling8) / @sizeOf(f32)), 16);
+    try std.testing.expectEqual(@as(usize, @sizeOf(F32Coupling16) / @sizeOf(f32)), 32);
+}
+
+test "coupling lane ops are equivalent to the tensor kernels" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 8;
+    var prng = std.Random.DefaultPrng.init(0x5DEECE66D);
+    const random = prng.random();
+    const s_weight = try allocator.alloc(f32, dim * core_tensor.coupling_width);
+    defer allocator.free(s_weight);
+    const t_weight = try allocator.alloc(f32, dim * core_tensor.coupling_width);
+    defer allocator.free(t_weight);
+    const row = try allocator.alloc(f32, 2 * dim);
+    defer allocator.free(row);
+    const lane_row = try allocator.alloc(f32, 2 * dim);
+    defer allocator.free(lane_row);
+    const input_row = try allocator.alloc(f32, 2 * dim);
+    defer allocator.free(input_row);
+    const scale = try allocator.alloc(f32, dim);
+    defer allocator.free(scale);
+    const trans = try allocator.alloc(f32, dim);
+    defer allocator.free(trans);
+    const g_outputs = try allocator.alloc(f32, 2 * dim);
+    defer allocator.free(g_outputs);
+    const ds_weight = try allocator.alloc(f32, dim * core_tensor.coupling_width);
+    defer allocator.free(ds_weight);
+    const dt_weight = try allocator.alloc(f32, dim * core_tensor.coupling_width);
+    defer allocator.free(dt_weight);
+    const d_inputs = try allocator.alloc(f32, 2 * dim);
+    defer allocator.free(d_inputs);
+
+    for (0..48) |_| {
+        for (s_weight) |*v| v.* = random.float(f32) * 1.6 - 0.8;
+        for (t_weight) |*v| v.* = random.float(f32) * 1.6 - 0.8;
+        for (row) |*v| v.* = random.float(f32) * 4.0 - 2.0;
+        @memcpy(lane_row, row);
+        @memcpy(input_row, row);
+        const clip_min: f32 = -1.5 + random.float(f32) * 0.5;
+        const clip_max: f32 = clip_min + 1.0 + random.float(f32) * 2.0;
+        const params = try core_tensor.RSFCouplingParams.init(s_weight, t_weight, dim, clip_min, clip_max);
+        const lanes_params = couplingParamLanes(8, params, 0);
+
+        const logdet_rows = try core_tensor.couplingForwardRows(params, row, 1, scale, trans);
+        var lanes = couplingRowToLanes(8, lane_row);
+        const clipped = couplingForwardLanes(8, &lanes, lanes_params);
+        couplingLanesToRow(8, lanes, lane_row);
+        var logdet_lanes: f64 = 0.0;
+        for (@as([8]f32, clipped)) |c| logdet_lanes += @as(f64, @floatCast(c));
+        try std.testing.expectApproxEqAbs(logdet_rows, logdet_lanes, 1e-5);
+        for (0..2 * dim) |k| try std.testing.expectApproxEqRel(row[k], lane_row[k], 1e-5);
+
+        var g_even: [8]f32 = undefined;
+        var g_odd: [8]f32 = undefined;
+        for (0..dim) |k| {
+            g_even[k] = random.float(f32) * 2.0 - 1.0;
+            g_odd[k] = random.float(f32) * 2.0 - 1.0;
+        }
+        const volume = random.float(f32) * 0.2 - 0.1;
+        @memcpy(g_outputs[0..dim], g_even[0..]);
+        @memcpy(g_outputs[dim .. 2 * dim], g_odd[0..]);
+        @memset(ds_weight, 0.0);
+        @memset(dt_weight, 0.0);
+        const logdet_back = try core_tensor.couplingBackwardRows(params, input_row, row, g_outputs, 1, volume, ds_weight, dt_weight, d_inputs, scale);
+        const adj = couplingBackwardLanes(8, couplingHalfToVector(8, input_row[dim..]), couplingHalfToVector(8, row[0..dim]), @as(@Vector(8, f32), g_even), @as(@Vector(8, f32), g_odd), volume, lanes_params);
+        var logdet_adj: f64 = 0.0;
+        for (@as([8]f32, adj.clipped)) |c| logdet_adj += @as(f64, @floatCast(c));
+        try std.testing.expectApproxEqAbs(logdet_back, logdet_adj, 1e-5);
+        for (0..dim) |k| {
+            try std.testing.expectApproxEqRel(d_inputs[k], adj.dx_even[k], 1e-5);
+            try std.testing.expectApproxEqRel(d_inputs[dim + k], adj.dx_odd[k], 1e-5);
+            try std.testing.expectApproxEqRel(ds_weight[k * core_tensor.coupling_width + core_tensor.coupling_weight_column], adj.ds_weight[k], 1e-5);
+            try std.testing.expectApproxEqRel(ds_weight[k * core_tensor.coupling_width + core_tensor.coupling_bias_column], adj.ds_bias[k], 1e-5);
+            try std.testing.expectApproxEqRel(dt_weight[k * core_tensor.coupling_width + core_tensor.coupling_weight_column], adj.dt_weight[k], 1e-5);
+            try std.testing.expectApproxEqRel(dt_weight[k * core_tensor.coupling_width + core_tensor.coupling_bias_column], adj.dt_bias[k], 1e-5);
+        }
+
+        const logdet_inv_rows = try core_tensor.couplingInverseRows(params, row, 1, scale, trans);
+        var inv_lanes = couplingRowToLanes(8, lane_row);
+        const clipped_inv = couplingInverseLanes(8, &inv_lanes, lanes_params);
+        couplingLanesToRow(8, inv_lanes, lane_row);
+        var logdet_inv_lanes: f64 = 0.0;
+        for (@as([8]f32, clipped_inv)) |c| logdet_inv_lanes += @as(f64, @floatCast(c));
+        try std.testing.expectApproxEqAbs(logdet_inv_rows, logdet_inv_lanes, 1e-5);
+        for (0..2 * dim) |k| {
+            try std.testing.expectApproxEqAbs(input_row[k], row[k], 1e-4);
+            try std.testing.expectApproxEqAbs(input_row[k], lane_row[k], 1e-4);
+        }
+    }
+}
+
+test "lane diffusion equals the single-row diffusion kernel and the Hadamard block is an involution" {
+    const allocator = std.testing.allocator;
+    const row_len: usize = 96;
+    const count: usize = 3;
+    var prng = std.Random.DefaultPrng.init(0x2545F4914F6CDD1D);
+    const random = prng.random();
+    const rows = try allocator.alloc(f32, row_len * count);
+    defer allocator.free(rows);
+    const reference = try allocator.alloc(f32, row_len * count);
+    defer allocator.free(reference);
+    const original = try allocator.alloc(f32, row_len * count);
+    defer allocator.free(original);
+    for (rows) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    @memcpy(reference, rows);
+    @memcpy(original, rows);
+    const layout = core_types.rsfDiffusionLayout(row_len).?;
+    for (0..count) |i| core_tensor.globalDiffuseRowUnchecked(reference[i * row_len ..][0..row_len], layout);
+    try diffuseLanesBlock(allocator, rows, count);
+    for (0..row_len * count) |k| try std.testing.expectApproxEqRel(reference[k], rows[k], 1e-6);
+    for (0..count) |i| try diffuseLanesRow(rows[i * row_len ..][0..row_len]);
+    var energy_original: f64 = 0.0;
+    var energy_roundtrip: f64 = 0.0;
+    for (0..row_len * count) |k| {
+        try std.testing.expectApproxEqAbs(original[k], rows[k], 2e-5);
+        energy_original += @as(f64, original[k]) * @as(f64, original[k]);
+        energy_roundtrip += @as(f64, rows[k]) * @as(f64, rows[k]);
+    }
+    try std.testing.expectApproxEqRel(energy_original, energy_roundtrip, 1e-5);
+
+    const block_len: usize = 32;
+    const hadamard_original = try allocator.alloc(f32, block_len);
+    defer allocator.free(hadamard_original);
+    const working = try allocator.alloc(f32, block_len);
+    defer allocator.free(working);
+    for (hadamard_original) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    @memcpy(working, hadamard_original);
+    try walshHadamardInPlace(working);
+    for (0..block_len) |k| try std.testing.expect(std.math.isFinite(working[k]));
+    try walshHadamardInPlace(working);
+    for (0..block_len) |k| try std.testing.expectApproxEqRel(hadamard_original[k], working[k], 1e-5);
+}
+
+test "sequence and relational causal masks are strictly lower triangular and relation-gated" {
+    const allocator = std.testing.allocator;
+    var mask = try causalMaskFromSequence(allocator, 7);
+    defer mask.deinit();
+    for (0..7) |i| {
+        for (0..7) |j| {
+            try std.testing.expectEqual(j < i, mask.get(i, j));
+        }
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), causalMaskDensity(&mask), 1e-6);
+    try std.testing.expectEqual(@as(usize, 21), mask.nnz);
+    try std.testing.expect(causalMaskIsRelational(&mask));
+
+    var graph = try SelfSimilarRelationalGraph.init(allocator);
+    defer graph.deinit();
+    const ids = [_][]const u8{ "A", "B", "C", "D" };
+    for (ids) |id| {
+        const node = try Node.init(allocator, id, id, nsir_core.Qubit.initBasis0(), 0.0);
+        try graph.addNode(node);
+    }
+    const edge_ab = try Edge.init(allocator, "A", "B", .entangled, 1.0, Complex(f64).init(1.0, 0.0), 0.0);
+    try graph.addEdge("A", "B", edge_ab);
+    const edge_ca = try Edge.init(allocator, "C", "A", .entangled, 1.0, Complex(f64).init(1.0, 0.0), 0.0);
+    try graph.addEdge("C", "A", edge_ca);
+
+    var relational = try relationalCausalMask(allocator, &graph, &ids);
+    defer relational.deinit();
+    try std.testing.expect(relational.get(1, 0));
+    try std.testing.expect(relational.get(2, 0));
+    try std.testing.expect(!relational.get(2, 1));
+    try std.testing.expect(!relational.get(3, 0));
+    try std.testing.expect(!relational.get(3, 1));
+    try std.testing.expect(!relational.get(3, 2));
+    for (0..4) |i| try std.testing.expect(!relational.get(i, i));
+    try std.testing.expect(causalMaskIsRelational(&relational));
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 6.0), causalMaskDensity(&relational), 1e-6);
+    try std.testing.expect(!relational.full_causal);
+    try std.testing.expectEqual(@as(usize, 1), relational.rowNnz(1));
+    try std.testing.expectEqual(@as(usize, 1), relational.rowNnz(2));
+    try std.testing.expectEqual(@as(usize, 0), relational.rowNnz(0));
+    try std.testing.expectEqual(@as(usize, 0), relational.rowNnz(3));
+
+    var empty_order = try relationalCausalMask(allocator, &graph, &[_][]const u8{});
+    defer empty_order.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_order.seq_len);
+
+    var single = try relationalCausalMask(allocator, &graph, ids[0..1]);
+    defer single.deinit();
+    try std.testing.expectEqual(@as(usize, 1), single.seq_len);
+    try std.testing.expect(!single.get(0, 0));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), causalMaskDensity(&single), 1e-9);
+}
+
+test "bitmask signal propagation delegates to the core kernels and the plane path respects the bound" {
+    const allocator = std.testing.allocator;
+    const rows: usize = 64;
+    const cols: usize = 64;
+    var matrix = try BitmaskMatrix.init(allocator, rows, cols);
+    defer matrix.deinit();
+    var prng = std.Random.DefaultPrng.init(0x853C49E6748FEA9B);
+    const random = prng.random();
+    for (0..rows) |i| {
+        for (0..cols) |j| {
+            if (random.float(f32) < 0.35) matrix.set(i, j);
+        }
+    }
+    const signal = try allocator.alloc(f32, cols);
+    defer allocator.free(signal);
+    const out_exact = try allocator.alloc(f32, rows);
+    defer allocator.free(out_exact);
+    const out_planes = try allocator.alloc(f32, rows);
+    defer allocator.free(out_planes);
+    const core_out = try allocator.alloc(f32, rows);
+    defer allocator.free(core_out);
+    for (signal, 0..) |*v, j| v.* = @sin(@as(f32, @floatFromInt(j))) * 1.7;
+    var max_abs: f32 = 0.0;
+    for (signal) |v| max_abs = @max(max_abs, @abs(v));
+
+    const decay: f32 = 0.37;
+    try matrix.signalPropagate(signal, decay, out_exact);
+    nsir_core.bitmaskSignalPropagateExactStrided(matrix.words, matrix.words_per_row, rows, cols, signal, decay, core_out);
+    for (0..rows) |i| try std.testing.expectApproxEqAbs(core_out[i], out_exact[i], 1e-6);
+    try matrix.signalPropagateBitPlane(signal, decay, out_planes);
+    const bound = matrix.signalPropagateBound(signal, decay);
+    var worst: f32 = 0.0;
+    for (0..rows) |i| worst = @max(worst, @abs(out_planes[i] - out_exact[i]));
+    try std.testing.expect(worst <= bound);
+
+    var vpu = try VPU.init(allocator);
+    defer vpu.deinit();
+    @memset(out_planes, 0.0);
+    try vpu.propagateBitmaskSignal(&matrix, signal, decay, out_planes);
+    for (0..rows) |i| try std.testing.expectApproxEqAbs(out_exact[i], out_planes[i], 1e-6);
+    try std.testing.expectEqual(@as(usize, 1), vpu.statistics.bitmask_operations);
+    @memset(out_planes, 0.0);
+    try vpu.propagateBitmaskSignalBitPlane(&matrix, signal, decay, out_planes);
+    for (0..rows) |i| try std.testing.expectApproxEqAbs(out_exact[i], out_planes[i], bound);
+    try std.testing.expectEqual(@as(usize, 2), vpu.statistics.bitmask_operations);
+
+    @memset(signal, 0.0);
+    @memset(out_planes, 999.0);
+    try matrix.signalPropagateBitPlane(signal, 1.0, out_planes);
+    for (0..rows) |i| try std.testing.expectEqual(@as(f32, 0.0), out_planes[i]);
+    try std.testing.expectError(BitmaskMatrixError.StateShapeMismatch, matrix.signalPropagate(signal[0..4], decay, out_exact));
+    try std.testing.expectError(BitmaskMatrixError.StateShapeMismatch, matrix.signalPropagateBitPlane(signal, decay, out_exact[0..4]));
+}
+
+test "vpu statistics count coupling, diffusion and causal mask work" {
+    const allocator = std.testing.allocator;
+    var vpu = try VPU.init(allocator);
+    defer vpu.deinit();
+    const dim: usize = 8;
+    const s_weight = try allocator.alloc(f32, dim * core_tensor.coupling_width);
+    defer allocator.free(s_weight);
+    const t_weight = try allocator.alloc(f32, dim * core_tensor.coupling_width);
+    defer allocator.free(t_weight);
+    for (s_weight, 0..) |*v, k| v.* = if (k % 2 == 0) 0.25 else 0.05;
+    for (t_weight, 0..) |*v, k| v.* = if (k % 2 == 0) -0.15 else 0.02;
+    const params = try core_tensor.RSFCouplingParams.default(s_weight, t_weight, dim);
+    const lane_params = couplingParamLanes(8, params, 0);
+    var lanes = F32Coupling8{ .even = @splat(1.0), .odd = @splat(0.5) };
+    _ = vpu.couplingForwardLanes8(&lanes, lane_params);
+    _ = vpu.couplingInverseLanes8(&lanes, lane_params);
+    try std.testing.expectEqual(@as(usize, 2), vpu.statistics.coupling_ops);
+    try std.testing.expect(vpu.statistics.simd_instructions_used >= 2);
+
+    const row_len: usize = 96;
+    const count: usize = 2;
+    const rows = try allocator.alloc(f32, row_len * count);
+    defer allocator.free(rows);
+    for (rows, 0..) |*v, k| v.* = @as(f32, @floatFromInt(k % 7)) * 0.1;
+    try vpu.diffuseRows(rows, count);
+    try std.testing.expectEqual(@as(usize, 2), vpu.statistics.diffusion_rows);
+    try std.testing.expect(vpu.statistics.simd_instructions_used > 2);
+    try std.testing.expectError(error.ZeroDimension, vpu.diffuseRows(rows, 0));
+
+    const scale = try allocator.alloc(f32, dim);
+    defer allocator.free(scale);
+    const trans = try allocator.alloc(f32, dim);
+    defer allocator.free(trans);
+    const batch_rows = try allocator.alloc(f32, 2 * dim * 3);
+    defer allocator.free(batch_rows);
+    for (batch_rows, 0..) |*v, k| v.* = @as(f32, @floatFromInt(k % 11)) * 0.05;
+    const logdet = try vpu.couplingForwardRows(params, batch_rows, 3, scale, trans);
+    try std.testing.expect(std.math.isFinite(logdet));
+    try std.testing.expectEqual(@as(usize, 5), vpu.statistics.coupling_ops);
+    try std.testing.expectEqual(@as(usize, 3), vpu.statistics.latents_flowed);
+    const inverse_logdet = try vpu.couplingInverseRows(params, batch_rows, 3, scale, trans);
+    try std.testing.expectEqual(@as(usize, 8), vpu.statistics.coupling_ops);
+    try std.testing.expectEqual(@as(usize, 6), vpu.statistics.latents_flowed);
+    try std.testing.expectApproxEqAbs(logdet, inverse_logdet, 1e-3);
+
+    var mask = try vpu.buildCausalMaskFromSequence(allocator, 5);
+    defer mask.deinit();
+    try std.testing.expectEqual(@as(usize, 1), vpu.statistics.causal_masks_built);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), causalMaskDensity(&mask), 1e-6);
+    try std.testing.expectEqual(@as(usize, 10), mask.nnz);
+    vpu.statistics.reset();
+    try std.testing.expectEqual(@as(usize, 0), vpu.statistics.coupling_ops);
+    try std.testing.expectEqual(@as(usize, 0), vpu.statistics.latents_flowed);
+    try std.testing.expectEqual(@as(usize, 0), vpu.statistics.diffusion_rows);
+    try std.testing.expectEqual(@as(usize, 0), vpu.statistics.causal_masks_built);
 }
