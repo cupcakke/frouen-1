@@ -1,764 +1,157 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const core_types = @import("../core/types.zig");
-const core_tensor = @import("../core/tensor.zig");
-const core_memory = @import("../core/memory.zig");
+const types = @import("../core/types.zig");
+const tensor_mod = @import("../core/tensor.zig");
+const Tensor = tensor_mod.Tensor;
 const core_io = @import("../core/io.zig");
-const PRNG = core_types.PRNG;
-
-var global_prng_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
-fn nextSeed() u64 {
-    var prng = PRNG.init(global_prng_counter.fetchAdd(1, .monotonic));
-    return prng.uint64();
-}
-
-fn shapesEqual(a: Shape, b: Shape) bool {
-    if (a.dims.len != b.dims.len) return false;
-    var i: usize = 0;
-    while (i < a.dims.len) : (i += 1) {
-        if (a.dims[i] != b.dims[i]) return false;
-    }
-    return true;
-}
-
-fn quantizeValue(value: f32, precision: Precision) f32 {
-    if (!std.math.isFinite(value)) return value;
-    return switch (precision) {
-        .fp16 => blk: {
-            const clamped = std.math.clamp(value, -65504.0, 65504.0);
-            const rounded: f16 = @floatCast(clamped);
-            break :blk @floatCast(rounded);
-        },
-        .fp32, .fp64 => value,
-    };
-}
-
-fn tensorFlagsToBits(flags: TensorFlags) u8 {
-    var bits: u8 = 0;
-    if (flags.in_tensor_memory) bits |= 0b001;
-    if (flags.requires_grad) bits |= 0b010;
-    return bits;
-}
-
-fn tensorFlagsFromBits(bits: u8) TensorFlags {
-    return TensorFlags{
-        .in_tensor_memory = (bits & 0b001) != 0,
-        .requires_grad = (bits & 0b010) != 0,
-    };
-}
-
-fn erfApprox(x: f32) f32 {
-    const a1: f32 = 0.254829592;
-    const a2: f32 = -0.284496736;
-    const a3: f32 = 1.421413741;
-    const a4: f32 = -1.453152027;
-    const a5: f32 = 1.061405429;
-    const p: f32 = 0.3275911;
-    const sign: f32 = if (x < 0) -1.0 else 1.0;
-    const abs_x = if (x < 0) -x else x;
-    const t = 1.0 / (1.0 + p * abs_x);
-    const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * @exp(-abs_x * abs_x);
-    return sign * y;
-}
-
-pub const Precision = enum {
-    fp16,
-    fp32,
-    fp64,
-};
-
-const Shape = struct {
-    dims: []const usize,
-
-    pub fn totalSize(self: Shape) usize {
-        var size: usize = 1;
-        for (self.dims) |dim| {
-            if (dim != 0 and size > std.math.maxInt(usize) / dim) @panic("Shape.totalSize overflow");
-            size *= dim;
-        }
-        return size;
-    }
-};
-
-pub const TensorFlags = struct {
-    in_tensor_memory: bool = false,
-    requires_grad: bool = true,
-};
-
-pub const Tensor = struct {
-    data: []f32,
-    shape: Shape,
-    dtype: Precision = .fp32,
-    flags: TensorFlags = .{},
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator, dims: []const usize) !Tensor {
-        for (dims) |d| {
-            if (d == 0) return error.InvalidShape;
-        }
-        const owned_dims = try allocator.dupe(usize, dims);
-        errdefer allocator.free(owned_dims);
-
-        const shape = Shape{ .dims = owned_dims };
-        const size = shape.totalSize();
-
-        const data = try allocator.alloc(f32, size);
-        errdefer allocator.free(data);
-
-        return Tensor{
-            .data = data,
-            .shape = shape,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn zeros(allocator: Allocator, dims: []const usize) !Tensor {
-        var tensor = try init(allocator, dims);
-        tensor.fill(0.0);
-        return tensor;
-    }
-
-    pub fn ones(allocator: Allocator, dims: []const usize) !Tensor {
-        var tensor = try init(allocator, dims);
-        tensor.fill(1.0);
-        return tensor;
-    }
-
-    pub fn eye(allocator: Allocator, dims: []const usize) !Tensor {
-        if (dims.len != 2 or dims[0] != dims[1]) return error.InvalidShape;
-        var tensor = try init(allocator, dims);
-        tensor.fill(0.0);
-        const n = dims[0];
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            tensor.data[i * n + i] = 1.0;
-        }
-        return tensor;
-    }
-
-    pub fn deinit(self: *Tensor) void {
-        self.allocator.free(self.data);
-        self.allocator.free(self.shape.dims);
-    }
-
-    pub fn fill(self: *Tensor, value: f32) void {
-        for (self.data) |*v| {
-            v.* = value;
-        }
-    }
-
-    pub fn fillRandomNormal(self: *Tensor, mean: f32, std_dev: f32) void {
-        var prng = std.Random.DefaultPrng.init(nextSeed());
-        const random = prng.random();
-
-        var i: usize = 0;
-        while (i + 1 < self.data.len) : (i += 2) {
-            const rand_u = @max(random.float(f32), 1e-7);
-            const rand_v = random.float(f32);
-            const r = @sqrt(-2.0 * @log(rand_u));
-            const theta = 2.0 * std.math.pi * rand_v;
-            self.data[i] = mean + std_dev * r * @cos(theta);
-            self.data[i + 1] = mean + std_dev * r * @sin(theta);
-        }
-        if (i < self.data.len) {
-            const rand_u = @max(random.float(f32), 1e-7);
-            const rand_v = random.float(f32);
-            const z0 = @sqrt(-2.0 * @log(rand_u)) * @cos(2.0 * std.math.pi * rand_v);
-            self.data[i] = mean + std_dev * z0;
-        }
-    }
-
-    pub fn fillRademacher(self: *Tensor) void {
-        var prng = std.Random.DefaultPrng.init(nextSeed());
-        const random = prng.random();
-
-        for (self.data) |*v| {
-            v.* = if (random.float(f32) < 0.5) -1.0 else 1.0;
-        }
-    }
-
-    pub fn clone(self: *const Tensor, allocator: Allocator) !Tensor {
-        var new_tensor = try Tensor.init(allocator, self.shape.dims);
-        @memcpy(new_tensor.data, self.data);
-        new_tensor.dtype = self.dtype;
-        new_tensor.flags = self.flags;
-        new_tensor.flags.in_tensor_memory = false;
-        return new_tensor;
-    }
-
-    pub fn copyFrom(self: *Tensor, other: *const Tensor) !void {
-        if (!shapesEqual(self.shape, other.shape)) return error.ShapeMismatch;
-        @memcpy(self.data, other.data);
-        self.flags.requires_grad = other.flags.requires_grad;
-        self.dtype = other.dtype;
-    }
-
-    pub fn copyFromWithCast(self: *Tensor, other: *const Tensor) !void {
-        if (!shapesEqual(self.shape, other.shape)) return error.ShapeMismatch;
-        var i: usize = 0;
-        while (i < self.data.len) : (i += 1) {
-            self.data[i] = quantizeValue(other.data[i], self.dtype);
-        }
-        self.flags.requires_grad = other.flags.requires_grad;
-    }
-
-    pub fn mulScalar(self: *Tensor, scalar: f32) void {
-        for (self.data) |*v| {
-            v.* *= scalar;
-        }
-    }
-
-    pub fn add(self: *Tensor, other: *const Tensor) !void {
-        if (!shapesEqual(self.shape, other.shape)) return error.ShapeMismatch;
-        var i: usize = 0;
-        while (i < self.data.len) : (i += 1) {
-            self.data[i] += other.data[i];
-        }
-    }
-
-    pub fn sub(self: *Tensor, other: *const Tensor) !void {
-        if (!shapesEqual(self.shape, other.shape)) return error.ShapeMismatch;
-        var i: usize = 0;
-        while (i < self.data.len) : (i += 1) {
-            self.data[i] -= other.data[i];
-        }
-    }
-
-    pub fn normL2(self: *const Tensor) f32 {
-        var sum: f64 = 0.0;
-        for (self.data) |v| {
-            if (std.math.isNan(v)) return std.math.nan(f32);
-            if (!std.math.isFinite(v)) return std.math.inf(f32);
-            sum += @as(f64, v) * @as(f64, v);
-        }
-        return @floatCast(@sqrt(sum));
-    }
-
-    pub fn spectralNorm(self: *const Tensor, allocator: Allocator, max_iter: usize, eps: f32) !f32 {
-        if (self.shape.dims.len != 2) return error.InvalidShape;
-
-        const m = self.shape.dims[0];
-        const n = self.shape.dims[1];
-
-        var v = try Tensor.init(allocator, &[_]usize{n});
-        defer v.deinit();
-        v.fillRandomNormal(0.0, 1.0);
-
-        var u = try Tensor.init(allocator, &[_]usize{m});
-        defer u.deinit();
-        u.fill(0.0);
-
-        const effective_iter = if (max_iter == 0) @as(usize, 1) else max_iter;
-        var iter: usize = 0;
-        while (iter < effective_iter) : (iter += 1) {
-            u.fill(0.0);
-            var i: usize = 0;
-            while (i < m) : (i += 1) {
-                var j: usize = 0;
-                while (j < n) : (j += 1) {
-                    u.data[i] += self.data[i * n + j] * v.data[j];
-                }
-            }
-
-            const u_norm = u.normL2();
-            if (std.math.isFinite(u_norm) and u_norm > eps) {
-                u.mulScalar(1.0 / u_norm);
-            }
-
-            v.fill(0.0);
-            i = 0;
-            while (i < m) : (i += 1) {
-                var j: usize = 0;
-                while (j < n) : (j += 1) {
-                    v.data[j] += self.data[i * n + j] * u.data[i];
-                }
-            }
-
-            const v_norm = v.normL2();
-            if (std.math.isFinite(v_norm) and v_norm > eps) {
-                v.mulScalar(1.0 / v_norm);
-            }
-        }
-
-        var sigma: f64 = 0.0;
-        var i: usize = 0;
-        while (i < m) : (i += 1) {
-            var j: usize = 0;
-            while (j < n) : (j += 1) {
-                sigma += @as(f64, u.data[i]) * @as(f64, self.data[i * n + j]) * @as(f64, v.data[j]);
-            }
-        }
-
-        const sigma_f32: f32 = @floatCast(sigma);
-        return if (sigma_f32 >= 0) sigma_f32 else -sigma_f32;
-    }
-
-    pub fn matmul(self: *Tensor, A: *const Tensor, B: *const Tensor) !void {
-        if (A.shape.dims.len != 2 or B.shape.dims.len != 2 or self.shape.dims.len != 2) return error.InvalidShape;
-
-        const m = A.shape.dims[0];
-        const k = A.shape.dims[1];
-        const n = B.shape.dims[1];
-
-        if (B.shape.dims[0] != k) return error.ShapeMismatch;
-        if (self.shape.dims[0] != m or self.shape.dims[1] != n) return error.ShapeMismatch;
-        if (self.data.len != m * n) return error.ShapeMismatch;
-
-        if (self.data.ptr == A.data.ptr or self.data.ptr == B.data.ptr) {
-            var temp = try Tensor.init(self.allocator, &[_]usize{ m, n });
-            defer temp.deinit();
-            try temp.matmul(A, B);
-            try self.copyFrom(&temp);
-            return;
-        }
-
-        self.fill(0.0);
-
-        const b_transposed = try self.allocator.alignedAlloc(f32, @as(?u29, 32), n * k);
-        defer self.allocator.free(b_transposed);
-        var pi: usize = 0;
-        while (pi < k) : (pi += 1) {
-            var ji: usize = 0;
-            while (ji < n) : (ji += 1) {
-                b_transposed[ji * k + pi] = B.data[pi * n + ji];
-            }
-        }
-
-        const SfdMatmulVecWidth = 8;
-        const SfdMatmulVec8 = @Vector(SfdMatmulVecWidth, f32);
-        const SfdMatmulBlock: usize = 32;
-
-        const Worker = struct {
-            fn run(a_ptr: []const f32, bt_ptr: []const f32, out_ptr: []f32, start: usize, end: usize, k_dim: usize, n_dim: usize) void {
-                var ii: usize = start;
-                while (ii < end) : (ii += SfdMatmulBlock) {
-                    const i_end = @min(ii + SfdMatmulBlock, end);
-                    var jj: usize = 0;
-                    while (jj < n_dim) : (jj += SfdMatmulBlock) {
-                        const j_end = @min(jj + SfdMatmulBlock, n_dim);
-                        var i: usize = ii;
-                        while (i < i_end) : (i += 1) {
-                            var j: usize = jj;
-                            while (j < j_end) : (j += 1) {
-                                var accumulator: SfdMatmulVec8 = @splat(0.0);
-                                var kk: usize = 0;
-                                const limit = k_dim - k_dim % SfdMatmulVecWidth;
-                                while (kk < limit) : (kk += SfdMatmulVecWidth) {
-                                    const av: SfdMatmulVec8 = a_ptr[i * k_dim + kk ..][0..SfdMatmulVecWidth].*;
-                                    const bv: SfdMatmulVec8 = bt_ptr[j * k_dim + kk ..][0..SfdMatmulVecWidth].*;
-                                    accumulator += av * bv;
-                                }
-                                var sum_value: f32 = @reduce(.Add, accumulator);
-                                while (kk < k_dim) : (kk += 1) {
-                                    sum_value += a_ptr[i * k_dim + kk] * bt_ptr[j * k_dim + kk];
-                                }
-                                out_ptr[i * n_dim + j] = sum_value;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        const thread_count = @min(core_tensor.effectiveCpuCount(), @min(m, 8));
-        if (thread_count <= 1) {
-            Worker.run(A.data, b_transposed, self.data, 0, m, k, n);
-        } else {
-            var threads: [8]std.Thread = undefined;
-            var active: usize = 0;
-            const chunk = (m + thread_count - 1) / thread_count;
-            var start: usize = 0;
-            while (start < m and active < thread_count) : (start += chunk) {
-                const end = @min(start + chunk, m);
-                threads[active] = std.Thread.spawn(.{}, Worker.run, .{ A.data, b_transposed, self.data, start, end, k, n }) catch |err| {
-                    for (threads[0..active]) |thread| thread.join();
-                    return err;
-                };
-                active += 1;
-            }
-            for (threads[0..active]) |thread| thread.join();
-        }
-    }
-
-    pub fn cholesky(self: *const Tensor, allocator: Allocator) !Tensor {
-        if (self.shape.dims.len != 2 or self.shape.dims[0] != self.shape.dims[1]) return error.InvalidShape;
-        const n = self.shape.dims[0];
-        var result = try Tensor.zeros(allocator, &.{ n, n });
-        errdefer result.deinit();
-
-        var diagonal_scale: f64 = 1.0;
-        var diagonal_index: usize = 0;
-        while (diagonal_index < n) : (diagonal_index += 1) {
-            const diagonal_value = self.data[diagonal_index * n + diagonal_index];
-            if (!std.math.isFinite(diagonal_value)) return error.MatrixNotPositiveDefinite;
-            diagonal_scale = @max(diagonal_scale, @abs(@as(f64, diagonal_value)));
-        }
-        const positivity_threshold = diagonal_scale * 1e-12;
-        const symmetry_threshold = diagonal_scale * 1e-5;
-
-        var row: usize = 0;
-        while (row < n) : (row += 1) {
-            var column: usize = 0;
-            while (column <= row) : (column += 1) {
-                const lower_value = self.data[row * n + column];
-                const upper_value = self.data[column * n + row];
-                if (!std.math.isFinite(lower_value) or !std.math.isFinite(upper_value)) return error.MatrixNotPositiveDefinite;
-                if (@abs(@as(f64, lower_value) - @as(f64, upper_value)) > symmetry_threshold) return error.MatrixNotPositiveDefinite;
-                var sum = (@as(f64, lower_value) + @as(f64, upper_value)) * 0.5;
-                var inner: usize = 0;
-                while (inner < column) : (inner += 1) {
-                    sum -= @as(f64, result.data[row * n + inner]) * @as(f64, result.data[column * n + inner]);
-                }
-                if (row == column) {
-                    if (!std.math.isFinite(sum) or sum <= positivity_threshold) return error.MatrixNotPositiveDefinite;
-                    result.data[row * n + column] = @floatCast(@sqrt(sum));
-                } else {
-                    const pivot = result.data[column * n + column];
-                    if (!std.math.isFinite(pivot) or pivot <= 0.0) return error.MatrixNotPositiveDefinite;
-                    const value = sum / @as(f64, pivot);
-                    if (!std.math.isFinite(value)) return error.MatrixNotPositiveDefinite;
-                    result.data[row * n + column] = @floatCast(value);
-                }
-            }
-        }
-        return result;
-    }
-
-    pub fn choleskyInverse(self: *const Tensor, allocator: Allocator) !Tensor {
-        var lower = try self.cholesky(allocator);
-        defer lower.deinit();
-        const n = lower.shape.dims[0];
-        var inverse_lower = try Tensor.zeros(allocator, &.{ n, n });
-        defer inverse_lower.deinit();
-
-        var column: usize = 0;
-        while (column < n) : (column += 1) {
-            var row: usize = 0;
-            while (row < n) : (row += 1) {
-                var sum: f64 = if (row == column) 1.0 else 0.0;
-                var inner: usize = 0;
-                while (inner < row) : (inner += 1) {
-                    sum -= @as(f64, lower.data[row * n + inner]) * @as(f64, inverse_lower.data[inner * n + column]);
-                }
-                const pivot = lower.data[row * n + row];
-                if (!std.math.isFinite(pivot) or pivot <= 0.0) return error.MatrixNotPositiveDefinite;
-                const value = sum / @as(f64, pivot);
-                if (!std.math.isFinite(value)) return error.MatrixNotPositiveDefinite;
-                inverse_lower.data[row * n + column] = @floatCast(value);
-            }
-        }
-
-        var result = try Tensor.zeros(allocator, &.{ n, n });
-        errdefer result.deinit();
-        var row: usize = 0;
-        while (row < n) : (row += 1) {
-            column = row;
-            while (column < n) : (column += 1) {
-                var sum: f64 = 0.0;
-                var inner: usize = @max(row, column);
-                while (inner < n) : (inner += 1) {
-                    sum += @as(f64, inverse_lower.data[inner * n + row]) * @as(f64, inverse_lower.data[inner * n + column]);
-                }
-                if (!std.math.isFinite(sum)) return error.MatrixNotPositiveDefinite;
-                const value: f32 = @floatCast(sum);
-                result.data[row * n + column] = value;
-                result.data[column * n + row] = value;
-            }
-        }
-        return result;
-    }
-
-    pub fn outerProduct(self: *const Tensor, allocator: Allocator, other: *const Tensor) !Tensor {
-        const m = self.data.len;
-        const n = other.data.len;
-
-        var result = try Tensor.init(allocator, &[_]usize{ m, n });
-
-        var i: usize = 0;
-        while (i < m) : (i += 1) {
-            var j: usize = 0;
-            while (j < n) : (j += 1) {
-                result.data[i * n + j] = self.data[i] * other.data[j];
-            }
-        }
-
-        return result;
-    }
-
-    pub fn sizeBytes(self: *const Tensor) usize {
-        return self.data.len * @sizeOf(f32);
-    }
-
-    pub fn save(self: *const Tensor, writer: anytype) !void {
-        try writer.writeInt(u32, 0x54464453, .little);
-        try writer.writeInt(u8, @intFromEnum(self.dtype), .little);
-        try writer.writeInt(u8, tensorFlagsToBits(self.flags), .little);
-        try writer.writeInt(u64, @intCast(self.shape.dims.len), .little);
-        for (self.shape.dims) |dim| {
-            try writer.writeInt(u64, @intCast(dim), .little);
-        }
-        for (self.data) |val| {
-            try writer.writeInt(u32, @as(u32, @bitCast(val)), .little);
-        }
-    }
-
-    pub fn load(allocator: Allocator, reader: anytype) !Tensor {
-        const magic = try reader.readInt(u32, .little);
-        if (magic != 0x54464453) return error.InvalidTensorFormat;
-
-        const dtype_raw = try reader.readInt(u8, .little);
-        const flags_raw = try reader.readInt(u8, .little);
-        const ndims_u64 = try reader.readInt(u64, .little);
-        if (ndims_u64 > @as(u64, std.math.maxInt(usize))) return error.InvalidShape;
-        const ndims: usize = @intCast(ndims_u64);
-        const dims = try allocator.alloc(usize, ndims);
-        defer allocator.free(dims);
-
-        var i: usize = 0;
-        while (i < ndims) : (i += 1) {
-            const dim_u64 = try reader.readInt(u64, .little);
-            if (dim_u64 > @as(u64, std.math.maxInt(usize))) return error.InvalidShape;
-            dims[i] = @intCast(dim_u64);
-        }
-
-        var tensor = try Tensor.init(allocator, dims);
-        errdefer tensor.deinit();
-
-        tensor.dtype = try std.meta.intToEnum(Precision, dtype_raw);
-        tensor.flags = tensorFlagsFromBits(flags_raw);
-
-        i = 0;
-        while (i < tensor.data.len) : (i += 1) {
-            const bits = try reader.readInt(u32, .little);
-            tensor.data[i] = @as(f32, @bitCast(bits));
-        }
-
-        return tensor;
-    }
-
-    pub fn fromCoreTensor(ct: *const core_tensor.Tensor, allocator: Allocator) !Tensor {
-        const t = try Tensor.init(allocator, ct.shape.dims);
-        @memcpy(t.data, ct.data);
-        return t;
-    }
-
-    pub fn toCoreTensor(self: *const Tensor, allocator: Allocator) !core_tensor.Tensor {
-        const ct = try core_tensor.Tensor.init(allocator, self.shape.dims);
-        @memcpy(ct.data, self.data);
-        return ct;
-    }
-
-    pub fn initWithArena(arena: *core_memory.ArenaAllocator, dims: []const usize) !Tensor {
-        return init(arena.allocator(), dims);
-    }
-
-    pub fn initWithPool(pool: *core_memory.PoolAllocator, dims: []const usize) !Tensor {
-        return init(pool.allocator(), dims);
-    }
-
-    pub fn initWithSlab(slab: *core_memory.SlabAllocator, dims: []const usize) !Tensor {
-        return init(slab.allocator(), dims);
-    }
-
-    pub fn initWithBuddy(buddy: *core_memory.BuddyAllocator, dims: []const usize) !Tensor {
-        return init(buddy.allocator(), dims);
-    }
+const rsf_mod = @import("../processor/rsf.zig");
+const RSF = rsf_mod.RSF;
+const RSFBranch = rsf_mod.RSFBranch;
+
+const coupling_width: usize = 2;
+const WEIGHT_COLUMN: usize = 0;
+const BIAS_COLUMN: usize = 1;
+const FISHER_LAYOUT: u32 = 3;
+const SFD4_MAGIC: u32 = 0x53464434;
+const SFD3_MAGIC: u32 = 0x53464433;
+const MIN_DET: f64 = 1.0e-12;
+const SPECTRAL_REPROJECT_REL: f64 = 1.0e-6;
+
+pub const FisherMode = enum(u8) {
+    rsf_gauss_newton = 0,
+    gradient = 1,
+    external = 2,
 };
 
 pub const SFDConfig = struct {
     beta1: f32 = 0.9,
-    beta2: f32 = 0.999,
+    fisher_gamma: f32 = 0.99,
+    fisher_epsilon: f32 = 1e-8,
+    fisher_mode: FisherMode = .rsf_gauss_newton,
     eps: f32 = 1e-8,
     clip_threshold: f32 = 0.1,
     weight_floor: f32 = 1e-3,
     fisher_max: f32 = 1e6,
     warmup_steps: usize = 10,
-    use_external_fisher: bool = false,
+    spectral_target: f32 = 0.9,
 };
 
-pub const KFACBlock = struct {
-    A_diag: Tensor,
-    G_diag: Tensor,
-    damping: f32,
-    alpha: f32,
-    update_freq: usize,
-    last_update: usize,
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator, input_dim: usize, output_dim: usize, damping: f32) !KFACBlock {
-        return initWithAlpha(allocator, input_dim, output_dim, damping, 0.95);
-    }
-
-    pub fn initWithAlpha(allocator: Allocator, input_dim: usize, output_dim: usize, damping: f32, alpha: f32) !KFACBlock {
-        const A_shape = [_]usize{ input_dim, input_dim };
-        const G_shape = [_]usize{ output_dim, output_dim };
-
-        var A = try Tensor.eye(allocator, &A_shape);
-        errdefer A.deinit();
-
-        var G = try Tensor.eye(allocator, &G_shape);
-        errdefer G.deinit();
-
-        return KFACBlock{
-            .A_diag = A,
-            .G_diag = G,
-            .damping = damping,
-            .alpha = alpha,
-            .update_freq = 10,
-            .last_update = 0,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *KFACBlock) void {
-        self.A_diag.deinit();
-        self.G_diag.deinit();
-    }
-
-    pub fn updateStatistics(self: *KFACBlock, activations: *const Tensor, gradients: *const Tensor) !void {
-        const a_dim = self.A_diag.shape.dims[0];
-        const g_dim = self.G_diag.shape.dims[0];
-
-        var row: usize = 0;
-        while (row < a_dim) : (row += 1) {
-            var col: usize = 0;
-            while (col < a_dim) : (col += 1) {
-                const idx = row * a_dim + col;
-                const a_r: f32 = if (row < activations.data.len) activations.data[row] else 0.0;
-                const a_c: f32 = if (col < activations.data.len) activations.data[col] else 0.0;
-                const diag_term: f32 = if (row == col) self.damping else 0.0;
-                const target = a_r * a_c + diag_term;
-                self.A_diag.data[idx] = self.alpha * self.A_diag.data[idx] + (1.0 - self.alpha) * target;
-            }
-        }
-
-        row = 0;
-        while (row < g_dim) : (row += 1) {
-            var col: usize = 0;
-            while (col < g_dim) : (col += 1) {
-                const idx = row * g_dim + col;
-                const g_r: f32 = if (row < gradients.data.len) gradients.data[row] else 0.0;
-                const g_c: f32 = if (col < gradients.data.len) gradients.data[col] else 0.0;
-                const diag_term: f32 = if (row == col) self.damping else 0.0;
-                const target = g_r * g_c + diag_term;
-                self.G_diag.data[idx] = self.alpha * self.G_diag.data[idx] + (1.0 - self.alpha) * target;
-            }
-        }
-    }
-
-    pub fn preconditionGradient(self: *const KFACBlock, grad: *Tensor) !void {
-        const g_dim = self.G_diag.shape.dims[0];
-        const a_dim = self.A_diag.shape.dims[0];
-        if (grad.shape.dims.len != 2 or grad.shape.dims[0] != g_dim or grad.shape.dims[1] != a_dim) {
-            return error.InvalidShape;
-        }
-
-        var A_inv_sqrt = try self.computeInverseSqrt(&self.A_diag);
-        defer A_inv_sqrt.deinit();
-        var G_inv_sqrt = try self.computeInverseSqrt(&self.G_diag);
-        defer G_inv_sqrt.deinit();
-        var original = try grad.clone(self.allocator);
-        defer original.deinit();
-        var left_scaled = try Tensor.init(self.allocator, &[_]usize{ g_dim, a_dim });
-        defer left_scaled.deinit();
-        try left_scaled.matmul(&G_inv_sqrt, &original);
-        try grad.matmul(&left_scaled, &A_inv_sqrt);
-    }
-
-    fn computeInverseSqrt(self: *const KFACBlock, M: *const Tensor) !Tensor {
-        if (M.shape.dims.len != 2 or M.shape.dims[0] != M.shape.dims[1]) return error.InvalidShape;
-        const n = M.shape.dims[0];
-        var matrix = try self.allocator.alloc(f64, n * n);
-        defer self.allocator.free(matrix);
-        var eigenvectors = try self.allocator.alloc(f64, n * n);
-        defer self.allocator.free(eigenvectors);
-
-        var scale: f64 = 1.0;
-        var row: usize = 0;
-        while (row < n) : (row += 1) {
-            var col: usize = 0;
-            while (col < n) : (col += 1) {
-                const value = (@as(f64, M.data[row * n + col]) + @as(f64, M.data[col * n + row])) * 0.5;
-                if (!std.math.isFinite(value)) return error.MatrixNotPositiveDefinite;
-                matrix[row * n + col] = value;
-                eigenvectors[row * n + col] = if (row == col) 1.0 else 0.0;
-                scale = @max(scale, @abs(value));
-            }
-            matrix[row * n + row] += @as(f64, @max(self.damping, @as(f32, 1e-8)));
-        }
-
-        const tolerance = scale * 1e-12;
-        const max_sweeps = @max(@as(usize, 8), n * n * 16);
-        var sweep: usize = 0;
-        while (sweep < max_sweeps) : (sweep += 1) {
-            var p_idx: usize = 0;
-            var q_idx: usize = 0;
-            var largest: f64 = 0.0;
-            row = 0;
-            while (row < n) : (row += 1) {
-                var col: usize = row + 1;
-                while (col < n) : (col += 1) {
-                    const magnitude = @abs(matrix[row * n + col]);
-                    if (magnitude > largest) {
-                        largest = magnitude;
-                        p_idx = row;
-                        q_idx = col;
-                    }
-                }
-            }
-            if (largest <= tolerance) break;
-
-            const app = matrix[p_idx * n + p_idx];
-            const aqq = matrix[q_idx * n + q_idx];
-            const apq = matrix[p_idx * n + q_idx];
-            const angle = 0.5 * std.math.atan2(2.0 * apq, aqq - app);
-            const cosine = @cos(angle);
-            const sine = @sin(angle);
-
-            var k: usize = 0;
-            while (k < n) : (k += 1) {
-                if (k != p_idx and k != q_idx) {
-                    const akp = matrix[k * n + p_idx];
-                    const akq = matrix[k * n + q_idx];
-                    const new_kp = cosine * akp - sine * akq;
-                    const new_kq = sine * akp + cosine * akq;
-                    matrix[k * n + p_idx] = new_kp;
-                    matrix[p_idx * n + k] = new_kp;
-                    matrix[k * n + q_idx] = new_kq;
-                    matrix[q_idx * n + k] = new_kq;
-                }
-                const vkp = eigenvectors[k * n + p_idx];
-                const vkq = eigenvectors[k * n + q_idx];
-                eigenvectors[k * n + p_idx] = cosine * vkp - sine * vkq;
-                eigenvectors[k * n + q_idx] = sine * vkp + cosine * vkq;
-            }
-            matrix[p_idx * n + p_idx] = cosine * cosine * app - 2.0 * sine * cosine * apq + sine * sine * aqq;
-            matrix[q_idx * n + q_idx] = sine * sine * app + 2.0 * sine * cosine * apq + cosine * cosine * aqq;
-            matrix[p_idx * n + q_idx] = 0.0;
-            matrix[q_idx * n + p_idx] = 0.0;
-        }
-
-        var result = try Tensor.zeros(self.allocator, M.shape.dims);
-        errdefer result.deinit();
-        row = 0;
-        while (row < n) : (row += 1) {
-            var col: usize = 0;
-            while (col < n) : (col += 1) {
-                var sum: f64 = 0.0;
-                var k: usize = 0;
-                while (k < n) : (k += 1) {
-                    const eigenvalue = matrix[k * n + k];
-                    if (!std.math.isFinite(eigenvalue) or eigenvalue <= 0.0) return error.MatrixNotPositiveDefinite;
-                    sum += eigenvectors[row * n + k] * (1.0 / @sqrt(eigenvalue)) * eigenvectors[col * n + k];
-                }
-                if (!std.math.isFinite(sum)) return error.MatrixNotPositiveDefinite;
-                result.data[row * n + col] = @floatCast(sum);
-            }
-        }
-        return result;
-    }
+pub const StepStats = struct {
+    step: u64,
+    lr_effective: f32,
+    grad_global_norm: f64,
+    fisher_block_mean: f64,
+    fisher_offdiag_mean_abs: f64,
+    correlation_abs_mean: f64,
+    condition_number_max: f64,
+    clipped_fraction: f64,
+    spectral_reprojected: bool,
 };
+
+pub const BlockInv = struct {
+    inv00: f64,
+    inv01: f64,
+    inv11: f64,
+};
+
+pub fn blockInverseSqrt(A: f64, B: f64, C: f64, lambda: f64) BlockInv {
+    const Ad = A + lambda;
+    const Cd = C + lambda;
+    const det_raw = Ad * Cd - B * B;
+    const det = if (det_raw > MIN_DET) det_raw else MIN_DET;
+    const sqrt_det = @sqrt(det);
+    const S = @sqrt(Ad + Cd + 2.0 * sqrt_det);
+    const denom = sqrt_det * S;
+    const alpha = if (denom > 0.0) 1.0 / denom else 0.0;
+    return .{
+        .inv00 = alpha * (Cd + sqrt_det),
+        .inv01 = -alpha * B,
+        .inv11 = alpha * (Ad + sqrt_det),
+    };
+}
+
+fn validateConfig(cfg: SFDConfig) !void {
+    if (!std.math.isFinite(cfg.beta1) or cfg.beta1 < 0.0 or cfg.beta1 >= 1.0) return error.InvalidBeta1;
+    if (!std.math.isFinite(cfg.fisher_gamma) or cfg.fisher_gamma < 0.0 or cfg.fisher_gamma >= 1.0) return error.InvalidFisherGamma;
+    if (!std.math.isFinite(cfg.fisher_epsilon) or cfg.fisher_epsilon < 1.0e-12) return error.InvalidFisherEpsilon;
+    if (!std.math.isFinite(cfg.eps) or cfg.eps <= 0.0) return error.InvalidEpsilon;
+    if (!std.math.isFinite(cfg.clip_threshold) or cfg.clip_threshold <= 0.0 or cfg.clip_threshold > 1.0) return error.InvalidClipThreshold;
+    if (!std.math.isFinite(cfg.weight_floor) or cfg.weight_floor <= 0.0) return error.InvalidWeightFloor;
+    if (!std.math.isFinite(cfg.fisher_max) or cfg.fisher_max <= 0.0) return error.InvalidFisherMax;
+    if (!std.math.isFinite(cfg.spectral_target) or !(cfg.spectral_target > 0.0)) return error.InvalidSpectralTarget;
+}
+
+fn checkedMul(a: usize, b: usize) !usize {
+    return std.math.mul(usize, a, b) catch return error.Overflow;
+}
+
+fn pairLen(dim: usize) !usize {
+    return checkedMul(dim, coupling_width);
+}
+
+fn blockLen(dim: usize) !usize {
+    return checkedMul(dim, 3);
+}
+
+fn crcU8(hasher: *std.hash.Crc32, v: u8) void {
+    const b = [_]u8{v};
+    hasher.update(&b);
+}
+
+fn crcU32LE(hasher: *std.hash.Crc32, v: u32) void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    hasher.update(&b);
+}
+
+fn crcU64LE(hasher: *std.hash.Crc32, v: u64) void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, v, .little);
+    hasher.update(&b);
+}
+
+fn crcF32LE(hasher: *std.hash.Crc32, v: f32) void {
+    crcU32LE(hasher, @bitCast(v));
+}
+
+fn capDiag(value: f32, cap: f32) f32 {
+    if (!std.math.isFinite(value) or value < 0.0) return 0.0;
+    if (value > cap) return cap;
+    return value;
+}
+
+fn capOff(value: f32, cap: f32) f32 {
+    if (!std.math.isFinite(value)) return 0.0;
+    if (value > cap) return cap;
+    if (value < -cap) return -cap;
+    return value;
+}
+
+fn safeGradient(g: f32) f32 {
+    return if (std.math.isFinite(g)) g else 0.0;
+}
+
+fn warmupFactor(step: u64, warmup_steps: usize) f32 {
+    if (warmup_steps == 0) return 1.0;
+    if (step >= warmup_steps) return 1.0;
+    return @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(warmup_steps));
+}
+
+fn conditionNumber(A: f64, B: f64, C: f64) f64 {
+    const disc = (A - C) * (A - C) + 4.0 * B * B;
+    const root = @sqrt(if (disc > 0.0) disc else 0.0);
+    const lam_max = 0.5 * (A + C + root);
+    const lam_min = 0.5 * (A + C - root);
+    if (!(lam_min > 0.0)) return std.math.inf(f64);
+    return lam_max / lam_min;
+}
+
+fn applyBlockVec(inv: BlockInv, x0: f64, x1: f64) struct { y0: f64, y1: f64 } {
+    return .{
+        .y0 = inv.inv00 * x0 + inv.inv01 * x1,
+        .y1 = inv.inv01 * x0 + inv.inv11 * x1,
+    };
+}
 
 pub const SpectralNormalizerConfig = struct {
     power_iterations: usize = 5,
@@ -772,7 +165,7 @@ pub const SpectralNormalizer = struct {
     max_singular_value: f32,
 
     pub fn init(power_iterations: usize) SpectralNormalizer {
-        return SpectralNormalizer{
+        return .{
             .power_iterations = power_iterations,
             .eps = 1e-12,
             .max_singular_value = 1.0,
@@ -780,7 +173,7 @@ pub const SpectralNormalizer = struct {
     }
 
     pub fn initWithConfig(config: SpectralNormalizerConfig) SpectralNormalizer {
-        return SpectralNormalizer{
+        return .{
             .power_iterations = config.power_iterations,
             .eps = config.eps,
             .max_singular_value = config.max_singular_value,
@@ -788,10 +181,19 @@ pub const SpectralNormalizer = struct {
     }
 
     pub fn normalizeWeights(self: *SpectralNormalizer, weights: *Tensor, allocator: Allocator) !void {
-        const sigma = try weights.spectralNorm(allocator, self.power_iterations, self.eps);
-
-        if (sigma > self.max_singular_value) {
-            weights.mulScalar(self.max_singular_value / sigma);
+        if (weights.shape.dims.len != 2) return error.InvalidShape;
+        const rows = weights.shape.dims[0];
+        const cols = weights.shape.dims[1];
+        if (rows == 0 or cols == 0) return error.InvalidShape;
+        if (cols == coupling_width) {
+            const sigma = try tensor_mod.constrainCouplingSpectralNorm(weights.data, rows, self.max_singular_value);
+            _ = sigma;
+            return;
+        }
+        const sigma = try denseSpectralNorm(weights.data, rows, cols, self.power_iterations, self.eps, allocator);
+        if (!std.math.isFinite(sigma)) return error.NonFinite;
+        if (sigma > self.max_singular_value and sigma > 0.0) {
+            try weights.mulScalar(self.max_singular_value / sigma);
         }
     }
 
@@ -801,221 +203,681 @@ pub const SpectralNormalizer = struct {
             const deviation = sigma - 1.0;
             reg_term += deviation * deviation;
         }
-
         return loss + lambda * reg_term;
     }
 };
 
-pub const SFD = struct {
-    fisher_diag: Tensor,
-    momentum_buffer: Tensor,
-    beta1: f32,
-    beta2: f32,
-    eps: f32,
-    clip_threshold: f32,
-    weight_floor: f32,
-    fisher_max: f32,
-    warmup_steps: usize,
-    step_count: usize,
-    allocator: Allocator,
-    param_size: usize,
-    initialized: bool,
-    use_external_fisher: bool,
+fn denseSpectralNorm(data: []const f32, rows: usize, cols: usize, iterations: usize, eps: f32, allocator: Allocator) !f32 {
+    const n = try checkedMul(rows, cols);
+    if (data.len < n) return error.InvalidShape;
+    const v = try allocator.alloc(f32, cols);
+    defer allocator.free(v);
+    const u = try allocator.alloc(f32, rows);
+    defer allocator.free(u);
+    const inv_sqrt: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(if (cols == 0) 1 else cols)));
+    var j: usize = 0;
+    while (j < cols) : (j += 1) v[j] = inv_sqrt;
+    const iters = if (iterations == 0) @as(usize, 1) else iterations;
+    var iter: usize = 0;
+    while (iter < iters) : (iter += 1) {
+        @memset(u, 0.0);
+        var i: usize = 0;
+        while (i < rows) : (i += 1) {
+            var acc: f64 = 0.0;
+            j = 0;
+            while (j < cols) : (j += 1) acc += @as(f64, data[i * cols + j]) * @as(f64, v[j]);
+            u[i] = @floatCast(acc);
+        }
+        var un: f64 = 0.0;
+        i = 0;
+        while (i < rows) : (i += 1) un += @as(f64, u[i]) * @as(f64, u[i]);
+        un = @sqrt(un);
+        if (un > @as(f64, eps)) {
+            const inv = 1.0 / un;
+            i = 0;
+            while (i < rows) : (i += 1) u[i] = @floatCast(@as(f64, u[i]) * inv);
+        }
+        @memset(v, 0.0);
+        i = 0;
+        while (i < rows) : (i += 1) {
+            j = 0;
+            while (j < cols) : (j += 1) v[j] += u[i] * data[i * cols + j];
+        }
+        var vn: f64 = 0.0;
+        j = 0;
+        while (j < cols) : (j += 1) vn += @as(f64, v[j]) * @as(f64, v[j]);
+        vn = @sqrt(vn);
+        if (vn > @as(f64, eps)) {
+            const inv = 1.0 / vn;
+            j = 0;
+            while (j < cols) : (j += 1) v[j] = @floatCast(@as(f64, v[j]) * inv);
+        }
+    }
+    var sigma: f64 = 0.0;
+    var i: usize = 0;
+    while (i < rows) : (i += 1) {
+        var j2: usize = 0;
+        while (j2 < cols) : (j2 += 1) {
+            sigma += @as(f64, u[i]) * @as(f64, data[i * cols + j2]) * @as(f64, v[j2]);
+        }
+    }
+    const out: f32 = @floatCast(if (sigma >= 0.0) sigma else -sigma);
+    if (!std.math.isFinite(out)) return error.NonFinite;
+    return out;
+}
 
-    pub fn init(allocator: Allocator, param_size: usize) !SFD {
-        return initWithConfig(allocator, param_size, .{});
+pub const KFACBlock = struct {
+    A_block: Tensor,
+    G_block: Tensor,
+    damping: f32,
+    alpha: f32,
+    dim: usize,
+    model_id: u64,
+    layer: usize,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, model: *const RSF, layer: usize, damping: f32) !KFACBlock {
+        return initWithAlpha(allocator, model, layer, damping, 0.95);
     }
 
-    pub fn initWithConfig(allocator: Allocator, param_size: usize, config: SFDConfig) !SFD {
-        if (param_size == 0) return error.InvalidParamSize;
-        if (!std.math.isFinite(config.beta1) or config.beta1 < 0.0 or config.beta1 >= 1.0) return error.InvalidBeta1;
-        if (!std.math.isFinite(config.beta2) or config.beta2 < 0.0 or config.beta2 >= 1.0) return error.InvalidBeta2;
-        if (!std.math.isFinite(config.eps) or config.eps <= 0.0) return error.InvalidEpsilon;
-        if (!std.math.isFinite(config.clip_threshold) or config.clip_threshold <= 0.0 or config.clip_threshold > 1.0) return error.InvalidClipThreshold;
-        if (!std.math.isFinite(config.weight_floor) or config.weight_floor <= 0.0) return error.InvalidWeightFloor;
-        if (!std.math.isFinite(config.fisher_max) or config.fisher_max <= 0.0) return error.InvalidFisherMax;
-
-        const shape = [_]usize{param_size};
-        var fisher = try Tensor.zeros(allocator, &shape);
-        errdefer fisher.deinit();
-        var momentum = try Tensor.zeros(allocator, &shape);
-        errdefer momentum.deinit();
+    pub fn initWithAlpha(allocator: Allocator, model: *const RSF, layer: usize, damping: f32, alpha: f32) !KFACBlock {
+        if (!std.math.isFinite(damping) or damping < 0.0) return error.InvalidEpsilon;
+        if (!std.math.isFinite(alpha) or alpha < 0.0 or alpha >= 1.0) return error.InvalidBeta1;
+        const dim = try model.dim();
+        const layers = try model.layerCount();
+        if (layer >= layers) return error.LayerIndexOutOfBounds;
+        if (dim == 0) return error.InvalidDimension;
+        const blen = try blockLen(dim);
+        _ = blen;
+        var A = try Tensor.zeros(allocator, &[_]usize{ dim, 3 });
+        errdefer A.deinit();
+        var G = try Tensor.zeros(allocator, &[_]usize{ dim, 3 });
+        errdefer G.deinit();
         return .{
-            .fisher_diag = fisher,
-            .momentum_buffer = momentum,
-            .beta1 = config.beta1,
-            .beta2 = config.beta2,
-            .eps = config.eps,
-            .clip_threshold = config.clip_threshold,
-            .weight_floor = config.weight_floor,
-            .fisher_max = config.fisher_max,
-            .warmup_steps = config.warmup_steps,
-            .step_count = 0,
+            .A_block = A,
+            .G_block = G,
+            .damping = damping,
+            .alpha = alpha,
+            .dim = dim,
+            .model_id = model.id,
+            .layer = layer,
             .allocator = allocator,
-            .param_size = param_size,
-            .initialized = true,
-            .use_external_fisher = config.use_external_fisher,
         };
     }
 
-    pub fn initWithArena(arena: *core_memory.ArenaAllocator, param_size: usize) !SFD {
-        return initWithConfig(arena.allocator(), param_size, .{});
+    pub fn deinit(self: *KFACBlock) void {
+        self.A_block.deinit();
+        self.G_block.deinit();
     }
-    pub fn initWithPool(pool: *core_memory.PoolAllocator, param_size: usize) !SFD {
-        return initWithConfig(pool.allocator(), param_size, .{});
+
+    pub fn updateStatistics(self: *KFACBlock, x2_batch: *const Tensor, dy_batch: *const Tensor) !void {
+        if (x2_batch.shape.dims.len != 2) return error.InvalidShape;
+        if (dy_batch.shape.dims.len != 2) return error.InvalidShape;
+        const batch = x2_batch.shape.dims[0];
+        if (batch == 0) return error.InvalidBatchSize;
+        if (x2_batch.shape.dims[1] != self.dim) return error.ShapeMismatch;
+        const dim2 = try pairLen(self.dim);
+        if (dy_batch.shape.dims[0] != batch or dy_batch.shape.dims[1] != dim2) return error.ShapeMismatch;
+        const inv_b: f64 = 1.0 / @as(f64, @floatFromInt(batch));
+        const keep: f64 = self.alpha;
+        const mix: f64 = 1.0 - keep;
+        var d: usize = 0;
+        while (d < self.dim) : (d += 1) {
+            var sum_x2sq: f64 = 0.0;
+            var sum_x2: f64 = 0.0;
+            var sum_dy2sq: f64 = 0.0;
+            var sum_cross: f64 = 0.0;
+            var sum_dy1sq: f64 = 0.0;
+            var b: usize = 0;
+            while (b < batch) : (b += 1) {
+                const x2: f64 = x2_batch.data[b * self.dim + d];
+                const dy1: f64 = dy_batch.data[b * dim2 + d];
+                const dy2: f64 = dy_batch.data[b * dim2 + self.dim + d];
+                sum_x2sq += x2 * x2;
+                sum_x2 += x2;
+                sum_dy2sq += dy2 * dy2;
+                sum_cross += dy1 * dy2;
+                sum_dy1sq += dy1 * dy1;
+            }
+            const a0: f32 = @floatCast(keep * @as(f64, self.A_block.data[d * 3 + 0]) + mix * sum_x2sq * inv_b);
+            const a1: f32 = @floatCast(keep * @as(f64, self.A_block.data[d * 3 + 1]) + mix * sum_x2 * inv_b);
+            const a2: f32 = @floatCast(keep * @as(f64, self.A_block.data[d * 3 + 2]) + mix * 1.0);
+            const g0: f32 = @floatCast(keep * @as(f64, self.G_block.data[d * 3 + 0]) + mix * sum_dy2sq * inv_b);
+            const g1: f32 = @floatCast(keep * @as(f64, self.G_block.data[d * 3 + 1]) + mix * sum_cross * inv_b);
+            const g2: f32 = @floatCast(keep * @as(f64, self.G_block.data[d * 3 + 2]) + mix * sum_dy1sq * inv_b);
+            if (!std.math.isFinite(a0) or !std.math.isFinite(a1) or !std.math.isFinite(a2)) return error.NonFinite;
+            if (!std.math.isFinite(g0) or !std.math.isFinite(g1) or !std.math.isFinite(g2)) return error.NonFinite;
+            self.A_block.data[d * 3 + 0] = a0;
+            self.A_block.data[d * 3 + 1] = a1;
+            self.A_block.data[d * 3 + 2] = a2;
+            self.G_block.data[d * 3 + 0] = g0;
+            self.G_block.data[d * 3 + 1] = g1;
+            self.G_block.data[d * 3 + 2] = g2;
+        }
     }
-    pub fn initWithBuddy(buddy: *core_memory.BuddyAllocator, param_size: usize) !SFD {
-        return initWithConfig(buddy.allocator(), param_size, .{});
+
+    pub fn preconditionGradient(self: *const KFACBlock, grad: *Tensor) !void {
+        if (grad.shape.dims.len != 2) return error.InvalidShape;
+        if (grad.shape.dims[0] != self.dim or grad.shape.dims[1] != coupling_width) return error.ShapeMismatch;
+        const lambda: f64 = self.damping;
+        var d: usize = 0;
+        while (d < self.dim) : (d += 1) {
+            const A = blockInverseSqrt(
+                self.A_block.data[d * 3 + 0],
+                self.A_block.data[d * 3 + 1],
+                self.A_block.data[d * 3 + 2],
+                lambda,
+            );
+            const G = blockInverseSqrt(
+                self.G_block.data[d * 3 + 0],
+                self.G_block.data[d * 3 + 1],
+                self.G_block.data[d * 3 + 2],
+                lambda,
+            );
+            const gw: f64 = grad.data[d * coupling_width + WEIGHT_COLUMN];
+            const gb: f64 = grad.data[d * coupling_width + BIAS_COLUMN];
+            const whitened = applyBlockVec(A, gw, gb);
+            const out = applyBlockVec(G, whitened.y0, whitened.y1);
+            const ow: f32 = @floatCast(out.y0);
+            const ob: f32 = @floatCast(out.y1);
+            if (!std.math.isFinite(ow) or !std.math.isFinite(ob)) return error.NonFinite;
+            grad.data[d * coupling_width + WEIGHT_COLUMN] = ow;
+            grad.data[d * coupling_width + BIAS_COLUMN] = ob;
+        }
+    }
+};
+
+pub const SFD = struct {
+    fisher_blocks_s: []Tensor,
+    fisher_blocks_t: []Tensor,
+    momentum_s: []Tensor,
+    momentum_t: []Tensor,
+    master_s: []Tensor,
+    master_t: []Tensor,
+    model_id: u64,
+    dim: usize,
+    num_layers: usize,
+    step_count: u64,
+    cfg: SFDConfig,
+    allocator: Allocator,
+    initialized: bool,
+
+    pub fn init(allocator: Allocator, model: *const RSF) !SFD {
+        return initWithConfig(allocator, model, .{});
+    }
+
+    pub fn initWithConfig(allocator: Allocator, model: *const RSF, cfg: SFDConfig) !SFD {
+        try validateConfig(cfg);
+        const model_id = model.id;
+        if (model_id == 0) return error.ModelMismatch;
+        const dim = try model.dim();
+        const num_layers = try model.layerCount();
+        if (dim == 0) return error.InvalidDimension;
+        if (num_layers == 0) return error.InvalidLayerCount;
+        const plen = try pairLen(dim);
+        var fisher_s = try allocator.alloc(Tensor, num_layers);
+        errdefer allocator.free(fisher_s);
+        var fisher_t = try allocator.alloc(Tensor, num_layers);
+        errdefer allocator.free(fisher_t);
+        var mom_s = try allocator.alloc(Tensor, num_layers);
+        errdefer allocator.free(mom_s);
+        var mom_t = try allocator.alloc(Tensor, num_layers);
+        errdefer allocator.free(mom_t);
+        var master_s = try allocator.alloc(Tensor, num_layers);
+        errdefer allocator.free(master_s);
+        var master_t = try allocator.alloc(Tensor, num_layers);
+        errdefer allocator.free(master_t);
+        var initialized_layers: usize = 0;
+        errdefer {
+            var j: usize = 0;
+            while (j < initialized_layers) : (j += 1) {
+                fisher_s[j].deinit();
+                fisher_t[j].deinit();
+                mom_s[j].deinit();
+                mom_t[j].deinit();
+                master_s[j].deinit();
+                master_t[j].deinit();
+            }
+        }
+        const s_tmp = try allocator.alloc(f32, plen);
+        defer allocator.free(s_tmp);
+        const t_tmp = try allocator.alloc(f32, plen);
+        defer allocator.free(t_tmp);
+        var l: usize = 0;
+        while (l < num_layers) : (l += 1) {
+            fisher_s[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 3 });
+            errdefer fisher_s[l].deinit();
+            fisher_t[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 3 });
+            errdefer fisher_t[l].deinit();
+            mom_s[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 2 });
+            errdefer mom_s[l].deinit();
+            mom_t[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 2 });
+            errdefer mom_t[l].deinit();
+            master_s[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 2 });
+            errdefer master_s[l].deinit();
+            master_t[l] = try Tensor.zeros(allocator, &[_]usize{ dim, 2 });
+            errdefer master_t[l].deinit();
+            try model.readLayerWeights(l, s_tmp, t_tmp);
+            @memcpy(master_s[l].data[0..plen], s_tmp);
+            @memcpy(master_t[l].data[0..plen], t_tmp);
+            _ = types.RSFBinding.layer(.fisher_block, model_id, l, dim);
+            _ = types.RSFBinding.layer(.momentum, model_id, l, dim);
+            _ = types.RSFBinding.layer(.master_weight, model_id, l, dim);
+            initialized_layers += 1;
+        }
+        return .{
+            .fisher_blocks_s = fisher_s,
+            .fisher_blocks_t = fisher_t,
+            .momentum_s = mom_s,
+            .momentum_t = mom_t,
+            .master_s = master_s,
+            .master_t = master_t,
+            .model_id = model_id,
+            .dim = dim,
+            .num_layers = num_layers,
+            .step_count = 0,
+            .cfg = cfg,
+            .allocator = allocator,
+            .initialized = true,
+        };
     }
 
     pub fn deinit(self: *SFD) void {
         if (!self.initialized) return;
-        self.fisher_diag.deinit();
-        self.momentum_buffer.deinit();
+        var l: usize = 0;
+        while (l < self.num_layers) : (l += 1) {
+            self.fisher_blocks_s[l].deinit();
+            self.fisher_blocks_t[l].deinit();
+            self.momentum_s[l].deinit();
+            self.momentum_t[l].deinit();
+            self.master_s[l].deinit();
+            self.master_t[l].deinit();
+        }
+        self.allocator.free(self.fisher_blocks_s);
+        self.allocator.free(self.fisher_blocks_t);
+        self.allocator.free(self.momentum_s);
+        self.allocator.free(self.momentum_t);
+        self.allocator.free(self.master_s);
+        self.allocator.free(self.master_t);
+        self.fisher_blocks_s = &.{};
+        self.fisher_blocks_t = &.{};
+        self.momentum_s = &.{};
+        self.momentum_t = &.{};
+        self.master_s = &.{};
+        self.master_t = &.{};
         self.initialized = false;
     }
 
-    fn warmupFactor(self: *const SFD, step: usize) f32 {
-        if (self.warmup_steps == 0 or step >= self.warmup_steps) return 1.0;
-        return @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(self.warmup_steps));
+    fn requireModel(self: *const SFD, model: *const RSF) !void {
+        if (!self.initialized) return error.NotInitialized;
+        if (model.id != self.model_id) return error.ModelMismatch;
+        const dim = try model.dim();
+        const layers = try model.layerCount();
+        if (dim != self.dim or layers != self.num_layers) return error.ModelMismatch;
     }
 
-    fn applySlices(self: *SFD, gradients: []const Tensor, params: []*Tensor, lr: f32) !void {
-        if (!self.initialized) return error.NotInitialized;
+    fn mixFisher(F: []f32, d: usize, p_ww: f32, p_wb: f32, p_bb: f32, gamma: f32, cap: f32) void {
+        const base = d * 3;
+        const keep = gamma;
+        const mix = 1.0 - gamma;
+        const ww = keep * F[base + 0] + mix * p_ww;
+        const wb = keep * F[base + 1] + mix * p_wb;
+        const bb = keep * F[base + 2] + mix * p_bb;
+        F[base + 0] = capDiag(ww, cap);
+        F[base + 1] = capOff(wb, cap);
+        F[base + 2] = capDiag(bb, cap);
+    }
+
+    pub fn step(self: *SFD, model: *RSF, lr: f32) !StepStats {
+        try self.requireModel(model);
         if (!std.math.isFinite(lr) or lr < 0.0) return error.InvalidLearningRate;
-        if (gradients.len != params.len) return error.GradientCountMismatch;
-
-        var total: usize = 0;
-        for (params, 0..) |param, index| {
-            if (gradients[index].data.len != param.data.len) return error.ShapeMismatch;
-            total = std.math.add(usize, total, param.data.len) catch return error.ShapeMismatch;
-        }
-        if (total != self.param_size) return error.ShapeMismatch;
-
-        const next_step = self.step_count +| 1;
+        try model.ensureGradients();
+        const plen = try pairLen(self.dim);
+        const blen = try blockLen(self.dim);
+        const allocator = self.allocator;
+        const gs = try allocator.alloc(f32, plen);
+        defer allocator.free(gs);
+        const gt = try allocator.alloc(f32, plen);
+        defer allocator.free(gt);
+        const prod_s = try allocator.alloc(f32, blen);
+        defer allocator.free(prod_s);
+        const prod_t = try allocator.alloc(f32, blen);
+        defer allocator.free(prod_t);
+        const gn = try allocator.alloc(f32, blen);
+        defer allocator.free(gn);
+        const next_step = self.step_count + 1;
         const step_f: f32 = @floatFromInt(next_step);
-        const m_correction = @max(1.0 - std.math.pow(f32, self.beta1, step_f), self.eps);
-        const f_correction = @max(1.0 - std.math.pow(f32, self.beta2, step_f), self.eps);
-        const effective_lr = lr * self.warmupFactor(next_step);
-
-        var offset: usize = 0;
-        for (params, 0..) |param, tensor_index| {
-            const grad = gradients[tensor_index];
-            for (grad.data, 0..) |g, element_index| {
-                const gradient_is_finite = std.math.isFinite(g);
-                const safe_gradient: f32 = if (gradient_is_finite) g else 0.0;
-                const state_index = offset + element_index;
-                const old_momentum = self.momentum_buffer.data[state_index];
-                const momentum_candidate = self.beta1 * old_momentum + (1.0 - self.beta1) * safe_gradient;
-                const momentum = if (std.math.isFinite(momentum_candidate)) momentum_candidate else old_momentum;
-                self.momentum_buffer.data[state_index] = momentum;
-
-                var fisher = self.fisher_diag.data[state_index];
-                if (!self.use_external_fisher) {
-                    const fisher_candidate = self.beta2 * fisher + (1.0 - self.beta2) * safe_gradient * safe_gradient;
-                    if (std.math.isFinite(fisher_candidate)) fisher = @min(fisher_candidate, self.fisher_max);
-                    self.fisher_diag.data[state_index] = fisher;
+        const m_corr = @max(1.0 - std.math.pow(f32, self.cfg.beta1, step_f), self.cfg.eps);
+        const f_corr = @max(1.0 - std.math.pow(f32, self.cfg.fisher_gamma, step_f), self.cfg.eps);
+        const lr_eff = lr * warmupFactor(next_step, self.cfg.warmup_steps);
+        const lambda: f64 = self.cfg.fisher_epsilon;
+        const gamma = self.cfg.fisher_gamma;
+        const cap = self.cfg.fisher_max;
+        var grad_sq: f64 = 0.0;
+        var fisher_sum: f64 = 0.0;
+        var fisher_n: u64 = 0;
+        var off_sum: f64 = 0.0;
+        var rho_sum: f64 = 0.0;
+        var rho_n: u64 = 0;
+        var cond_max: f64 = 0.0;
+        var clipped: u64 = 0;
+        var components: u64 = 0;
+        var spectral_reprojected = false;
+        var l: usize = 0;
+        while (l < self.num_layers) : (l += 1) {
+            try model.readLayerGradients(l, gs, gt);
+            try model.readLayerGradientProducts(l, .s, prod_s);
+            try model.readLayerGradientProducts(l, .t, prod_t);
+            try model.readLayerGaussNewton(l, gn);
+            var d: usize = 0;
+            while (d < self.dim) : (d += 1) {
+                const gsw = safeGradient(gs[d * coupling_width + WEIGHT_COLUMN]);
+                const gsb = safeGradient(gs[d * coupling_width + BIAS_COLUMN]);
+                const gtw = safeGradient(gt[d * coupling_width + WEIGHT_COLUMN]);
+                const gtb = safeGradient(gt[d * coupling_width + BIAS_COLUMN]);
+                grad_sq += @as(f64, gsw) * @as(f64, gsw) + @as(f64, gsb) * @as(f64, gsb) + @as(f64, gtw) * @as(f64, gtw) + @as(f64, gtb) * @as(f64, gtb);
+                switch (self.cfg.fisher_mode) {
+                    .external => {},
+                    .gradient => {
+                        mixFisher(self.fisher_blocks_s[l].data, d, prod_s[d * 3 + 0], prod_s[d * 3 + 1], prod_s[d * 3 + 2], gamma, cap);
+                        mixFisher(self.fisher_blocks_t[l].data, d, prod_t[d * 3 + 0], prod_t[d * 3 + 1], prod_t[d * 3 + 2], gamma, cap);
+                    },
+                    .rsf_gauss_newton => {
+                        mixFisher(
+                            self.fisher_blocks_s[l].data,
+                            d,
+                            prod_s[d * 3 + 0] + gn[d * 3 + 0],
+                            prod_s[d * 3 + 1] + gn[d * 3 + 1],
+                            prod_s[d * 3 + 2] + gn[d * 3 + 2],
+                            gamma,
+                            cap,
+                        );
+                        mixFisher(self.fisher_blocks_t[l].data, d, prod_t[d * 3 + 0], prod_t[d * 3 + 1], prod_t[d * 3 + 2], gamma, cap);
+                    },
                 }
-                if (!gradient_is_finite) continue;
-
-                const m_hat = momentum / m_correction;
-                const fisher_hat = if (self.use_external_fisher) fisher else fisher / f_correction;
-                if (!std.math.isFinite(fisher_hat) or fisher_hat < 0.0) continue;
-                var delta = effective_lr * m_hat / (@sqrt(fisher_hat) + self.eps);
-                const parameter_scale = @max(@abs(param.data[element_index]), self.weight_floor);
-                const max_update = self.clip_threshold * parameter_scale;
-                delta = std.math.clamp(delta, -max_update, max_update);
-                const updated = param.data[element_index] - delta;
-                if (std.math.isFinite(updated)) param.data[element_index] = updated;
+                const branches = [_]*Tensor{ &self.fisher_blocks_s[l], &self.fisher_blocks_t[l] };
+                const moms = [_]*Tensor{ &self.momentum_s[l], &self.momentum_t[l] };
+                const masters = [_]*Tensor{ &self.master_s[l], &self.master_t[l] };
+                const grads_w = [_]f32{ gsw, gtw };
+                const grads_b = [_]f32{ gsb, gtb };
+                const raw_w = [_]f32{ gs[d * coupling_width + WEIGHT_COLUMN], gt[d * coupling_width + WEIGHT_COLUMN] };
+                const raw_b = [_]f32{ gs[d * coupling_width + BIAS_COLUMN], gt[d * coupling_width + BIAS_COLUMN] };
+                var br: usize = 0;
+                while (br < 2) : (br += 1) {
+                    const F = branches[br].data;
+                    const M = moms[br].data;
+                    const W = masters[br].data;
+                    const mw_old = M[d * coupling_width + WEIGHT_COLUMN];
+                    const mb_old = M[d * coupling_width + BIAS_COLUMN];
+                    const mw_cand = self.cfg.beta1 * mw_old + (1.0 - self.cfg.beta1) * grads_w[br];
+                    const mb_cand = self.cfg.beta1 * mb_old + (1.0 - self.cfg.beta1) * grads_b[br];
+                    const mw = if (std.math.isFinite(mw_cand)) mw_cand else mw_old;
+                    const mb = if (std.math.isFinite(mb_cand)) mb_cand else mb_old;
+                    M[d * coupling_width + WEIGHT_COLUMN] = mw;
+                    M[d * coupling_width + BIAS_COLUMN] = mb;
+                    const Fww = F[d * 3 + 0];
+                    const Fwb = F[d * 3 + 1];
+                    const Fbb = F[d * 3 + 2];
+                    fisher_sum += @as(f64, Fww) + @as(f64, Fbb);
+                    fisher_n += 2;
+                    off_sum += @abs(@as(f64, Fwb));
+                    const den_rho = @sqrt(@as(f64, Fww) * @as(f64, Fbb));
+                    if (den_rho > 0.0) {
+                        rho_sum += @abs(@as(f64, Fwb)) / den_rho;
+                        rho_n += 1;
+                    }
+                    const Fhat_ww: f64 = @as(f64, Fww) / @as(f64, f_corr);
+                    const Fhat_wb: f64 = @as(f64, Fwb) / @as(f64, f_corr);
+                    const Fhat_bb: f64 = @as(f64, Fbb) / @as(f64, f_corr);
+                    const Ad = Fhat_ww + lambda;
+                    const Cd = Fhat_bb + lambda;
+                    const cond = conditionNumber(Ad, Fhat_wb, Cd);
+                    if (cond > cond_max) cond_max = cond;
+                    const inv = blockInverseSqrt(Fhat_ww, Fhat_wb, Fhat_bb, lambda);
+                    const mhw: f64 = @as(f64, mw) / @as(f64, m_corr);
+                    const mhb: f64 = @as(f64, mb) / @as(f64, m_corr);
+                    const ng = applyBlockVec(inv, mhw, mhb);
+                    var dw: f32 = @floatCast(@as(f64, lr_eff) * ng.y0);
+                    var db: f32 = @floatCast(@as(f64, lr_eff) * ng.y1);
+                    const tw = W[d * coupling_width + WEIGHT_COLUMN];
+                    const tb = W[d * coupling_width + BIAS_COLUMN];
+                    const max_w = self.cfg.clip_threshold * @max(@abs(tw), self.cfg.weight_floor);
+                    const max_b = self.cfg.clip_threshold * @max(@abs(tb), self.cfg.weight_floor);
+                    components += 2;
+                    if (@abs(dw) > max_w) {
+                        dw = std.math.clamp(dw, -max_w, max_w);
+                        clipped += 1;
+                    }
+                    if (@abs(db) > max_b) {
+                        db = std.math.clamp(db, -max_b, max_b);
+                        clipped += 1;
+                    }
+                    const both_grad_finite = std.math.isFinite(raw_w[br]) and std.math.isFinite(raw_b[br]);
+                    if (both_grad_finite and std.math.isFinite(dw) and std.math.isFinite(db)) {
+                        const nw = tw - dw;
+                        const nb = tb - db;
+                        if (std.math.isFinite(nw) and std.math.isFinite(nb)) {
+                            W[d * coupling_width + WEIGHT_COLUMN] = nw;
+                            W[d * coupling_width + BIAS_COLUMN] = nb;
+                        }
+                    }
+                }
             }
-            offset += param.data.len;
+            const sigma_s = try tensor_mod.constrainCouplingSpectralNorm(self.master_s[l].data, self.dim, self.cfg.spectral_target);
+            const sigma_t = try tensor_mod.constrainCouplingSpectralNorm(self.master_t[l].data, self.dim, self.cfg.spectral_target);
+            const target: f64 = self.cfg.spectral_target;
+            if (sigma_s > target * (1.0 + SPECTRAL_REPROJECT_REL)) spectral_reprojected = true;
+            if (sigma_t > target * (1.0 + SPECTRAL_REPROJECT_REL)) spectral_reprojected = true;
+            try model.writeLayerWeights(l, self.master_s[l].data[0..plen], self.master_t[l].data[0..plen]);
         }
+        try model.notifyWeightsChanged();
         self.step_count = next_step;
+        const grad_norm = @sqrt(grad_sq);
+        const fisher_mean = if (fisher_n == 0) 0.0 else fisher_sum / @as(f64, @floatFromInt(fisher_n));
+        const off_mean = if (fisher_n == 0) 0.0 else off_sum / @as(f64, @floatFromInt(self.num_layers * self.dim * 2));
+        const rho_mean = if (rho_n == 0) 0.0 else rho_sum / @as(f64, @floatFromInt(rho_n));
+        const clip_frac = if (components == 0) 0.0 else @as(f64, @floatFromInt(clipped)) / @as(f64, @floatFromInt(components));
+        if (!std.math.isFinite(grad_norm) or !std.math.isFinite(fisher_mean) or !std.math.isFinite(off_mean) or !std.math.isFinite(rho_mean) or !std.math.isFinite(clip_frac)) return error.NonFinite;
+        return .{
+            .step = self.step_count,
+            .lr_effective = lr_eff,
+            .grad_global_norm = grad_norm,
+            .fisher_block_mean = fisher_mean,
+            .fisher_offdiag_mean_abs = off_mean,
+            .correlation_abs_mean = rho_mean,
+            .condition_number_max = cond_max,
+            .clipped_fraction = clip_frac,
+            .spectral_reprojected = spectral_reprojected,
+        };
     }
 
-    pub fn update(self: *SFD, gradients: *const Tensor, params: *Tensor, lr: f32) !void {
-        const gradient_slices = [_]Tensor{gradients.*};
-        var parameter_slices = [_]*Tensor{params};
-        return self.applySlices(&gradient_slices, &parameter_slices, lr);
-    }
-
-    pub fn updateFusedFisher(self: *SFD, gradients: *const Tensor, params: *Tensor, lr: f32) !void {
-        const gradient_slices = [_]Tensor{gradients.*};
-        var parameter_slices = [_]*Tensor{params};
-        return self.applySlices(&gradient_slices, &parameter_slices, lr);
-    }
-
-    pub fn updateFusedFisherMulti(self: *SFD, gradients: []const Tensor, params: []*Tensor, lr: f32) !void {
-        return self.applySlices(gradients, params, lr);
-    }
-
-    pub fn adaptiveLR(self: *const SFD, grad_norm: f32, param_norm: f32) f32 {
-        if (!std.math.isFinite(grad_norm) or grad_norm < 0.0 or !std.math.isFinite(param_norm) or param_norm < 0.0) return 1.0;
-        const result = 1.0 / @sqrt(grad_norm / (param_norm + self.eps) + self.eps);
-        return if (std.math.isFinite(result)) result else 1.0;
-    }
-
-    pub fn spectralClip(self: *SFD, tensor: *Tensor, max_eig: f32) !void {
-        return self.spectralClipWithIters(tensor, max_eig, 100);
-    }
-    pub fn spectralClipWithIters(self: *SFD, tensor: *Tensor, max_eig: f32, power_iter: usize) !void {
-        if (!self.initialized) return error.NotInitialized;
-        if (!std.math.isFinite(max_eig) or max_eig <= 0.0) return error.InvalidMaxEig;
-        const current = try tensor.spectralNorm(self.allocator, power_iter, 1e-6);
-        if (std.math.isFinite(current) and current > max_eig) tensor.mulScalar(max_eig / current);
-    }
-
-    pub fn accumulateFisher(self: *SFD, grads: []const Tensor) !void {
-        if (!self.initialized) return error.NotInitialized;
-        for (grads) |grad| {
-            const count = @min(self.fisher_diag.data.len, grad.data.len);
-            for (grad.data[0..count], 0..) |g, index| {
-                if (std.math.isFinite(g)) self.fisher_diag.data[index] = @min(self.fisher_diag.data[index] + g * g, self.fisher_max);
-            }
+    pub fn zeroMomentum(self: *SFD) void {
+        if (!self.initialized) return;
+        var l: usize = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memset(self.momentum_s[l].data, 0.0);
+            @memset(self.momentum_t[l].data, 0.0);
         }
     }
 
     pub fn resetFisher(self: *SFD) void {
-        if (self.initialized) self.fisher_diag.fill(0.0);
-    }
-
-    pub fn clipGradNorm(self: *SFD, grads: []*Tensor, max_norm: f32) f32 {
-        if (!std.math.isFinite(max_norm) or max_norm <= 0.0) return 0.0;
-        var sum_sq: f64 = 0.0;
-        for (grads) |grad| {
-            const norm = grad.normL2();
-            if (std.math.isFinite(norm)) sum_sq += @as(f64, norm) * @as(f64, norm);
+        if (!self.initialized) return;
+        var l: usize = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memset(self.fisher_blocks_s[l].data, 0.0);
+            @memset(self.fisher_blocks_t[l].data, 0.0);
         }
-        const norm: f32 = @floatCast(@sqrt(sum_sq));
-        if (norm > max_norm) for (grads) |grad| grad.mulScalar(max_norm / (norm + self.eps));
-        return norm;
     }
 
-    pub fn ampSchedule(_: *const SFD, step: usize, warmup: usize, total: usize) f32 {
-        if (warmup > 0 and step < warmup) return @as(f32, @floatFromInt(step + 1)) / @as(f32, @floatFromInt(warmup));
-        if (total <= warmup) return 1.0;
-        const progress = @min(@as(f32, @floatFromInt(step -| warmup)) / @as(f32, @floatFromInt(total - warmup)), 1.0);
-        return 0.5 * (1.0 + @cos(std.math.pi * progress));
+    pub fn clipGradNorm(self: *SFD, model: *RSF, max_norm: f32) !f32 {
+        try self.requireModel(model);
+        if (!std.math.isFinite(max_norm) or !(max_norm > 0.0)) return error.InvalidClipThreshold;
+        const pre = try model.gradientL2Norm();
+        if (!std.math.isFinite(pre)) return error.NonFinite;
+        if (pre > max_norm) {
+            const scale = max_norm / (pre + self.cfg.eps);
+            try model.scaleLayerGradients(scale);
+        }
+        return pre;
+    }
+
+    fn flatLen(self: *const SFD) !usize {
+        const plen = try pairLen(self.dim);
+        const blen = try blockLen(self.dim);
+        const masters = try checkedMul(try checkedMul(self.num_layers, plen), 4);
+        const fishers = try checkedMul(try checkedMul(self.num_layers, blen), 2);
+        return std.math.add(usize, masters, fishers) catch return error.Overflow;
+    }
+
+    pub fn exportFlatState(self: *const SFD, allocator: Allocator) ![]f32 {
+        if (!self.initialized) return error.NotInitialized;
+        const plen = try pairLen(self.dim);
+        const blen = try blockLen(self.dim);
+        const total = try self.flatLen();
+        const out = try allocator.alloc(f32, total);
+        errdefer allocator.free(out);
+        var off: usize = 0;
+        var l: usize = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(out[off .. off + plen], self.master_s[l].data[0..plen]);
+            off += plen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(out[off .. off + plen], self.master_t[l].data[0..plen]);
+            off += plen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(out[off .. off + plen], self.momentum_s[l].data[0..plen]);
+            off += plen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(out[off .. off + plen], self.momentum_t[l].data[0..plen]);
+            off += plen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(out[off .. off + blen], self.fisher_blocks_s[l].data[0..blen]);
+            off += blen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(out[off .. off + blen], self.fisher_blocks_t[l].data[0..blen]);
+            off += blen;
+        }
+        if (off != total) return error.InvalidModelState;
+        return out;
+    }
+
+    pub fn importFlatState(self: *SFD, state: []const f32) !void {
+        if (!self.initialized) return error.NotInitialized;
+        const total = try self.flatLen();
+        if (state.len != total) return error.InvalidDataLength;
+        const plen = try pairLen(self.dim);
+        const blen = try blockLen(self.dim);
+        var off: usize = 0;
+        var l: usize = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(self.master_s[l].data[0..plen], state[off .. off + plen]);
+            off += plen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(self.master_t[l].data[0..plen], state[off .. off + plen]);
+            off += plen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(self.momentum_s[l].data[0..plen], state[off .. off + plen]);
+            off += plen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(self.momentum_t[l].data[0..plen], state[off .. off + plen]);
+            off += plen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(self.fisher_blocks_s[l].data[0..blen], state[off .. off + blen]);
+            off += blen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(self.fisher_blocks_t[l].data[0..blen], state[off .. off + blen]);
+            off += blen;
+        }
+    }
+
+    pub fn setExternalFisher(self: *SFD, blocks: []const f32) !void {
+        if (!self.initialized) return error.NotInitialized;
+        const blen = try blockLen(self.dim);
+        const expected = try checkedMul(try checkedMul(self.num_layers, blen), 2);
+        if (blocks.len != expected) return error.InvalidDataLength;
+        var off: usize = 0;
+        var l: usize = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(self.fisher_blocks_s[l].data[0..blen], blocks[off .. off + blen]);
+            off += blen;
+        }
+        l = 0;
+        while (l < self.num_layers) : (l += 1) {
+            @memcpy(self.fisher_blocks_t[l].data[0..blen], blocks[off .. off + blen]);
+            off += blen;
+        }
     }
 
     pub fn saveState(self: *const SFD, path: []const u8) !void {
         if (!self.initialized) return error.NotInitialized;
+        const flat = try self.exportFlatState(self.allocator);
+        defer self.allocator.free(flat);
         var file = try core_io.createFilePath(path, .{ .mode = 0o600 });
         defer file.close();
         var buffered = std.io.bufferedWriter(file.writer());
         const writer = buffered.writer();
-        try writer.writeInt(u32, 0x53464433, .little);
-        try writer.writeInt(u32, @bitCast(self.beta1), .little);
-        try writer.writeInt(u32, @bitCast(self.beta2), .little);
-        try writer.writeInt(u32, @bitCast(self.eps), .little);
-        try writer.writeInt(u32, @bitCast(self.clip_threshold), .little);
-        try writer.writeInt(u32, @bitCast(self.weight_floor), .little);
-        try writer.writeInt(u32, @bitCast(self.fisher_max), .little);
-        try writer.writeInt(u64, @intCast(self.warmup_steps), .little);
-        try writer.writeInt(u64, @intCast(self.param_size), .little);
-        try writer.writeInt(u64, @intCast(self.step_count), .little);
-        try self.fisher_diag.save(writer);
-        try self.momentum_buffer.save(writer);
+        var hasher = std.hash.Crc32.init();
+        try writer.writeInt(u32, SFD4_MAGIC, .little);
+        crcU32LE(&hasher, SFD4_MAGIC);
+        try writer.writeInt(u64, self.model_id, .little);
+        crcU64LE(&hasher, self.model_id);
+        try writer.writeInt(u64, @intCast(self.dim), .little);
+        crcU64LE(&hasher, @intCast(self.dim));
+        try writer.writeInt(u64, @intCast(self.num_layers), .little);
+        crcU64LE(&hasher, @intCast(self.num_layers));
+        try writer.writeInt(u64, self.step_count, .little);
+        crcU64LE(&hasher, self.step_count);
+        try writer.writeInt(u32, @bitCast(self.cfg.beta1), .little);
+        crcF32LE(&hasher, self.cfg.beta1);
+        try writer.writeInt(u32, @bitCast(self.cfg.fisher_gamma), .little);
+        crcF32LE(&hasher, self.cfg.fisher_gamma);
+        try writer.writeInt(u32, @bitCast(self.cfg.fisher_epsilon), .little);
+        crcF32LE(&hasher, self.cfg.fisher_epsilon);
+        const mode_u8: u8 = @intFromEnum(self.cfg.fisher_mode);
+        try writer.writeByte(mode_u8);
+        crcU8(&hasher, mode_u8);
+        try writer.writeInt(u32, @bitCast(self.cfg.eps), .little);
+        crcF32LE(&hasher, self.cfg.eps);
+        try writer.writeInt(u32, @bitCast(self.cfg.clip_threshold), .little);
+        crcF32LE(&hasher, self.cfg.clip_threshold);
+        try writer.writeInt(u32, @bitCast(self.cfg.weight_floor), .little);
+        crcF32LE(&hasher, self.cfg.weight_floor);
+        try writer.writeInt(u32, @bitCast(self.cfg.fisher_max), .little);
+        crcF32LE(&hasher, self.cfg.fisher_max);
+        try writer.writeInt(u64, @intCast(self.cfg.warmup_steps), .little);
+        crcU64LE(&hasher, @intCast(self.cfg.warmup_steps));
+        try writer.writeInt(u32, @bitCast(self.cfg.spectral_target), .little);
+        crcF32LE(&hasher, self.cfg.spectral_target);
+        try writer.writeInt(u32, FISHER_LAYOUT, .little);
+        crcU32LE(&hasher, FISHER_LAYOUT);
+        try writer.writeInt(u64, @intCast(flat.len), .little);
+        crcU64LE(&hasher, @intCast(flat.len));
+        for (flat) |v| {
+            const bits: u32 = @bitCast(v);
+            try writer.writeInt(u32, bits, .little);
+            crcU32LE(&hasher, bits);
+        }
+        try writer.writeInt(u32, hasher.final(), .little);
         try buffered.flush();
     }
 
@@ -1026,9 +888,89 @@ pub const SFD = struct {
         var buffered = std.io.bufferedReader(file.reader());
         const reader = buffered.reader();
         const magic = try reader.readInt(u32, .little);
-        if (magic != 0x53464433) return error.InvalidStateFormat;
+        if (magic == SFD3_MAGIC) {
+            try self.loadLegacyV1(reader);
+            return;
+        }
+        if (magic != SFD4_MAGIC) return error.InvalidStateFormat;
+        var hasher = std.hash.Crc32.init();
+        crcU32LE(&hasher, magic);
+        const model_id = try reader.readInt(u64, .little);
+        crcU64LE(&hasher, model_id);
+        if (model_id != self.model_id) return error.ModelMismatch;
+        const dim_u64 = try reader.readInt(u64, .little);
+        crcU64LE(&hasher, dim_u64);
+        const layers_u64 = try reader.readInt(u64, .little);
+        crcU64LE(&hasher, layers_u64);
+        if (dim_u64 != self.dim or layers_u64 != self.num_layers) return error.ModelMismatch;
+        const loaded_step = try reader.readInt(u64, .little);
+        crcU64LE(&hasher, loaded_step);
+        const beta1: f32 = @bitCast(try reader.readInt(u32, .little));
+        crcF32LE(&hasher, beta1);
+        const fisher_gamma: f32 = @bitCast(try reader.readInt(u32, .little));
+        crcF32LE(&hasher, fisher_gamma);
+        const fisher_epsilon: f32 = @bitCast(try reader.readInt(u32, .little));
+        crcF32LE(&hasher, fisher_epsilon);
+        const mode_u8 = try reader.readByte();
+        crcU8(&hasher, mode_u8);
+        const eps: f32 = @bitCast(try reader.readInt(u32, .little));
+        crcF32LE(&hasher, eps);
+        const clip: f32 = @bitCast(try reader.readInt(u32, .little));
+        crcF32LE(&hasher, clip);
+        const weight_floor: f32 = @bitCast(try reader.readInt(u32, .little));
+        crcF32LE(&hasher, weight_floor);
+        const fisher_max: f32 = @bitCast(try reader.readInt(u32, .little));
+        crcF32LE(&hasher, fisher_max);
+        const warmup_u64 = try reader.readInt(u64, .little);
+        crcU64LE(&hasher, warmup_u64);
+        const spectral_target: f32 = @bitCast(try reader.readInt(u32, .little));
+        crcF32LE(&hasher, spectral_target);
+        const layout = try reader.readInt(u32, .little);
+        crcU32LE(&hasher, layout);
+        if (layout != FISHER_LAYOUT) return error.InvalidStateFormat;
+        const n_u64 = try reader.readInt(u64, .little);
+        crcU64LE(&hasher, n_u64);
+        if (n_u64 > std.math.maxInt(usize)) return error.InvalidStateFormat;
+        const n: usize = @intCast(n_u64);
+        const expected = try self.flatLen();
+        if (n != expected) return error.InvalidStateFormat;
+        const flat = try self.allocator.alloc(f32, n);
+        defer self.allocator.free(flat);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const bits = try reader.readInt(u32, .little);
+            crcU32LE(&hasher, bits);
+            flat[i] = @bitCast(bits);
+        }
+        const stored_crc = try reader.readInt(u32, .little);
+        if (stored_crc != hasher.final()) return error.ChecksumMismatch;
+        const trailing = reader.readByte() catch |err| switch (err) {
+            error.EndOfStream => null,
+            else => return err,
+        };
+        if (trailing != null) return error.InvalidStateFormat;
+        const loaded_cfg = SFDConfig{
+            .beta1 = beta1,
+            .fisher_gamma = fisher_gamma,
+            .fisher_epsilon = fisher_epsilon,
+            .fisher_mode = std.meta.intToEnum(FisherMode, mode_u8) catch return error.InvalidStateFormat,
+            .eps = eps,
+            .clip_threshold = clip,
+            .weight_floor = weight_floor,
+            .fisher_max = fisher_max,
+            .warmup_steps = std.math.cast(usize, warmup_u64) orelse return error.InvalidStateFormat,
+            .spectral_target = spectral_target,
+        };
+        try validateConfig(loaded_cfg);
+        try self.importFlatState(flat);
+        self.cfg = loaded_cfg;
+        self.step_count = loaded_step;
+    }
+
+    fn loadLegacyV1(self: *SFD, reader: anytype) !void {
         const beta1: f32 = @bitCast(try reader.readInt(u32, .little));
         const beta2: f32 = @bitCast(try reader.readInt(u32, .little));
+        _ = beta2;
         const eps: f32 = @bitCast(try reader.readInt(u32, .little));
         const clip: f32 = @bitCast(try reader.readInt(u32, .little));
         const weight_floor: f32 = @bitCast(try reader.readInt(u32, .little));
@@ -1036,381 +978,599 @@ pub const SFD = struct {
         const warmup_u64 = try reader.readInt(u64, .little);
         const size_u64 = try reader.readInt(u64, .little);
         const step_u64 = try reader.readInt(u64, .little);
-        if (!std.math.isFinite(beta1) or beta1 < 0.0 or beta1 >= 1.0 or
-            !std.math.isFinite(beta2) or beta2 < 0.0 or beta2 >= 1.0 or
-            !std.math.isFinite(eps) or eps <= 0.0 or !std.math.isFinite(clip) or clip <= 0.0 or clip > 1.0 or
-            !std.math.isFinite(weight_floor) or weight_floor <= 0.0 or
-            !std.math.isFinite(fisher_max) or fisher_max <= 0.0) return error.InvalidStateFormat;
+        if (!std.math.isFinite(beta1) or beta1 < 0.0 or beta1 >= 1.0) return error.InvalidStateFormat;
+        if (!std.math.isFinite(eps) or eps <= 0.0) return error.InvalidStateFormat;
+        if (!std.math.isFinite(clip) or clip <= 0.0 or clip > 1.0) return error.InvalidStateFormat;
+        if (!std.math.isFinite(weight_floor) or weight_floor <= 0.0) return error.InvalidStateFormat;
+        if (!std.math.isFinite(fisher_max) or fisher_max <= 0.0) return error.InvalidStateFormat;
         if (warmup_u64 > std.math.maxInt(usize) or size_u64 > std.math.maxInt(usize) or step_u64 > std.math.maxInt(usize)) return error.InvalidStateFormat;
-        if (@as(usize, @intCast(size_u64)) != self.param_size) return error.ShapeMismatch;
-
+        const param_size: usize = @intCast(size_u64);
+        const expected = try checkedMul(try checkedMul(self.num_layers, self.dim), 4);
+        if (param_size != expected) return error.InvalidStateFormat;
         var fisher = try Tensor.load(self.allocator, reader);
-        errdefer fisher.deinit();
+        defer fisher.deinit();
         var momentum = try Tensor.load(self.allocator, reader);
-        errdefer momentum.deinit();
-        if (fisher.data.len != self.param_size or momentum.data.len != self.param_size) return error.ShapeMismatch;
+        defer momentum.deinit();
+        if (fisher.data.len != param_size or momentum.data.len != param_size) return error.InvalidStateFormat;
         const trailing = reader.readByte() catch |err| switch (err) {
             error.EndOfStream => null,
             else => return err,
         };
         if (trailing != null) return error.InvalidStateFormat;
-        self.fisher_diag.deinit();
-        self.momentum_buffer.deinit();
-        self.fisher_diag = fisher;
-        self.momentum_buffer = momentum;
-        self.beta1 = beta1;
-        self.beta2 = beta2;
-        self.eps = eps;
-        self.clip_threshold = clip;
-        self.weight_floor = weight_floor;
-        self.fisher_max = fisher_max;
-        self.warmup_steps = @intCast(warmup_u64);
+        const plen = try pairLen(self.dim);
+        var offset: usize = 0;
+        var l: usize = 0;
+        while (l < self.num_layers) : (l += 1) {
+            var d: usize = 0;
+            while (d < self.dim) : (d += 1) {
+                const iw = offset + d * coupling_width + WEIGHT_COLUMN;
+                const ib = offset + d * coupling_width + BIAS_COLUMN;
+                self.fisher_blocks_s[l].data[d * 3 + 0] = capDiag(fisher.data[iw], fisher_max);
+                self.fisher_blocks_s[l].data[d * 3 + 1] = 0.0;
+                self.fisher_blocks_s[l].data[d * 3 + 2] = capDiag(fisher.data[ib], fisher_max);
+                self.momentum_s[l].data[d * coupling_width + WEIGHT_COLUMN] = if (std.math.isFinite(momentum.data[iw])) momentum.data[iw] else 0.0;
+                self.momentum_s[l].data[d * coupling_width + BIAS_COLUMN] = if (std.math.isFinite(momentum.data[ib])) momentum.data[ib] else 0.0;
+            }
+            offset += plen;
+            d = 0;
+            while (d < self.dim) : (d += 1) {
+                const iw = offset + d * coupling_width + WEIGHT_COLUMN;
+                const ib = offset + d * coupling_width + BIAS_COLUMN;
+                self.fisher_blocks_t[l].data[d * 3 + 0] = capDiag(fisher.data[iw], fisher_max);
+                self.fisher_blocks_t[l].data[d * 3 + 1] = 0.0;
+                self.fisher_blocks_t[l].data[d * 3 + 2] = capDiag(fisher.data[ib], fisher_max);
+                self.momentum_t[l].data[d * coupling_width + WEIGHT_COLUMN] = if (std.math.isFinite(momentum.data[iw])) momentum.data[iw] else 0.0;
+                self.momentum_t[l].data[d * coupling_width + BIAS_COLUMN] = if (std.math.isFinite(momentum.data[ib])) momentum.data[ib] else 0.0;
+            }
+            offset += plen;
+        }
+        self.cfg.beta1 = beta1;
+        self.cfg.eps = eps;
+        self.cfg.clip_threshold = clip;
+        self.cfg.weight_floor = weight_floor;
+        self.cfg.fisher_max = fisher_max;
+        self.cfg.warmup_steps = @intCast(warmup_u64);
         self.step_count = @intCast(step_u64);
-    }
-
-    pub fn writeBackFP16(params: *const Tensor, dst: []f16) !void {
-        if (dst.len != params.data.len) return error.ShapeMismatch;
-        for (params.data, dst) |value, *target| target.* = @floatCast(std.math.clamp(value, @as(f32, -65504.0), @as(f32, 65504.0)));
-    }
-    pub fn loadFromFP16(src: []const f16, params: *Tensor) !void {
-        if (src.len != params.data.len) return error.ShapeMismatch;
-        for (src, params.data) |value, *target| target.* = @floatCast(value);
-    }
-
-    pub fn warmStart(self: *SFD, previous: *const Tensor) void {
-        if (!self.initialized) return;
-        const count = @min(previous.data.len, self.fisher_diag.data.len);
-        for (previous.data[0..count], 0..) |value, index| {
-            if (std.math.isFinite(value) and value >= 0.0) self.fisher_diag.data[index] = @min(value, self.fisher_max);
-        }
-    }
-
-    pub fn varianceReduction(self: *SFD, noise_grads: []const Tensor) !void {
-        if (!self.initialized) return error.NotInitialized;
-        if (noise_grads.len == 0) return error.EmptyGrads;
-        var mean = try Tensor.zeros(self.allocator, self.fisher_diag.shape.dims);
-        defer mean.deinit();
-        var second = try Tensor.zeros(self.allocator, self.fisher_diag.shape.dims);
-        defer second.deinit();
-        for (noise_grads) |grad| {
-            const count = @min(grad.data.len, mean.data.len);
-            for (grad.data[0..count], 0..) |g, index| if (std.math.isFinite(g)) {
-                mean.data[index] += g;
-                second.data[index] += g * g;
-            };
-        }
-        const divisor: f32 = @floatFromInt(noise_grads.len);
-        for (self.fisher_diag.data, 0..) |*fisher, index| {
-            const avg = mean.data[index] / divisor;
-            const variance = @max(0.0, second.data[index] / divisor - avg * avg);
-            fisher.* = @max(0.0, fisher.* - variance);
-        }
+        try validateConfig(self.cfg);
     }
 };
 
-test "SFD init and deinit" {
-    const gpa = std.testing.allocator;
-    var sfd = try SFD.init(gpa, 4);
-    defer sfd.deinit();
-
-    try std.testing.expect(sfd.initialized);
-    try std.testing.expectEqual(@as(usize, 4), sfd.param_size);
+pub fn ampSchedule(step: usize, warmup: usize, total: usize) f32 {
+    if (warmup > 0 and step < warmup) return @as(f32, @floatFromInt(step + 1)) / @as(f32, @floatFromInt(warmup));
+    if (total <= warmup) return 1.0;
+    const progress = @min(@as(f32, @floatFromInt(step -| warmup)) / @as(f32, @floatFromInt(total - warmup)), 1.0);
+    return 0.5 * (1.0 + @cos(std.math.pi * progress));
 }
 
-test "SFD update" {
-    const gpa = std.testing.allocator;
-    var sfd = try SFD.init(gpa, 4);
-    defer sfd.deinit();
-
-    const shape = [_]usize{4};
-    var grads = try Tensor.init(gpa, &shape);
-    defer grads.deinit();
-
-    grads.data[0] = 1.0;
-    grads.data[1] = 2.0;
-    grads.data[2] = 3.0;
-    grads.data[3] = 4.0;
-
-    var params = try Tensor.init(gpa, &shape);
-    defer params.deinit();
-
-    params.fill(0.0);
-
-    try sfd.update(&grads, &params, 0.1);
-    for (params.data) |v| {
-        try std.testing.expect(v < 0);
-    }
+pub fn adaptiveLR(grad_norm: f32, param_norm: f32) f32 {
+    if (!std.math.isFinite(grad_norm) or grad_norm < 0.0 or !std.math.isFinite(param_norm) or param_norm < 0.0) return 1.0;
+    const eps: f32 = 1.0e-8;
+    const result = 1.0 / @sqrt(grad_norm / (param_norm + eps) + eps);
+    return if (std.math.isFinite(result)) result else 1.0;
 }
 
-test "Tensor clone" {
-    const gpa = std.testing.allocator;
-    const shape = [_]usize{ 2, 3 };
-    var t1 = try Tensor.init(gpa, &shape);
-    defer t1.deinit();
-
-    t1.fill(5.0);
-
-    var t2 = try t1.clone(gpa);
-    defer t2.deinit();
-
-    try std.testing.expectEqual(t1.data[0], t2.data[0]);
-    try std.testing.expectEqual(false, t2.flags.in_tensor_memory);
+pub fn writeBackFP16(params: *const Tensor, dst: []f16) !void {
+    if (dst.len != params.data.len) return error.ShapeMismatch;
+    for (params.data, dst) |value, *target| target.* = @floatCast(std.math.clamp(value, @as(f32, -65504.0), @as(f32, 65504.0)));
 }
 
-test "KFACBlock init" {
-    const gpa = std.testing.allocator;
-    var block = try KFACBlock.init(gpa, 4, 4, 0.001);
-    defer block.deinit();
-
-    try std.testing.expectEqual(@as(f32, 0.001), block.damping);
-    try std.testing.expectEqual(@as(f32, 0.95), block.alpha);
+pub fn loadFromFP16(src: []const f16, params: *Tensor) !void {
+    if (src.len != params.data.len) return error.ShapeMismatch;
+    for (src, params.data) |value, *target| target.* = @floatCast(value);
 }
 
-test "KFAC precondition uses inverse square roots" {
-    const allocator = std.testing.allocator;
-    var block = try KFACBlock.init(allocator, 2, 2, 0.001);
-    defer block.deinit();
-    var gradient = try Tensor.init(allocator, &.{ 2, 2 });
-    defer gradient.deinit();
-    gradient.fill(1.0);
-    try block.preconditionGradient(&gradient);
-    for (gradient.data) |value| try std.testing.expect(std.math.isFinite(value));
-}
-
-test "SpectralNormalizer normalizeWeights" {
-    const gpa = std.testing.allocator;
-    var normalizer = SpectralNormalizer.init(10);
-    const shape = [_]usize{ 4, 4 };
-    var w = try Tensor.init(gpa, &shape);
-    defer w.deinit();
-    w.fillRandomNormal(0.0, 2.0);
-    try normalizer.normalizeWeights(&w, gpa);
-    const sigma = try w.spectralNorm(gpa, 20, 1e-6);
-    try std.testing.expect(sigma <= normalizer.max_singular_value + 1e-3);
-}
-
-test "SFD fused Fisher update matches persistent momentum Fisher reference" {
-    const gpa = std.testing.allocator;
-    var opt = try SFD.initWithConfig(gpa, 16, .{ .warmup_steps = 0 });
-    defer opt.deinit();
-
-    var grads = try Tensor.init(gpa, &.{16});
-    defer grads.deinit();
-    var params = try Tensor.init(gpa, &.{16});
-    defer params.deinit();
+fn mseBlocked(a: []const f32, b: []const f32) f32 {
+    var acc: f64 = 0.0;
+    const n = @min(a.len, b.len);
+    if (n == 0) return 0.0;
     var i: usize = 0;
-    while (i < 16) : (i += 1) {
-        grads.data[i] = 0.02 * @as(f32, @floatFromInt((i * 11) % 7)) - 0.05;
-        params.data[i] = 0.1 * @as(f32, @floatFromInt((i * 3) % 5)) - 0.2;
+    while (i < n) : (i += 1) {
+        const d = @as(f64, a[i]) - @as(f64, b[i]);
+        acc += d * d;
     }
-    const initial_params = try gpa.dupe(f32, params.data);
-    defer gpa.free(initial_params);
-
-    const lr: f32 = 0.01;
-    try opt.updateFusedFisher(&grads, &params, lr);
-
-    i = 0;
-    while (i < 16) : (i += 1) {
-        const g = grads.data[i];
-        const m = (1.0 - opt.beta1) * g;
-        const f = (1.0 - opt.beta2) * g * g;
-        const m_hat = m / (1.0 - opt.beta1);
-        const f_hat = f / (1.0 - opt.beta2);
-        const parameter_scale = @max(@abs(initial_params[i]), @as(f32, 1e-3));
-        const unclipped = lr * m_hat / (@sqrt(f_hat) + opt.eps);
-        const expected = initial_params[i] - std.math.clamp(unclipped, -opt.clip_threshold * parameter_scale, opt.clip_threshold * parameter_scale);
-        try std.testing.expectApproxEqAbs(expected, params.data[i], 1e-5);
-        try std.testing.expectApproxEqAbs(f, opt.fisher_diag.data[i], 1e-6);
-        try std.testing.expectApproxEqAbs(m, opt.momentum_buffer.data[i], 1e-6);
-    }
+    return @floatCast(acc / @as(f64, @floatFromInt(n)));
 }
 
-test "SFD fused multi-layer update applies per-tensor slices" {
-    const gpa = std.testing.allocator;
-    var opt = try SFD.initWithConfig(gpa, 12, .{ .warmup_steps = 0 });
+fn writeLegacyV1(path: []const u8, param_size: usize, fisher: []const f32, momentum: []const f32, step: u64) !void {
+    var file = try core_io.createFilePath(path, .{ .mode = 0o600 });
+    defer file.close();
+    var buffered = std.io.bufferedWriter(file.writer());
+    const writer = buffered.writer();
+    try writer.writeInt(u32, SFD3_MAGIC, .little);
+    try writer.writeInt(u32, @bitCast(@as(f32, 0.9)), .little);
+    try writer.writeInt(u32, @bitCast(@as(f32, 0.999)), .little);
+    try writer.writeInt(u32, @bitCast(@as(f32, 1.0e-8)), .little);
+    try writer.writeInt(u32, @bitCast(@as(f32, 0.1)), .little);
+    try writer.writeInt(u32, @bitCast(@as(f32, 1.0e-3)), .little);
+    try writer.writeInt(u32, @bitCast(@as(f32, 1.0e6)), .little);
+    try writer.writeInt(u64, 10, .little);
+    try writer.writeInt(u64, @intCast(param_size), .little);
+    try writer.writeInt(u64, step, .little);
+    try writer.writeInt(u64, 1, .little);
+    try writer.writeInt(u64, @intCast(param_size), .little);
+    for (fisher) |v| try writer.writeInt(u32, @bitCast(v), .little);
+    try writer.writeInt(u64, 1, .little);
+    try writer.writeInt(u64, @intCast(param_size), .little);
+    for (momentum) |v| try writer.writeInt(u32, @bitCast(v), .little);
+    try buffered.flush();
+}
+
+test "SFD constructor requires an RSF model and validates config" {
+    const allocator = std.testing.allocator;
+    var rsf = try RSF.initWithConfig(allocator, 4, 2, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var opt = try SFD.init(allocator, &rsf);
     defer opt.deinit();
-
-    var g1 = try Tensor.init(gpa, &.{8});
-    defer g1.deinit();
-    var g2 = try Tensor.init(gpa, &.{4});
-    defer g2.deinit();
-    var p1 = try Tensor.init(gpa, &.{8});
-    defer p1.deinit();
-    var p2 = try Tensor.init(gpa, &.{4});
-    defer p2.deinit();
-    p1.fill(0.05);
-    p2.fill(-0.05);
-    g1.fill(0.1);
-    g2.fill(-0.1);
-
-    const grads = [_]Tensor{ g1, g2 };
-    var params_list = [_]*Tensor{ &p1, &p2 };
-    try opt.updateFusedFisherMulti(&grads, &params_list, 0.01);
-    try std.testing.expectEqual(@as(usize, 1), opt.step_count);
-
-    const m = (1.0 - opt.beta1) * 0.1;
-    const f = (1.0 - opt.beta2) * 0.01;
-    const raw_update = 0.01 * (m / (1.0 - opt.beta1)) / (@sqrt(f / (1.0 - opt.beta2)) + opt.eps);
-    const expected1 = 0.05 - std.math.clamp(raw_update, -opt.clip_threshold * 0.05, opt.clip_threshold * 0.05);
-    try std.testing.expectApproxEqAbs(expected1, p1.data[0], 1e-5);
+    try std.testing.expectEqual(rsf.id, opt.model_id);
+    try std.testing.expectEqual(@as(usize, 4), opt.dim);
+    try std.testing.expectEqual(@as(usize, 2), opt.num_layers);
+    try std.testing.expectEqual(@as(u64, 0), opt.step_count);
+    try std.testing.expectError(error.InvalidBeta1, SFD.initWithConfig(allocator, &rsf, .{ .beta1 = 1.0 }));
+    try std.testing.expectError(error.InvalidFisherGamma, SFD.initWithConfig(allocator, &rsf, .{ .fisher_gamma = 1.0 }));
+    try std.testing.expectError(error.InvalidFisherEpsilon, SFD.initWithConfig(allocator, &rsf, .{ .fisher_epsilon = 0.0 }));
+    try std.testing.expectError(error.InvalidClipThreshold, SFD.initWithConfig(allocator, &rsf, .{ .clip_threshold = 0.0 }));
+    try std.testing.expectError(error.InvalidSpectralTarget, SFD.initWithConfig(allocator, &rsf, .{ .spectral_target = 0.0 }));
+    var other = try RSF.initWithConfig(allocator, 4, 2, .{ .global_diffusion = false });
+    defer other.deinit();
+    try std.testing.expectError(error.ModelMismatch, opt.step(&other, 1.0e-3));
 }
 
-test "SFD substitutes zero for non-finite gradients and decays state" {
-    const allocator = std.testing.allocator;
-    var optimizer = try SFD.initWithConfig(allocator, 2, .{ .warmup_steps = 0 });
-    defer optimizer.deinit();
-    var gradients = try Tensor.init(allocator, &.{2});
-    defer gradients.deinit();
-    var parameters = try Tensor.init(allocator, &.{2});
-    defer parameters.deinit();
-    gradients.data[0] = 0.25;
-    gradients.data[1] = 0.5;
-    parameters.fill(0.1);
-    try optimizer.updateFusedFisher(&gradients, &parameters, 0.01);
-
-    const old_parameter = parameters.data[1];
-    const old_momentum = optimizer.momentum_buffer.data[1];
-    const old_fisher = optimizer.fisher_diag.data[1];
-    gradients.data[0] = 0.1;
-    gradients.data[1] = std.math.nan(f32);
-    try optimizer.updateFusedFisher(&gradients, &parameters, 0.01);
-    try std.testing.expectEqual(old_parameter, parameters.data[1]);
-    try std.testing.expectApproxEqAbs(old_momentum * optimizer.beta1, optimizer.momentum_buffer.data[1], 1e-7);
-    try std.testing.expectApproxEqAbs(old_fisher * optimizer.beta2, optimizer.fisher_diag.data[1], 1e-7);
-}
-
-test "SFD fused multi rejects gradient count mismatch" {
-    const allocator = std.testing.allocator;
-    var optimizer = try SFD.initWithConfig(allocator, 2, .{ .warmup_steps = 0 });
-    defer optimizer.deinit();
-    var first = try Tensor.init(allocator, &.{1});
-    defer first.deinit();
-    var second = try Tensor.init(allocator, &.{1});
-    defer second.deinit();
-    var gradient = try Tensor.init(allocator, &.{1});
-    defer gradient.deinit();
-    const gradients = [_]Tensor{gradient};
-    var parameters = [_]*Tensor{ &first, &second };
-    try std.testing.expectError(error.GradientCountMismatch, optimizer.updateFusedFisherMulti(&gradients, &parameters, 0.01));
-}
-
-test "SFD FP16 writeback clamps to representable range" {
-    const gpa = std.testing.allocator;
-    var params = try Tensor.init(gpa, &.{4});
-    defer params.deinit();
-    params.data[0] = 70000.0;
-    params.data[1] = -70000.0;
-    params.data[2] = 0.5;
-    params.data[3] = -2.25;
-
-    var out: [4]f16 = undefined;
-    try SFD.writeBackFP16(&params, &out);
-    try std.testing.expectApproxEqAbs(@as(f32, 65504.0), @as(f32, @floatCast(out[0])), 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, -65504.0), @as(f32, @floatCast(out[1])), 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), @as(f32, @floatCast(out[2])), 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, -2.25), @as(f32, @floatCast(out[3])), 1e-3);
-
-    var back = try Tensor.init(gpa, &.{4});
-    defer back.deinit();
-    try SFD.loadFromFP16(&out, &back);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), back.data[2], 1e-3);
-}
-
-test "SFD configurable weight floor bounds first zero-weight update" {
-    const allocator = std.testing.allocator;
-    var optimizer = try SFD.initWithConfig(allocator, 1, .{
-        .beta1 = 0.0,
-        .beta2 = 0.0,
-        .clip_threshold = 0.1,
-        .weight_floor = 0.25,
-        .warmup_steps = 0,
-    });
-    defer optimizer.deinit();
-    var gradient = try Tensor.init(allocator, &.{1});
-    defer gradient.deinit();
-    var parameter = try Tensor.zeros(allocator, &.{1});
-    defer parameter.deinit();
-    gradient.data[0] = 1.0;
-    try optimizer.updateFusedFisher(&gradient, &parameter, 1.0);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.025), parameter.data[0], 1e-7);
-}
-
-test "SFD3 persists complete optimizer state" {
-    const allocator = std.testing.allocator;
-    var source = try SFD.initWithConfig(allocator, 2, .{
-        .beta1 = 0.0,
-        .beta2 = 0.0,
-        .eps = 2e-7,
-        .clip_threshold = 0.07,
-        .weight_floor = 0.125,
-        .fisher_max = 17.0,
-        .warmup_steps = 3,
-    });
-    defer source.deinit();
-    source.step_count = 9;
-    source.fisher_diag.data[0] = 0.25;
-    source.fisher_diag.data[1] = 0.5;
-    source.momentum_buffer.data[0] = -0.75;
-    source.momentum_buffer.data[1] = 1.25;
-
-    var temporary = std.testing.tmpDir(.{});
-    defer temporary.cleanup();
-    const directory_path = try temporary.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(directory_path);
-    const state_path = try std.fs.path.join(allocator, &.{ directory_path, "optimizer.sfd" });
-    defer allocator.free(state_path);
-    try source.saveState(state_path);
-
-    var restored = try SFD.init(allocator, 2);
-    defer restored.deinit();
-    try restored.loadState(state_path);
-    try std.testing.expectEqual(source.beta1, restored.beta1);
-    try std.testing.expectEqual(source.beta2, restored.beta2);
-    try std.testing.expectEqual(source.eps, restored.eps);
-    try std.testing.expectEqual(source.clip_threshold, restored.clip_threshold);
-    try std.testing.expectEqual(source.weight_floor, restored.weight_floor);
-    try std.testing.expectEqual(source.fisher_max, restored.fisher_max);
-    try std.testing.expectEqual(source.warmup_steps, restored.warmup_steps);
-    try std.testing.expectEqual(source.step_count, restored.step_count);
-    try std.testing.expectEqualSlices(f32, source.fisher_diag.data, restored.fisher_diag.data);
-    try std.testing.expectEqualSlices(f32, source.momentum_buffer.data, restored.momentum_buffer.data);
-}
-
-test "weighted gradient reduction produces identical local SFD state" {
-    const allocator = std.testing.allocator;
-    const config = SFDConfig{
-        .beta1 = 0.8,
-        .beta2 = 0.95,
-        .eps = 1e-7,
-        .clip_threshold = 0.08,
-        .weight_floor = 0.02,
-        .warmup_steps = 0,
-    };
-    var first_optimizer = try SFD.initWithConfig(allocator, 3, config);
-    defer first_optimizer.deinit();
-    var second_optimizer = try SFD.initWithConfig(allocator, 3, config);
-    defer second_optimizer.deinit();
-    var first_parameters = try Tensor.init(allocator, &.{3});
-    defer first_parameters.deinit();
-    var second_parameters = try Tensor.init(allocator, &.{3});
-    defer second_parameters.deinit();
-    first_parameters.data[0] = 0.2;
-    first_parameters.data[1] = -0.4;
-    first_parameters.data[2] = 0.0;
-    @memcpy(second_parameters.data, first_parameters.data);
-    const first_local = [_]f32{ 0.5, -0.25, 0.125 };
-    const second_local = [_]f32{ -0.1, 0.75, -0.5 };
-    const first_fraction: f32 = 0.25;
-    const second_fraction: f32 = 0.75;
-    var reduced_gradient = try Tensor.init(allocator, &.{3});
-    defer reduced_gradient.deinit();
-    for (reduced_gradient.data, 0..) |*value, index| {
-        value.* = first_local[index] * first_fraction + second_local[index] * second_fraction;
+test "SFD block inverse square root reconstructs the identity" {
+    var seed: u64 = 0xC0FFEE;
+    var k: usize = 0;
+    while (k < 10000) : (k += 1) {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const ua: f64 = @as(f64, @floatFromInt(seed >> 40)) / 16777216.0;
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const uc: f64 = @as(f64, @floatFromInt(seed >> 40)) / 16777216.0;
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const ub: f64 = @as(f64, @floatFromInt(seed >> 40)) / 16777216.0;
+        const A = 0.15 + 4.5 * ua;
+        const C = 0.15 + 4.5 * uc;
+        const bound = 0.9 * @sqrt(A * C);
+        const B = (2.0 * ub - 1.0) * bound;
+        if (!(A * C - B * B > 1.0e-8)) continue;
+        const inv = blockInverseSqrt(A, B, C, 0.0);
+        try std.testing.expect(inv.inv00 > 0.0);
+        try std.testing.expect(inv.inv11 > 0.0);
+        try std.testing.expect(inv.inv00 * inv.inv11 - inv.inv01 * inv.inv01 > 0.0);
+        const p00 = inv.inv00 * A + inv.inv01 * B;
+        const p01 = inv.inv00 * B + inv.inv01 * C;
+        const p10 = inv.inv01 * A + inv.inv11 * B;
+        const p11 = inv.inv01 * B + inv.inv11 * C;
+        const q00 = p00 * inv.inv00 + p01 * inv.inv01;
+        const q01 = p00 * inv.inv01 + p01 * inv.inv11;
+        const q10 = p10 * inv.inv00 + p11 * inv.inv01;
+        const q11 = p10 * inv.inv01 + p11 * inv.inv11;
+        const n00 = q00 - 1.0;
+        const n01 = q01;
+        const n10 = q10;
+        const n11 = q11 - 1.0;
+        const a = n00 * n00 + n10 * n10;
+        const b = n00 * n01 + n10 * n11;
+        const c = n01 * n01 + n11 * n11;
+        const disc = (a - c) * (a - c) + 4.0 * b * b;
+        const lam = 0.5 * (a + c + @sqrt(if (disc > 0.0) disc else 0.0));
+        const spec = @sqrt(if (lam > 0.0) lam else 0.0);
+        try std.testing.expect(spec < 1.0e-5);
     }
-    try first_optimizer.update(&reduced_gradient, &first_parameters, 0.003);
-    try second_optimizer.update(&reduced_gradient, &second_parameters, 0.003);
-    try std.testing.expectEqualSlices(f32, first_parameters.data, second_parameters.data);
-    try std.testing.expectEqualSlices(f32, first_optimizer.momentum_buffer.data, second_optimizer.momentum_buffer.data);
-    try std.testing.expectEqualSlices(f32, first_optimizer.fisher_diag.data, second_optimizer.fisher_diag.data);
-    try std.testing.expectEqual(first_optimizer.step_count, second_optimizer.step_count);
+}
+
+test "SFD block inverse square root degenerates to the diagonal resolvent" {
+    const samples = [_][2]f64{
+        .{ 0.25, 1.5 },
+        .{ 2.0, 0.5 },
+        .{ 4.0, 4.0 },
+        .{ 0.01, 9.0 },
+        .{ 7.5, 0.2 },
+    };
+    for (samples) |pair| {
+        const inv = blockInverseSqrt(pair[0], 0.0, pair[1], 0.0);
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0 / @sqrt(pair[0])), inv.inv00, 1.0e-6);
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0 / @sqrt(pair[1])), inv.inv11, 1.0e-6);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.0), inv.inv01, 1.0e-12);
+    }
+}
+
+test "SFD first damped step from zero Fisher is well-defined" {
+    const inv = blockInverseSqrt(0.0, 0.0, 0.0, 1.0e-8);
+    try std.testing.expect(std.math.isFinite(inv.inv00));
+    try std.testing.expect(std.math.isFinite(inv.inv11));
+    try std.testing.expectApproxEqAbs(inv.inv00, inv.inv11, 1.0e-12);
+    try std.testing.expect(inv.inv00 > 0.0);
+}
+
+test "SFD three FisherMode paths run and gauss-newton records scale curvature" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const dim2: usize = dim * 2;
+    const batch: usize = 3;
+    var rsf = try RSF.initWithConfig(allocator, dim, 1, .{ .global_diffusion = false, .grad_mean = false });
+    defer rsf.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim2 }, -0.3, 0.3, 44001);
+    defer x.deinit();
+    var y = try Tensor.init(allocator, &[_]usize{ batch, dim2 });
+    defer y.deinit();
+    @memcpy(y.data, x.data);
+    try rsf.forward(&y);
+    var go = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim2 }, -0.2, 0.2, 44002);
+    defer go.deinit();
+    var gx = try Tensor.init(allocator, &[_]usize{ batch, dim2 });
+    defer gx.deinit();
+    try rsf.zeroGradients();
+    try rsf.backwardWithLogDet(&go, &x, &y, &gx, 1.0);
+    var gn_opt = try SFD.initWithConfig(allocator, &rsf, .{ .fisher_mode = .rsf_gauss_newton, .warmup_steps = 0, .fisher_gamma = 0.5 });
+    defer gn_opt.deinit();
+    const stats_gn = try gn_opt.step(&rsf, 1.0e-3);
+    try std.testing.expectEqual(@as(u64, 1), stats_gn.step);
+    try std.testing.expect(stats_gn.grad_global_norm >= 0.0);
+    try std.testing.expect(std.math.isFinite(stats_gn.fisher_block_mean));
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        var b: usize = 0;
+        var acc: f64 = 0.0;
+        while (b < batch) : (b += 1) acc += @as(f64, x.data[b * dim2 + dim + d]) * @as(f64, x.data[b * dim2 + dim + d]);
+        const Fww = gn_opt.fisher_blocks_s[0].data[d * 3 + 0];
+        try std.testing.expect(Fww + 1.0e-12 >= @as(f32, @floatCast((acc / @as(f64, @floatFromInt(batch))) * 0.5)));
+        try std.testing.expect(Fww >= 0.0);
+        try std.testing.expect(gn_opt.fisher_blocks_s[0].data[d * 3 + 2] >= 0.0);
+    }
+    var grad_opt = try SFD.initWithConfig(allocator, &rsf, .{ .fisher_mode = .gradient, .warmup_steps = 0 });
+    defer grad_opt.deinit();
+    _ = try grad_opt.step(&rsf, 1.0e-3);
+    var ext_opt = try SFD.initWithConfig(allocator, &rsf, .{ .fisher_mode = .external, .warmup_steps = 0 });
+    defer ext_opt.deinit();
+    const blen = dim * 3;
+    const ext = try allocator.alloc(f32, blen * 2);
+    defer allocator.free(ext);
+    @memset(ext, 0.25);
+    try ext_opt.setExternalFisher(ext);
+    const before = ext_opt.fisher_blocks_s[0].data[0];
+    _ = try ext_opt.step(&rsf, 1.0e-3);
+    try std.testing.expectEqual(before, ext_opt.fisher_blocks_s[0].data[0]);
+}
+
+test "SFD spectral norm stays inside the closed-form bound after steps" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 6;
+    const dim2: usize = dim * 2;
+    var rsf = try RSF.initWithConfig(allocator, dim, 2, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var opt = try SFD.initWithConfig(allocator, &rsf, .{ .warmup_steps = 0, .spectral_target = 0.9 });
+    defer opt.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ 2, dim2 }, -0.4, 0.4, 55001);
+    defer x.deinit();
+    var step_i: usize = 0;
+    while (step_i < 8) : (step_i += 1) {
+        var y = try Tensor.init(allocator, &[_]usize{ 2, dim2 });
+        defer y.deinit();
+        @memcpy(y.data, x.data);
+        try rsf.forward(&y);
+        var go = try Tensor.randomUniform(allocator, &[_]usize{ 2, dim2 }, -0.3, 0.3, 55002 + step_i);
+        defer go.deinit();
+        var gx = try Tensor.init(allocator, &[_]usize{ 2, dim2 });
+        defer gx.deinit();
+        try rsf.zeroGradients();
+        try rsf.backward(&go, &x, &y, &gx);
+        _ = try opt.step(&rsf, 5.0e-3);
+    }
+    const plen = dim * 2;
+    const s_buf = try allocator.alloc(f32, plen);
+    defer allocator.free(s_buf);
+    const t_buf = try allocator.alloc(f32, plen);
+    defer allocator.free(t_buf);
+    var l: usize = 0;
+    while (l < 2) : (l += 1) {
+        try rsf.readLayerWeights(l, s_buf, t_buf);
+        const ss = try tensor_mod.exactSpectralNormRank2(s_buf, dim);
+        const st = try tensor_mod.exactSpectralNormRank2(t_buf, dim);
+        try std.testing.expect(ss <= 0.9 * 1.05 + 1.0e-6);
+        try std.testing.expect(st <= 0.9 * 1.05 + 1.0e-6);
+    }
+}
+
+test "SFD invertibility is preserved after one hundred steps" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const dim2: usize = dim * 2;
+    var rsf = try RSF.initWithConfig(allocator, dim, 2, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var opt = try SFD.initWithConfig(allocator, &rsf, .{ .warmup_steps = 0 });
+    defer opt.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ 2, dim2 }, -0.25, 0.25, 66001);
+    defer x.deinit();
+    var step_i: usize = 0;
+    while (step_i < 100) : (step_i += 1) {
+        var y = try Tensor.init(allocator, &[_]usize{ 2, dim2 });
+        defer y.deinit();
+        @memcpy(y.data, x.data);
+        try rsf.forward(&y);
+        var go = try Tensor.randomUniform(allocator, &[_]usize{ 2, dim2 }, -0.2, 0.2, 66002 + step_i);
+        defer go.deinit();
+        var gx = try Tensor.init(allocator, &[_]usize{ 2, dim2 });
+        defer gx.deinit();
+        try rsf.zeroGradients();
+        try rsf.backward(&go, &x, &y, &gx);
+        _ = try opt.step(&rsf, 1.0e-3);
+    }
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ 2, dim }, -0.3, 0.3, 66011);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ 2, dim }, -0.3, 0.3, 66012);
+    defer x2.deinit();
+    var state = try rsf_mod.RSFLatentState.fromHalves(allocator, &rsf, &x1, &x2);
+    defer state.deinit();
+    const rel = try state.roundtripError(&rsf, allocator);
+    try std.testing.expect(rel <= 1.0e-3);
+}
+
+test "SFD loss at step 200 is below 60 percent of the loss at step 10" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 8;
+    const dim2: usize = dim * 2;
+    const batch: usize = 4;
+    var rsf = try RSF.initWithConfig(allocator, dim, 2, .{ .global_diffusion = false, .grad_mean = true });
+    defer rsf.deinit();
+    var opt = try SFD.initWithConfig(allocator, &rsf, .{ .warmup_steps = 0, .fisher_mode = .rsf_gauss_newton, .clip_threshold = 0.25 });
+    defer opt.deinit();
+    var input = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim2 }, -0.4, 0.4, 77001);
+    defer input.deinit();
+    var target = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim2 }, -0.4, 0.4, 77002);
+    defer target.deinit();
+    var loss10: f32 = 0.0;
+    var loss200: f32 = 0.0;
+    var step_i: usize = 1;
+    while (step_i <= 200) : (step_i += 1) {
+        var y = try Tensor.init(allocator, &[_]usize{ batch, dim2 });
+        defer y.deinit();
+        @memcpy(y.data, input.data);
+        try rsf.forward(&y);
+        const loss = mseBlocked(y.data, target.data);
+        if (step_i == 10) loss10 = loss;
+        if (step_i == 200) loss200 = loss;
+        var go = try Tensor.init(allocator, &[_]usize{ batch, dim2 });
+        defer go.deinit();
+        const scale: f32 = 2.0 / @as(f32, @floatFromInt(batch * dim2));
+        var k: usize = 0;
+        while (k < batch * dim2) : (k += 1) go.data[k] = scale * (y.data[k] - target.data[k]);
+        var gx = try Tensor.init(allocator, &[_]usize{ batch, dim2 });
+        defer gx.deinit();
+        try rsf.zeroGradients();
+        try rsf.backwardWithLogDet(&go, &input, &y, &gx, 0.05);
+        _ = try opt.clipGradNorm(&rsf, 5.0);
+        _ = try opt.step(&rsf, 2.0e-2);
+    }
+    try std.testing.expect(loss10 > 0.0);
+    try std.testing.expect(loss200 < 0.6 * loss10);
+}
+
+test "SFD fisher_max caps each block component" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 2;
+    const dim2: usize = dim * 2;
+    var rsf = try RSF.initWithConfig(allocator, dim, 1, .{ .global_diffusion = false, .grad_mean = false });
+    defer rsf.deinit();
+    var opt = try SFD.initWithConfig(allocator, &rsf, .{ .warmup_steps = 0, .fisher_max = 0.5, .fisher_mode = .gradient, .fisher_gamma = 0.0 });
+    defer opt.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ 2, dim2 }, -1.0, 1.0, 88001);
+    defer x.deinit();
+    var y = try Tensor.init(allocator, &[_]usize{ 2, dim2 });
+    defer y.deinit();
+    @memcpy(y.data, x.data);
+    try rsf.forward(&y);
+    var go = try Tensor.randomUniform(allocator, &[_]usize{ 2, dim2 }, -2.0, 2.0, 88002);
+    defer go.deinit();
+    var gx = try Tensor.init(allocator, &[_]usize{ 2, dim2 });
+    defer gx.deinit();
+    try rsf.zeroGradients();
+    try rsf.backward(&go, &x, &y, &gx);
+    _ = try opt.step(&rsf, 1.0e-4);
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        try std.testing.expect(opt.fisher_blocks_s[0].data[d * 3 + 0] <= 0.5 + 1.0e-6);
+        try std.testing.expect(opt.fisher_blocks_s[0].data[d * 3 + 2] <= 0.5 + 1.0e-6);
+        try std.testing.expect(@abs(opt.fisher_blocks_s[0].data[d * 3 + 1]) <= 0.5 + 1.0e-6);
+        try std.testing.expect(opt.fisher_blocks_t[0].data[d * 3 + 0] <= 0.5 + 1.0e-6);
+        try std.testing.expect(opt.fisher_blocks_t[0].data[d * 3 + 2] <= 0.5 + 1.0e-6);
+    }
+}
+
+test "SFD flat state round-trips and rejects a foreign model" {
+    const allocator = std.testing.allocator;
+    var rsf = try RSF.initWithConfig(allocator, 4, 2, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var opt = try SFD.initWithConfig(allocator, &rsf, .{ .warmup_steps = 0 });
+    defer opt.deinit();
+    var x = try Tensor.randomUniform(allocator, &[_]usize{ 1, 8 }, -0.2, 0.2, 99001);
+    defer x.deinit();
+    var y = try Tensor.init(allocator, &[_]usize{ 1, 8 });
+    defer y.deinit();
+    @memcpy(y.data, x.data);
+    try rsf.forward(&y);
+    var go = try Tensor.randomUniform(allocator, &[_]usize{ 1, 8 }, -0.2, 0.2, 99002);
+    defer go.deinit();
+    var gx = try Tensor.init(allocator, &[_]usize{ 1, 8 });
+    defer gx.deinit();
+    try rsf.zeroGradients();
+    try rsf.backward(&go, &x, &y, &gx);
+    _ = try opt.step(&rsf, 1.0e-3);
+    const flat = try opt.exportFlatState(allocator);
+    defer allocator.free(flat);
+    var clone = try SFD.init(allocator, &rsf);
+    defer clone.deinit();
+    try clone.importFlatState(flat);
+    try std.testing.expectEqual(opt.master_s[0].data[0], clone.master_s[0].data[0]);
+    try std.testing.expectEqual(opt.fisher_blocks_t[1].data[3], clone.fisher_blocks_t[1].data[3]);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const path = try std.fs.path.join(allocator, &.{ dir_path, "sfd4.bin" });
+    defer allocator.free(path);
+    try opt.saveState(path);
+    var restored = try SFD.init(allocator, &rsf);
+    defer restored.deinit();
+    try restored.loadState(path);
+    try std.testing.expectEqual(opt.step_count, restored.step_count);
+    try std.testing.expectEqual(opt.master_t[0].data[1], restored.master_t[0].data[1]);
+    var other = try RSF.initWithConfig(allocator, 4, 2, .{ .global_diffusion = false });
+    defer other.deinit();
+    var foreign = try SFD.init(allocator, &other);
+    defer foreign.deinit();
+    try std.testing.expectError(error.ModelMismatch, foreign.loadState(path));
+}
+
+test "SFD loads and promotes a legacy v1 diagonal checkpoint" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 2;
+    const layers: usize = 1;
+    var rsf = try RSF.initWithConfig(allocator, dim, layers, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var opt = try SFD.init(allocator, &rsf);
+    defer opt.deinit();
+    const param_size: usize = layers * dim * 4;
+    var fisher = [_]f32{0.0} ** 16;
+    var momentum = [_]f32{0.0} ** 16;
+    try std.testing.expectEqual(param_size, @as(usize, 8));
+    fisher[0] = 1.25;
+    fisher[1] = 0.5;
+    fisher[2] = 0.75;
+    fisher[3] = 0.25;
+    fisher[4] = 2.0;
+    fisher[5] = 0.1;
+    fisher[6] = 0.3;
+    fisher[7] = 0.4;
+    momentum[0] = 0.01;
+    momentum[3] = -0.02;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const path = try std.fs.path.join(allocator, &.{ dir_path, "sfd3.bin" });
+    defer allocator.free(path);
+    try writeLegacyV1(path, param_size, fisher[0..param_size], momentum[0..param_size], 7);
+    try opt.loadState(path);
+    try std.testing.expectEqual(@as(u64, 7), opt.step_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), opt.fisher_blocks_s[0].data[0], 1.0e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), opt.fisher_blocks_s[0].data[1], 1.0e-12);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), opt.fisher_blocks_s[0].data[2], 1.0e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), opt.fisher_blocks_t[0].data[0], 1.0e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.01), opt.momentum_s[0].data[0], 1.0e-6);
+    try std.testing.expectError(error.InvalidStateFormat, blk: {
+        try writeLegacyV1(path, 3, fisher[0..3], momentum[0..3], 1);
+        break :blk opt.loadState(path);
+    });
+}
+
+test "SFD KFACBlock matches an explicit 2x2 inverse-sqrt reference" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 3;
+    var rsf = try RSF.initWithConfig(allocator, dim, 1, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var kfac = try KFACBlock.init(allocator, &rsf, 0, 1.0e-4);
+    defer kfac.deinit();
+    const batch: usize = 5;
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.5, 0.5, 10101);
+    defer x2.deinit();
+    var dy = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim * 2 }, -0.5, 0.5, 10102);
+    defer dy.deinit();
+    try kfac.updateStatistics(&x2, &dy);
+    var grad = try Tensor.randomUniform(allocator, &[_]usize{ dim, 2 }, -0.4, 0.4, 10103);
+    defer grad.deinit();
+    var expected = try Tensor.init(allocator, &[_]usize{ dim, 2 });
+    defer expected.deinit();
+    @memcpy(expected.data, grad.data);
+    const lambda: f64 = 1.0e-4;
+    const mix: f64 = 1.0 - 0.95;
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        var sx2: f64 = 0.0;
+        var sx: f64 = 0.0;
+        var s22: f64 = 0.0;
+        var s12: f64 = 0.0;
+        var s11: f64 = 0.0;
+        var b: usize = 0;
+        while (b < batch) : (b += 1) {
+            const xv: f64 = x2.data[b * dim + d];
+            const d1: f64 = dy.data[b * dim * 2 + d];
+            const d2: f64 = dy.data[b * dim * 2 + dim + d];
+            sx2 += xv * xv;
+            sx += xv;
+            s22 += d2 * d2;
+            s12 += d1 * d2;
+            s11 += d1 * d1;
+        }
+        const inv_b = 1.0 / @as(f64, @floatFromInt(batch));
+        const A = blockInverseSqrt(mix * sx2 * inv_b, mix * sx * inv_b, mix * 1.0, lambda);
+        const G = blockInverseSqrt(mix * s22 * inv_b, mix * s12 * inv_b, mix * s11 * inv_b, lambda);
+        const gw: f64 = expected.data[d * 2 + 0];
+        const gb: f64 = expected.data[d * 2 + 1];
+        const w1 = applyBlockVec(A, gw, gb);
+        const w2 = applyBlockVec(G, w1.y0, w1.y1);
+        expected.data[d * 2 + 0] = @floatCast(w2.y0);
+        expected.data[d * 2 + 1] = @floatCast(w2.y1);
+    }
+    try kfac.preconditionGradient(&grad);
+    d = 0;
+    while (d < dim * 2) : (d += 1) {
+        try std.testing.expectApproxEqAbs(expected.data[d], grad.data[d], 1.0e-5);
+    }
+}
+
+test "SFD SpectralNormalizer uses the exact rank-2 form on coupling weights" {
+    const allocator = std.testing.allocator;
+    var weights = try Tensor.randomUniform(allocator, &[_]usize{ 8, 2 }, -1.5, 1.5, 11111);
+    defer weights.deinit();
+    var normer = SpectralNormalizer.initWithConfig(.{ .max_singular_value = 0.9, .power_iterations = 100 });
+    try normer.normalizeWeights(&weights, allocator);
+    const sigma = try tensor_mod.exactSpectralNormRank2(weights.data, 8);
+    try std.testing.expect(sigma <= 0.9 + 1.0e-5);
+    var dense = try Tensor.randomUniform(allocator, &[_]usize{ 4, 5 }, -0.5, 0.5, 11112);
+    defer dense.deinit();
+    try normer.normalizeWeights(&dense, allocator);
+    const out = try allocator.alloc(f16, weights.data.len);
+    defer allocator.free(out);
+    try writeBackFP16(&weights, out);
+    var round = try Tensor.init(allocator, &[_]usize{ 8, 2 });
+    defer round.deinit();
+    try round.fill(0.0);
+    try loadFromFP16(out, &round);
+    try std.testing.expectApproxEqAbs(weights.data[0], round.data[0], 1.0e-2);
+    try std.testing.expect(std.math.isFinite(ampSchedule(0, 10, 100)));
+    try std.testing.expect(std.math.isFinite(adaptiveLR(1.0, 2.0)));
+}
+
+test "SFD zeroMomentum and resetFisher clear state" {
+    const allocator = std.testing.allocator;
+    var rsf = try RSF.initWithConfig(allocator, 3, 1, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var opt = try SFD.initWithConfig(allocator, &rsf, .{ .warmup_steps = 0 });
+    defer opt.deinit();
+    opt.momentum_s[0].data[0] = 0.3;
+    opt.fisher_blocks_t[0].data[1] = 0.7;
+    opt.zeroMomentum();
+    opt.resetFisher();
+    try std.testing.expectEqual(@as(f32, 0.0), opt.momentum_s[0].data[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), opt.fisher_blocks_t[0].data[1]);
+}
+
+test "SFD F_wb tracks gradient correlation sign" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 2;
+    var rsf = try RSF.initWithConfig(allocator, dim, 1, .{ .global_diffusion = false, .grad_mean = false });
+    defer rsf.deinit();
+    try rsf.ensureGradients();
+    const plen = dim * 2;
+    const s_g = try allocator.alloc(f32, plen);
+    defer allocator.free(s_g);
+    const t_g = try allocator.alloc(f32, plen);
+    defer allocator.free(t_g);
+    @memset(s_g, 0.0);
+    @memset(t_g, 0.0);
+    s_g[0] = 0.5;
+    s_g[1] = 0.25;
+    try rsf.accumulateLayerGradients(0, s_g, t_g);
+    var opt = try SFD.initWithConfig(allocator, &rsf, .{ .warmup_steps = 0, .fisher_mode = .gradient, .fisher_gamma = 0.0 });
+    defer opt.deinit();
+    _ = try opt.step(&rsf, 1.0e-6);
+    try std.testing.expect(opt.fisher_blocks_s[0].data[1] > 0.0);
 }
