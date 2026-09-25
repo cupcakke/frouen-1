@@ -758,6 +758,8 @@ const RSFCore = struct {
     cpu_weight_version: u64,
     f16_buf: ?[]f16,
     oftb: OFTB,
+    layer_applications: std.atomic.Value(usize),
+    frontier_depth: std.atomic.Value(usize),
 };
 const ModelRegistryEntry = struct {
     core: *RSFCore,
@@ -927,6 +929,466 @@ fn inverseLogDetOnCore(core: *const RSFCore, y: *Tensor, logdet_per_row: []f32) 
     }
 }
 
+const MidpointSplit = struct {
+    forward_layers: usize,
+    backward_layers: usize,
+};
+fn midpointSplitLayers(layer_count: usize) MidpointSplit {
+    const forward_layers = layer_count / 2;
+    return .{ .forward_layers = forward_layers, .backward_layers = layer_count - forward_layers };
+}
+fn noteLayerApplication(core: *const RSFCore) void {
+    _ = @constCast(core).layer_applications.fetchAdd(1, .monotonic);
+}
+fn noteFrontierDepth(core: *const RSFCore, depth: usize) void {
+    var current = core.frontier_depth.load(.monotonic);
+    while (depth > current) {
+        current = @constCast(core).frontier_depth.cmpxchgWeak(current, depth, .monotonic, .monotonic) orelse break;
+    }
+}
+fn resetLayerApplicationCounters(core: *RSFCore) void {
+    core.layer_applications.store(0, .monotonic);
+    core.frontier_depth.store(0, .monotonic);
+}
+fn blockedEnergy(blocked: *const Tensor) f64 {
+    var acc: f64 = 0.0;
+    for (blocked.data) |v| acc += @as(f64, v) * @as(f64, v);
+    return acc;
+}
+fn blockedMaxAbs(blocked: *const Tensor) f64 {
+    var acc: f64 = 0.0;
+    for (blocked.data) |v| {
+        const a = @abs(@as(f64, v));
+        if (a > acc) acc = a;
+    }
+    return acc;
+}
+fn collisionLossBlocked(z: *const Tensor, w: *const Tensor, dim: usize) !f32 {
+    if (!tensorsSameShape(z, w)) return error.ShapeMismatch;
+    try validateTensor2D(z);
+    const batch = z.shape.dims[0];
+    const dim2 = try checkedMul(dim, 2);
+    if (z.shape.dims[1] != dim2) return error.ShapeMismatch;
+    const tokens_dim = try checkedMul(batch, dim);
+    if (tokens_dim == 0) return error.InvalidBatchSize;
+    const n = try checkedMul(batch, dim2);
+    if (z.data.len < n or w.data.len < n) return error.DataLengthMismatch;
+    var sum: f64 = 0.0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const d = @as(f64, z.data[i]) - @as(f64, w.data[i]);
+        sum += d * d;
+    }
+    const loss: f32 = @floatCast(sum / @as(f64, @floatFromInt(tokens_dim)));
+    if (!std.math.isFinite(loss)) return error.NonFinite;
+    return loss;
+}
+fn blockedMeanLogDetAndApplyForward(core: *const RSFCore, blocked: *Tensor, start: usize, end: usize) !f32 {
+    try validateTensor2D(blocked);
+    try validateModelMetadata(core);
+    const dim = core.dim;
+    const dim2 = try checkedMul(dim, 2);
+    if (blocked.shape.dims[1] != dim2) return error.ShapeMismatch;
+    const batch = blocked.shape.dims[0];
+    if (batch == 0) return error.InvalidBatchSize;
+    const layer_count = try checkedModelLayerCount(core);
+    if (end < start or end > layer_count) return error.LayerIndexOutOfBounds;
+    if (start == end) return 0.0;
+    try ensureFiniteSlice(blocked.data[0..try checkedMul(batch, dim2)]);
+    const allocator = scratchAllocator();
+    const scale = try allocator.alloc(f32, dim);
+    defer allocator.free(scale);
+    const trans = try allocator.alloc(f32, dim);
+    defer allocator.free(trans);
+    var sum: f64 = 0.0;
+    var l: usize = start;
+    while (l < end) : (l += 1) {
+        const layer = &core.layers[l];
+        var b: usize = 0;
+        while (b < batch) : (b += 1) {
+            const row = blocked.data[b * dim2 .. b * dim2 + dim2];
+            const row_logdet = try layer.couplingForwardLogDetRow(row, scale, trans);
+            sum += @as(f64, row_logdet);
+            core.oftb.forwardSliceInPlace(row);
+        }
+        noteLayerApplication(core);
+    }
+    const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(batch)));
+    if (!std.math.isFinite(mean)) return error.NonFinite;
+    return mean;
+}
+fn blockedMeanLogDetAndApplyInverse(core: *const RSFCore, blocked: *Tensor, start: usize, end: usize) !f32 {
+    try validateTensor2D(blocked);
+    try validateModelMetadata(core);
+    const dim = core.dim;
+    const dim2 = try checkedMul(dim, 2);
+    if (blocked.shape.dims[1] != dim2) return error.ShapeMismatch;
+    const batch = blocked.shape.dims[0];
+    if (batch == 0) return error.InvalidBatchSize;
+    const layer_count = try checkedModelLayerCount(core);
+    if (end < start or end > layer_count) return error.LayerIndexOutOfBounds;
+    if (start == end) return 0.0;
+    try ensureFiniteSlice(blocked.data[0..try checkedMul(batch, dim2)]);
+    const allocator = scratchAllocator();
+    const scale = try allocator.alloc(f32, dim);
+    defer allocator.free(scale);
+    const trans = try allocator.alloc(f32, dim);
+    defer allocator.free(trans);
+    var sum: f64 = 0.0;
+    var idx = end;
+    while (idx > start) {
+        idx -= 1;
+        const layer = &core.layers[idx];
+        var b: usize = 0;
+        while (b < batch) : (b += 1) {
+            const row = blocked.data[b * dim2 .. b * dim2 + dim2];
+            core.oftb.inverseSliceInPlace(row);
+            const row_logdet = try layer.couplingInverseLogDetRow(row, scale, trans);
+            sum += @as(f64, row_logdet);
+        }
+        noteLayerApplication(core);
+    }
+    const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(batch)));
+    if (!std.math.isFinite(mean)) return error.NonFinite;
+    return mean;
+}
+fn addLayerParamGrads(layer: *LayerCore, ds: []const f32, dt: []const f32) !void {
+    try layer.ensureGradients();
+    const expected = try checkedMul(layer.dim, coupling_width);
+    if (ds.len < expected or dt.len < expected) return error.DataLengthMismatch;
+    const s_grad = if (layer.s_weight_grad) |*g| g else return error.NoGradients;
+    const t_grad = if (layer.t_weight_grad) |*g| g else return error.NoGradients;
+    var k: usize = 0;
+    while (k < expected) : (k += 1) {
+        const ns = s_grad.data[k] + ds[k];
+        const nt = t_grad.data[k] + dt[k];
+        if (!std.math.isFinite(ns) or !std.math.isFinite(nt)) return error.NonFinite;
+        s_grad.data[k] = ns;
+        t_grad.data[k] = nt;
+    }
+}
+fn midpointForwardAdjointOnCore(
+    core: *RSFCore,
+    z_blocked: *const Tensor,
+    grad: []f32,
+    grad_input_blocked: *Tensor,
+    start: usize,
+    end: usize,
+    logdet_adjoint: f32,
+) !void {
+    try validateTensor2D(z_blocked);
+    try validateTensor2D(grad_input_blocked);
+    const dim = core.dim;
+    const dim2 = try checkedMul(dim, 2);
+    const batch = z_blocked.shape.dims[0];
+    if (batch == 0) return error.InvalidBatchSize;
+    const n = try checkedMul(batch, dim2);
+    if (z_blocked.data.len < n or grad.len < n) return error.DataLengthMismatch;
+    if (grad_input_blocked.data.len < n) return error.DataLengthMismatch;
+    if (!std.math.isFinite(logdet_adjoint)) return error.NonFinite;
+    if (start == end) {
+        @memcpy(grad_input_blocked.data[0..n], grad[0..n]);
+        return;
+    }
+    const allocator = scratchAllocator();
+    const state = try allocator.alloc(f32, n);
+    defer allocator.free(state);
+    @memcpy(state, z_blocked.data[0..n]);
+    var scratch = try tensor.InvertedFlowScratch.init(allocator, dim);
+    defer scratch.deinit();
+    const expected = try checkedMul(dim, coupling_width);
+    const ds_buf = try allocator.alloc(f32, expected);
+    defer allocator.free(ds_buf);
+    const dt_buf = try allocator.alloc(f32, expected);
+    defer allocator.free(dt_buf);
+    const scale = try allocator.alloc(f32, dim);
+    defer allocator.free(scale);
+    const trans = try allocator.alloc(f32, dim);
+    defer allocator.free(trans);
+    const dx = try allocator.alloc(f32, dim2);
+    defer allocator.free(dx);
+    var l = end;
+    while (l > start) {
+        l -= 1;
+        const layer = &core.layers[l];
+        @memset(ds_buf, 0.0);
+        @memset(dt_buf, 0.0);
+        const params = try layer.couplingParams();
+        var b: usize = 0;
+        while (b < batch) : (b += 1) {
+            const row = state[b * dim2 .. b * dim2 + dim2];
+            const grow = grad[b * dim2 .. b * dim2 + dim2];
+            core.oftb.inverseSliceInPlace(row);
+            try layer.couplingInverseRow(row, scale, trans);
+            core.oftb.backwardSliceInPlace(grow);
+            _ = try tensor.couplingAdjointRow(
+                params,
+                row[0..dim],
+                row[dim..dim2],
+                grow[0..dim],
+                grow[dim..dim2],
+                dx[0..dim],
+                dx[dim..dim2],
+                ds_buf,
+                dt_buf,
+                1.0,
+                logdet_adjoint,
+                &scratch,
+            );
+            @memcpy(grow, dx);
+        }
+        try addLayerParamGrads(layer, ds_buf, dt_buf);
+        noteLayerApplication(core);
+    }
+    @memcpy(grad_input_blocked.data[0..n], grad[0..n]);
+}
+fn midpointBackwardAdjointOnCore(
+    core: *RSFCore,
+    w_blocked: *const Tensor,
+    grad: []f32,
+    start: usize,
+    end: usize,
+    ld_shift: f32,
+) !void {
+    try validateTensor2D(w_blocked);
+    const dim = core.dim;
+    const dim2 = try checkedMul(dim, 2);
+    const batch = w_blocked.shape.dims[0];
+    if (batch == 0) return error.InvalidBatchSize;
+    const n = try checkedMul(batch, dim2);
+    if (w_blocked.data.len < n or grad.len < n) return error.DataLengthMismatch;
+    if (!std.math.isFinite(ld_shift)) return error.NonFinite;
+    if (start == end) return;
+    const allocator = scratchAllocator();
+    const state = try allocator.alloc(f32, n);
+    defer allocator.free(state);
+    @memcpy(state, w_blocked.data[0..n]);
+    var scratch = try tensor.InvertedFlowScratch.init(allocator, dim);
+    defer scratch.deinit();
+    const expected = try checkedMul(dim, coupling_width);
+    const ds_buf = try allocator.alloc(f32, expected);
+    defer allocator.free(ds_buf);
+    const dt_buf = try allocator.alloc(f32, expected);
+    defer allocator.free(dt_buf);
+    const scale = try allocator.alloc(f32, dim);
+    defer allocator.free(scale);
+    const trans = try allocator.alloc(f32, dim);
+    defer allocator.free(trans);
+    const u = try allocator.alloc(f32, dim2);
+    defer allocator.free(u);
+    const o = try allocator.alloc(f32, dim2);
+    defer allocator.free(o);
+    const gu = try allocator.alloc(f32, dim2);
+    defer allocator.free(gu);
+    var l: usize = start;
+    while (l < end) : (l += 1) {
+        const layer = &core.layers[l];
+        @memset(ds_buf, 0.0);
+        @memset(dt_buf, 0.0);
+        const params = try layer.couplingParams();
+        var b: usize = 0;
+        while (b < batch) : (b += 1) {
+            const row = state[b * dim2 .. b * dim2 + dim2];
+            const grow = grad[b * dim2 .. b * dim2 + dim2];
+            @memcpy(u, row);
+            try layer.couplingForwardRow(u, scale, trans);
+            @memcpy(o, u);
+            core.oftb.forwardSliceInPlace(o);
+            _ = try tensor.couplingInvertedFlowAdjointRow(
+                params,
+                u[0..dim],
+                u[dim..dim2],
+                grow[0..dim],
+                grow[dim..dim2],
+                gu[0..dim],
+                gu[dim..dim2],
+                ds_buf,
+                dt_buf,
+                1.0,
+                ld_shift,
+                &scratch,
+            );
+            @memcpy(grow, gu);
+            core.oftb.forwardSliceInPlace(grow);
+            @memcpy(row, o);
+        }
+        try addLayerParamGrads(layer, ds_buf, dt_buf);
+        noteLayerApplication(core);
+    }
+}
+fn seedCollisionGrads(z: *const Tensor, w: *const Tensor, gz: []f32, gw: []f32, dim: usize, grad_scale: f32) !void {
+    if (!tensorsSameShape(z, w)) return error.ShapeMismatch;
+    try validateTensor2D(z);
+    const batch = z.shape.dims[0];
+    const dim2 = try checkedMul(dim, 2);
+    const n = try checkedMul(batch, dim2);
+    if (gz.len < n or gw.len < n) return error.DataLengthMismatch;
+    if (!std.math.isFinite(grad_scale)) return error.NonFinite;
+    const tokens_dim = try checkedMul(batch, dim);
+    const inv_td = grad_scale / @as(f32, @floatFromInt(tokens_dim));
+    if (!std.math.isFinite(inv_td)) return error.NonFinite;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const g = 2.0 * (z.data[i] - w.data[i]) * inv_td;
+        if (!std.math.isFinite(g)) return error.NonFinite;
+        gz[i] = g;
+        gw[i] = -g;
+    }
+}
+fn midpointCollisionOnCore(
+    core: *const RSFCore,
+    input: *const RSFLatentState,
+    target: *const RSFLatentState,
+    allocator: Allocator,
+    parallel: bool,
+) !MidpointResult {
+    try validateModelMetadata(core);
+    const layer_count = try checkedModelLayerCount(core);
+    const split = midpointSplitLayers(layer_count);
+    var z = try input.clone(allocator);
+    errdefer z.deinit();
+    var w = try target.clone(allocator);
+    errdefer w.deinit();
+    var z_blocked = try allocBlockedLatentTensor(allocator, &z);
+    defer z_blocked.deinit();
+    var w_blocked = try allocBlockedLatentTensor(allocator, &w);
+    defer w_blocked.deinit();
+    try latentToBlockedTensor(&z, &z_blocked);
+    try latentToBlockedTensor(&w, &w_blocked);
+    var logdet_forward: f32 = 0.0;
+    var logdet_backward: f32 = 0.0;
+    if (parallel) {
+        const Job = struct {
+            fn fwd(c: *const RSFCore, t: *Tensor, start: usize, end: usize, out: *f32, err_slot: *?anyerror) void {
+                out.* = blockedMeanLogDetAndApplyForward(c, t, start, end) catch |e| {
+                    err_slot.* = e;
+                    return;
+                };
+            }
+            fn bwd(c: *const RSFCore, t: *Tensor, start: usize, end: usize, out: *f32, err_slot: *?anyerror) void {
+                out.* = blockedMeanLogDetAndApplyInverse(c, t, start, end) catch |e| {
+                    err_slot.* = e;
+                    return;
+                };
+            }
+        };
+        var fwd_err: ?anyerror = null;
+        var bwd_err: ?anyerror = null;
+        const fwd_thread = try Thread.spawn(.{}, Job.fwd, .{ core, &z_blocked, @as(usize, 0), split.forward_layers, &logdet_forward, &fwd_err });
+        const bwd_thread = Thread.spawn(.{}, Job.bwd, .{ core, &w_blocked, split.forward_layers, layer_count, &logdet_backward, &bwd_err }) catch |spawn_err| {
+            fwd_thread.join();
+            return spawn_err;
+        };
+        fwd_thread.join();
+        bwd_thread.join();
+        if (fwd_err) |e| return e;
+        if (bwd_err) |e| return e;
+    } else {
+        logdet_forward = try blockedMeanLogDetAndApplyForward(core, &z_blocked, 0, split.forward_layers);
+        logdet_backward = try blockedMeanLogDetAndApplyInverse(core, &w_blocked, split.forward_layers, layer_count);
+    }
+    const depth = if (split.forward_layers > split.backward_layers) split.forward_layers else split.backward_layers;
+    noteFrontierDepth(core, depth);
+    const collision_loss = try collisionLossBlocked(&z_blocked, &w_blocked, core.dim);
+    try blockedTensorToLatent(&z_blocked, &z);
+    try blockedTensorToLatent(&w_blocked, &w);
+    z.log_det = logdet_forward;
+    w.log_det = logdet_backward;
+    const logdet_total = logdet_forward + logdet_backward;
+    if (!std.math.isFinite(logdet_total)) return error.NonFinite;
+    return .{
+        .z = z,
+        .w = w,
+        .collision_loss = collision_loss,
+        .logdet_forward = logdet_forward,
+        .logdet_backward = logdet_backward,
+        .logdet_total = logdet_total,
+        .forward_layers = split.forward_layers,
+        .backward_layers = split.backward_layers,
+    };
+}
+fn midpointBackwardOnCore(
+    core: *RSFCore,
+    z_blocked: *const Tensor,
+    w_blocked: *const Tensor,
+    grad_input_blocked: *Tensor,
+    start: usize,
+    end: usize,
+    layer_count: usize,
+    grad_scale: f32,
+    logdet_weight: f32,
+    parallel: bool,
+) !void {
+    try validateTensor2D(z_blocked);
+    try validateTensor2D(w_blocked);
+    try validateTensor2D(grad_input_blocked);
+    if (!tensorsSameShape(z_blocked, w_blocked)) return error.ShapeMismatch;
+    if (!tensorsSameShape(z_blocked, grad_input_blocked)) return error.ShapeMismatch;
+    if (!std.math.isFinite(grad_scale) or !std.math.isFinite(logdet_weight)) return error.NonFinite;
+    const dim = core.dim;
+    const dim2 = try checkedMul(dim, 2);
+    const batch = z_blocked.shape.dims[0];
+    const n = try checkedMul(batch, dim2);
+    const allocator = scratchAllocator();
+    const gz = try allocator.alloc(f32, n);
+    defer allocator.free(gz);
+    const gw = try allocator.alloc(f32, n);
+    defer allocator.free(gw);
+    try seedCollisionGrads(z_blocked, w_blocked, gz, gw, dim, grad_scale);
+    const tokens: f32 = @floatFromInt(batch);
+    const ld_shift = logdet_weight / tokens;
+    if (!std.math.isFinite(ld_shift)) return error.NonFinite;
+    const logdet_adjoint = -ld_shift;
+    var li: usize = 0;
+    while (li < layer_count) : (li += 1) try core.layers[li].ensureGradients();
+    if (parallel) {
+        const Job = struct {
+            fn fwd(
+                c: *RSFCore,
+                z: *const Tensor,
+                g: []f32,
+                gin: *Tensor,
+                s: usize,
+                e: usize,
+                adj: f32,
+                err_slot: *?anyerror,
+            ) void {
+                midpointForwardAdjointOnCore(c, z, g, gin, s, e, adj) catch |err| {
+                    err_slot.* = err;
+                };
+            }
+            fn bwd(
+                c: *RSFCore,
+                w: *const Tensor,
+                g: []f32,
+                s: usize,
+                e: usize,
+                shift: f32,
+                err_slot: *?anyerror,
+            ) void {
+                midpointBackwardAdjointOnCore(c, w, g, s, e, shift) catch |err| {
+                    err_slot.* = err;
+                };
+            }
+        };
+        var fwd_err: ?anyerror = null;
+        var bwd_err: ?anyerror = null;
+        const fwd_thread = try Thread.spawn(.{}, Job.fwd, .{ core, z_blocked, gz, grad_input_blocked, start, end, logdet_adjoint, &fwd_err });
+        const bwd_thread = Thread.spawn(.{}, Job.bwd, .{ core, w_blocked, gw, end, layer_count, ld_shift, &bwd_err }) catch |spawn_err| {
+            fwd_thread.join();
+            return spawn_err;
+        };
+        fwd_thread.join();
+        bwd_thread.join();
+        if (fwd_err) |e| return e;
+        if (bwd_err) |e| return e;
+    } else {
+        try midpointForwardAdjointOnCore(core, z_blocked, gz, grad_input_blocked, start, end, logdet_adjoint);
+        try midpointBackwardAdjointOnCore(core, w_blocked, gw, end, layer_count, ld_shift);
+    }
+    const depth = if (end - start > layer_count - end) end - start else layer_count - end;
+    noteFrontierDepth(core, depth);
+}
 fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tensor, output: *const Tensor, grad_input_out: *Tensor, logdet_weight: f32) !void {
     try validateModelMetadata(core);
     try validateTensor2D(grad_output);
@@ -1870,6 +2332,28 @@ pub const RSFLatentState = struct {
     }
 };
 
+pub const MidpointResult = struct {
+    z: RSFLatentState,
+    w: RSFLatentState,
+    collision_loss: f32,
+    logdet_forward: f32,
+    logdet_backward: f32,
+    logdet_total: f32,
+    forward_layers: usize,
+    backward_layers: usize,
+
+    pub fn deinit(self: *MidpointResult) void {
+        self.z.deinit();
+        self.w.deinit();
+        self.collision_loss = 0.0;
+        self.logdet_forward = 0.0;
+        self.logdet_backward = 0.0;
+        self.logdet_total = 0.0;
+        self.forward_layers = 0;
+        self.backward_layers = 0;
+    }
+};
+
 pub const RSF = struct {
     id: u64 = 0,
     ctrl: ?*RSFCore = null,
@@ -1895,6 +2379,8 @@ pub const RSF = struct {
             .cpu_weight_version = 1,
             .f16_buf = null,
             .oftb = try initOFTBForConfig(model_dim, cfg.global_diffusion),
+            .layer_applications = std.atomic.Value(usize).init(0),
+            .frontier_depth = std.atomic.Value(usize).init(0),
         };
         errdefer {
             if (core.gpu_accel) |*ga| {
@@ -2507,6 +2993,211 @@ pub const RSF = struct {
         try blockedTensorToLatent(&dx, grad_input_out);
     }
 
+    pub fn midpointSplit(self: *const RSF) !struct { forward_layers: usize, backward_layers: usize } {
+        const layers = try self.layerCount();
+        const split = midpointSplitLayers(layers);
+        return .{ .forward_layers = split.forward_layers, .backward_layers = split.backward_layers };
+    }
+
+    pub fn resetLayerApplicationCounter(self: *RSF) void {
+        const id = handleId(self.id) catch return;
+        const core = acquireModelCore(id) catch return;
+        defer releaseModelCore(id);
+        resetLayerApplicationCounters(core);
+    }
+
+    pub fn layerApplicationCount(self: *const RSF) usize {
+        const id = handleId(self.id) catch return 0;
+        const core = acquireModelCore(id) catch return 0;
+        defer releaseModelCore(id);
+        return core.layer_applications.load(.monotonic);
+    }
+
+    pub fn lastFrontierDepth(self: *const RSF) usize {
+        const id = handleId(self.id) catch return 0;
+        const core = acquireModelCore(id) catch return 0;
+        defer releaseModelCore(id);
+        return core.frontier_depth.load(.monotonic);
+    }
+
+    pub fn midpointForwardFrontier(self: *RSF, input: *const RSFLatentState, out_z: *RSFLatentState) !void {
+        try input.requireModel(self);
+        try out_z.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const split = midpointSplitLayers(try checkedModelLayerCount(core));
+        const allocator = scratchAllocator();
+        var blocked = try allocBlockedLatentTensor(allocator, input);
+        defer blocked.deinit();
+        try latentToBlockedTensor(input, &blocked);
+        const logdet = try blockedMeanLogDetAndApplyForward(core, &blocked, 0, split.forward_layers);
+        noteFrontierDepth(core, split.forward_layers);
+        try blockedTensorToLatent(&blocked, out_z);
+        out_z.log_det = logdet;
+    }
+
+    pub fn midpointBackwardFrontier(self: *RSF, target: *const RSFLatentState, out_w: *RSFLatentState) !void {
+        try target.requireModel(self);
+        try out_w.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const layer_count = try checkedModelLayerCount(core);
+        const split = midpointSplitLayers(layer_count);
+        const allocator = scratchAllocator();
+        var blocked = try allocBlockedLatentTensor(allocator, target);
+        defer blocked.deinit();
+        try latentToBlockedTensor(target, &blocked);
+        const logdet = try blockedMeanLogDetAndApplyInverse(core, &blocked, split.forward_layers, layer_count);
+        noteFrontierDepth(core, split.backward_layers);
+        try blockedTensorToLatent(&blocked, out_w);
+        out_w.log_det = logdet;
+    }
+
+    pub fn midpointCollision(self: *RSF, input: *const RSFLatentState, target: *const RSFLatentState, allocator: Allocator) !MidpointResult {
+        try input.requireModel(self);
+        try target.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        return midpointCollisionOnCore(core, input, target, allocator, false);
+    }
+
+    pub fn midpointCollisionParallel(self: *RSF, input: *const RSFLatentState, target: *const RSFLatentState, allocator: Allocator) !MidpointResult {
+        try input.requireModel(self);
+        try target.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        return midpointCollisionOnCore(core, input, target, allocator, true);
+    }
+
+    pub fn midpointBackward(self: *RSF, result: *const MidpointResult, grad_scale: f32, logdet_weight: f32, grad_input_out: *RSFLatentState) !void {
+        try result.z.requireModel(self);
+        try result.w.requireModel(self);
+        try grad_input_out.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        const layer_count = try checkedModelLayerCount(core);
+        const split = midpointSplitLayers(layer_count);
+        const allocator = scratchAllocator();
+        var z_blocked = try allocBlockedLatentTensor(allocator, &result.z);
+        defer z_blocked.deinit();
+        var w_blocked = try allocBlockedLatentTensor(allocator, &result.w);
+        defer w_blocked.deinit();
+        var gin = try allocBlockedLatentTensor(allocator, grad_input_out);
+        defer gin.deinit();
+        try latentToBlockedTensor(&result.z, &z_blocked);
+        try latentToBlockedTensor(&result.w, &w_blocked);
+        try midpointBackwardOnCore(core, &z_blocked, &w_blocked, &gin, 0, split.forward_layers, layer_count, grad_scale, logdet_weight, false);
+        try blockedTensorToLatent(&gin, grad_input_out);
+    }
+
+    pub fn midpointBackwardParallel(self: *RSF, result: *const MidpointResult, grad_scale: f32, logdet_weight: f32, grad_input_out: *RSFLatentState) !void {
+        try result.z.requireModel(self);
+        try result.w.requireModel(self);
+        try grad_input_out.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lock();
+        defer core.rwlock.unlock();
+        const layer_count = try checkedModelLayerCount(core);
+        const split = midpointSplitLayers(layer_count);
+        const allocator = scratchAllocator();
+        var z_blocked = try allocBlockedLatentTensor(allocator, &result.z);
+        defer z_blocked.deinit();
+        var w_blocked = try allocBlockedLatentTensor(allocator, &result.w);
+        defer w_blocked.deinit();
+        var gin = try allocBlockedLatentTensor(allocator, grad_input_out);
+        defer gin.deinit();
+        try latentToBlockedTensor(&result.z, &z_blocked);
+        try latentToBlockedTensor(&result.w, &w_blocked);
+        try midpointBackwardOnCore(core, &z_blocked, &w_blocked, &gin, 0, split.forward_layers, layer_count, grad_scale, logdet_weight, true);
+        try blockedTensorToLatent(&gin, grad_input_out);
+    }
+
+    pub fn resonanceDrift(self: *RSF, state: *const RSFLatentState, allocator: Allocator) !f32 {
+        try state.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const layer_count = try checkedModelLayerCount(core);
+        const order = OFTB.resonance_order;
+        var working = try state.clone(allocator);
+        defer working.deinit();
+        var blocked = try allocBlockedLatentTensor(allocator, &working);
+        defer blocked.deinit();
+        try latentToBlockedTensor(&working, &blocked);
+        const e0: f64 = blockedEnergy(&blocked);
+        var worst: f64 = 0.0;
+        const denom = if (e0 > 1.0e-30) e0 else 1.0e-30;
+        var l: usize = 0;
+        while (l < layer_count) {
+            _ = try blockedMeanLogDetAndApplyForward(core, &blocked, l, l + 1);
+            l += 1;
+            if (l % order == 0 or l == layer_count) {
+                const e = blockedEnergy(&blocked);
+                const drift = @abs(e - e0) / denom;
+                if (drift > worst) worst = drift;
+            }
+        }
+        const out: f32 = @floatCast(worst);
+        if (!std.math.isFinite(out)) return error.NonFinite;
+        return out;
+    }
+
+    pub fn stateGrowthReport(self: *RSF, state: *const RSFLatentState, allocator: Allocator) ![]f32 {
+        try state.requireModel(self);
+        const id = try handleId(self.id);
+        const core = try acquireModelCore(id);
+        defer releaseModelCore(id);
+        core.rwlock.lockShared();
+        defer core.rwlock.unlockShared();
+        const layer_count = try checkedModelLayerCount(core);
+        const order = OFTB.resonance_order;
+        const samples = 1 + (layer_count + order - 1) / order;
+        const report = try allocator.alloc(f32, samples);
+        errdefer allocator.free(report);
+        var working = try state.clone(allocator);
+        defer working.deinit();
+        var blocked = try allocBlockedLatentTensor(allocator, &working);
+        defer blocked.deinit();
+        try latentToBlockedTensor(&working, &blocked);
+        report[0] = @floatCast(blockedMaxAbs(&blocked));
+        var l: usize = 0;
+        var seen: usize = 1;
+        while (l < layer_count) {
+            _ = try blockedMeanLogDetAndApplyForward(core, &blocked, l, l + 1);
+            l += 1;
+            if (l % order == 0 or l == layer_count) {
+                if (seen >= samples) return error.InvalidModelState;
+                const m = blockedMaxAbs(&blocked);
+                const v: f32 = @floatCast(m);
+                if (!std.math.isFinite(v)) return error.NonFinite;
+                report[seen] = v;
+                seen += 1;
+            }
+        }
+        if (seen != samples) return error.InvalidModelState;
+        if (!std.math.isFinite(report[0])) return error.NonFinite;
+        return report;
+    }
+
     pub fn save(self: *const RSF, path: []const u8) !void {
         const id = try handleId(self.id);
         const core = try acquireModelCore(id);
@@ -2606,6 +3297,8 @@ pub const RSF = struct {
             .cpu_weight_version = 1,
             .f16_buf = null,
             .oftb = try initOFTBForConfig(model_dim, loaded_cfg.global_diffusion),
+            .layer_applications = std.atomic.Value(usize).init(0),
+            .frontier_depth = std.atomic.Value(usize).init(0),
         };
         errdefer {
             if (core.gpu_accel) |*ga| {
@@ -3857,5 +4550,292 @@ test "RSF backwardSequence records the causal Natural Gradient block" {
         try std.testing.expect(valuesWithinTolerance(block[d * 3 + 2], @as(f32, @floatFromInt(seq_len)), 1.0e-5, 1.0e-5));
         try std.testing.expect(block[d * 3 + 0] >= 0.0);
         try std.testing.expect(std.math.isFinite(block[d * 3 + 1]));
+    }
+}
+
+test "RSF midpoint split is L/2 with empty forward frontier at L=1" {
+    const allocator = std.testing.allocator;
+    var rsf1 = try RSF.initWithConfig(allocator, 4, 1, .{ .global_diffusion = false });
+    defer rsf1.deinit();
+    const s1 = try rsf1.midpointSplit();
+    try std.testing.expectEqual(@as(usize, 0), s1.forward_layers);
+    try std.testing.expectEqual(@as(usize, 1), s1.backward_layers);
+    var rsf2 = try RSF.initWithConfig(allocator, 4, 2, .{ .global_diffusion = false });
+    defer rsf2.deinit();
+    const s2 = try rsf2.midpointSplit();
+    try std.testing.expectEqual(@as(usize, 1), s2.forward_layers);
+    try std.testing.expectEqual(@as(usize, 1), s2.backward_layers);
+    var rsf5 = try RSF.initWithConfig(allocator, 4, 5, .{ .global_diffusion = false });
+    defer rsf5.deinit();
+    const s5 = try rsf5.midpointSplit();
+    try std.testing.expectEqual(@as(usize, 2), s5.forward_layers);
+    try std.testing.expectEqual(@as(usize, 3), s5.backward_layers);
+    try std.testing.expectEqual(@as(usize, 5), s5.forward_layers + s5.backward_layers);
+    const ceil_half = (5 + 1) / 2;
+    const max_depth = if (s5.forward_layers > s5.backward_layers) s5.forward_layers else s5.backward_layers;
+    try std.testing.expectEqual(ceil_half, max_depth);
+    var rsf8 = try RSF.initWithConfig(allocator, 4, 8, .{ .global_diffusion = false });
+    defer rsf8.deinit();
+    const s8 = try rsf8.midpointSplit();
+    try std.testing.expectEqual(@as(usize, 4), s8.forward_layers);
+    try std.testing.expectEqual(@as(usize, 4), s8.backward_layers);
+}
+
+test "RSF midpoint collision vanishes when the target is the image of the input" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const batch: usize = 3;
+    const layers: usize = 5;
+    var rsf = try RSF.initWithConfig(allocator, dim, layers, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.35, 0.35, 91001);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.35, 0.35, 91002);
+    defer x2.deinit();
+    var input = try RSFLatentState.fromHalves(allocator, &rsf, &x1, &x2);
+    defer input.deinit();
+    var target = try input.clone(allocator);
+    defer target.deinit();
+    const full_logdet = try rsf.forwardLatentWithLogDet(&target);
+    rsf.resetLayerApplicationCounter();
+    var result = try rsf.midpointCollision(&input, &target, allocator);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, layers), result.forward_layers + result.backward_layers);
+    try std.testing.expectEqual(@as(usize, layers), rsf.layerApplicationCount());
+    const ceil_half = (layers + 1) / 2;
+    try std.testing.expect(rsf.lastFrontierDepth() <= ceil_half);
+    try std.testing.expect(rsf.lastFrontierDepth() == ceil_half);
+    try std.testing.expect(result.collision_loss < 1.0e-8);
+    try std.testing.expectApproxEqAbs(full_logdet, result.logdet_total, 1.0e-4);
+    const n = try input.blockedLength();
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        try std.testing.expect(valuesWithinTolerance(result.z.data.data[k], result.w.data.data[k], 1.0e-5, 1.0e-5));
+    }
+    var z_only = try RSFLatentState.init(allocator, &rsf, batch);
+    defer z_only.deinit();
+    try rsf.midpointForwardFrontier(&input, &z_only);
+    k = 0;
+    while (k < n) : (k += 1) {
+        try std.testing.expectEqual(result.z.data.data[k], z_only.data.data[k]);
+    }
+    try std.testing.expectApproxEqAbs(result.logdet_forward, z_only.log_det, 1.0e-6);
+    var w_only = try RSFLatentState.init(allocator, &rsf, batch);
+    defer w_only.deinit();
+    try rsf.midpointBackwardFrontier(&target, &w_only);
+    k = 0;
+    while (k < n) : (k += 1) {
+        try std.testing.expectEqual(result.w.data.data[k], w_only.data.data[k]);
+    }
+}
+
+test "RSF midpoint collision parallel matches sequential and respects the locking contract" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const batch: usize = 2;
+    const layers: usize = 6;
+    var rsf = try RSF.initWithConfig(allocator, dim, layers, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.3, 0.3, 91011);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.3, 0.3, 91012);
+    defer x2.deinit();
+    var input = try RSFLatentState.fromHalves(allocator, &rsf, &x1, &x2);
+    defer input.deinit();
+    var y1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.3, 0.3, 91013);
+    defer y1.deinit();
+    var y2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.3, 0.3, 91014);
+    defer y2.deinit();
+    var target = try RSFLatentState.fromHalves(allocator, &rsf, &y1, &y2);
+    defer target.deinit();
+    var sequential = try rsf.midpointCollision(&input, &target, allocator);
+    defer sequential.deinit();
+    var parallel = try rsf.midpointCollisionParallel(&input, &target, allocator);
+    defer parallel.deinit();
+    try std.testing.expectEqual(sequential.forward_layers, parallel.forward_layers);
+    try std.testing.expectEqual(sequential.backward_layers, parallel.backward_layers);
+    try std.testing.expectApproxEqAbs(sequential.collision_loss, parallel.collision_loss, 1.0e-6);
+    try std.testing.expectApproxEqAbs(sequential.logdet_forward, parallel.logdet_forward, 1.0e-5);
+    try std.testing.expectApproxEqAbs(sequential.logdet_backward, parallel.logdet_backward, 1.0e-5);
+    const n = try input.blockedLength();
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        try std.testing.expect(valuesWithinTolerance(sequential.z.data.data[k], parallel.z.data.data[k], 1.0e-6, 1.0e-6));
+        try std.testing.expect(valuesWithinTolerance(sequential.w.data.data[k], parallel.w.data.data[k], 1.0e-6, 1.0e-6));
+    }
+    try std.testing.expect(sequential.collision_loss > 0.0);
+}
+
+test "RSF midpointBackward counts 2L applications and vanishes on a colliding pair" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const batch: usize = 2;
+    const layers: usize = 4;
+    var rsf = try RSF.initWithConfig(allocator, dim, layers, .{ .global_diffusion = false, .grad_mean = false });
+    defer rsf.deinit();
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.25, 0.25, 91021);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.25, 0.25, 91022);
+    defer x2.deinit();
+    var input = try RSFLatentState.fromHalves(allocator, &rsf, &x1, &x2);
+    defer input.deinit();
+    var target = try input.clone(allocator);
+    defer target.deinit();
+    try rsf.forwardLatent(&target);
+    rsf.resetLayerApplicationCounter();
+    var result = try rsf.midpointCollision(&input, &target, allocator);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, layers), rsf.layerApplicationCount());
+    try rsf.zeroGradients();
+    var grad_input = try RSFLatentState.init(allocator, &rsf, batch);
+    defer grad_input.deinit();
+    try rsf.midpointBackward(&result, 1.0, 0.0, &grad_input);
+    try std.testing.expectEqual(@as(usize, 2 * layers), rsf.layerApplicationCount());
+    const ceil_half = (layers + 1) / 2;
+    try std.testing.expect(rsf.lastFrontierDepth() <= ceil_half);
+    const n = try input.blockedLength();
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        try std.testing.expect(@abs(grad_input.data.data[k]) < 1.0e-5);
+    }
+    const expected = dim * 2;
+    const s_buf = try allocator.alloc(f32, expected);
+    defer allocator.free(s_buf);
+    const t_buf = try allocator.alloc(f32, expected);
+    defer allocator.free(t_buf);
+    var layer_i: usize = 0;
+    while (layer_i < layers) : (layer_i += 1) {
+        try rsf.readLayerGradients(layer_i, s_buf, t_buf);
+        var j: usize = 0;
+        while (j < expected) : (j += 1) {
+            try std.testing.expect(@abs(s_buf[j]) < 1.0e-4);
+            try std.testing.expect(@abs(t_buf[j]) < 1.0e-4);
+        }
+    }
+}
+
+test "RSF midpointBackwardParallel matches sequential on a non-colliding pair" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const batch: usize = 2;
+    const layers: usize = 5;
+    var rsf = try RSF.initWithConfig(allocator, dim, layers, .{ .global_diffusion = false, .grad_mean = false });
+    defer rsf.deinit();
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.3, 0.3, 91031);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.3, 0.3, 91032);
+    defer x2.deinit();
+    var input = try RSFLatentState.fromHalves(allocator, &rsf, &x1, &x2);
+    defer input.deinit();
+    var y1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.3, 0.3, 91033);
+    defer y1.deinit();
+    var y2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.3, 0.3, 91034);
+    defer y2.deinit();
+    var target = try RSFLatentState.fromHalves(allocator, &rsf, &y1, &y2);
+    defer target.deinit();
+    var result = try rsf.midpointCollision(&input, &target, allocator);
+    defer result.deinit();
+    try rsf.zeroGradients();
+    var grad_seq = try RSFLatentState.init(allocator, &rsf, batch);
+    defer grad_seq.deinit();
+    try rsf.midpointBackward(&result, 1.0, 0.25, &grad_seq);
+    const expected = dim * 2;
+    const s_seq = try allocator.alloc(f32, expected * layers);
+    defer allocator.free(s_seq);
+    const t_seq = try allocator.alloc(f32, expected * layers);
+    defer allocator.free(t_seq);
+    var layer_i: usize = 0;
+    while (layer_i < layers) : (layer_i += 1) {
+        try rsf.readLayerGradients(layer_i, s_seq[layer_i * expected ..][0..expected], t_seq[layer_i * expected ..][0..expected]);
+    }
+    try rsf.zeroGradients();
+    var grad_par = try RSFLatentState.init(allocator, &rsf, batch);
+    defer grad_par.deinit();
+    try rsf.midpointBackwardParallel(&result, 1.0, 0.25, &grad_par);
+    const s_par = try allocator.alloc(f32, expected);
+    defer allocator.free(s_par);
+    const t_par = try allocator.alloc(f32, expected);
+    defer allocator.free(t_par);
+    const n = try input.blockedLength();
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        try std.testing.expect(valuesWithinTolerance(grad_seq.data.data[k], grad_par.data.data[k], 1.0e-5, 1.0e-5));
+    }
+    layer_i = 0;
+    while (layer_i < layers) : (layer_i += 1) {
+        try rsf.readLayerGradients(layer_i, s_par, t_par);
+        var j: usize = 0;
+        while (j < expected) : (j += 1) {
+            try std.testing.expect(valuesWithinTolerance(s_seq[layer_i * expected + j], s_par[j], 1.0e-5, 1.0e-5));
+            try std.testing.expect(valuesWithinTolerance(t_seq[layer_i * expected + j], t_par[j], 1.0e-5, 1.0e-5));
+        }
+    }
+}
+
+test "RSF resonanceDrift and stateGrowthReport sample C8 boundaries" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const batch: usize = 2;
+    var rsf8 = try RSF.initWithConfig(allocator, dim, 8, .{ .global_diffusion = false });
+    defer rsf8.deinit();
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.4, 0.4, 91041);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.4, 0.4, 91042);
+    defer x2.deinit();
+    var state = try RSFLatentState.fromHalves(allocator, &rsf8, &x1, &x2);
+    defer state.deinit();
+    const drift = try rsf8.resonanceDrift(&state, allocator);
+    try std.testing.expect(std.math.isFinite(drift));
+    try std.testing.expect(drift >= 0.0);
+    const report8 = try rsf8.stateGrowthReport(&state, allocator);
+    defer allocator.free(report8);
+    try std.testing.expectEqual(@as(usize, 2), report8.len);
+    try std.testing.expect(report8[0] > 0.0);
+    try std.testing.expect(std.math.isFinite(report8[1]));
+    var rsf9 = try RSF.initWithConfig(allocator, dim, 9, .{ .global_diffusion = false });
+    defer rsf9.deinit();
+    var state9 = try RSFLatentState.fromHalves(allocator, &rsf9, &x1, &x2);
+    defer state9.deinit();
+    const report9 = try rsf9.stateGrowthReport(&state9, allocator);
+    defer allocator.free(report9);
+    try std.testing.expectEqual(@as(usize, 3), report9.len);
+    var rsf1 = try RSF.initWithConfig(allocator, dim, 1, .{ .global_diffusion = false });
+    defer rsf1.deinit();
+    var state1 = try RSFLatentState.fromHalves(allocator, &rsf1, &x1, &x2);
+    defer state1.deinit();
+    const report1 = try rsf1.stateGrowthReport(&state1, allocator);
+    defer allocator.free(report1);
+    try std.testing.expectEqual(@as(usize, 2), report1.len);
+    const drift1 = try rsf1.resonanceDrift(&state1, allocator);
+    try std.testing.expect(std.math.isFinite(drift1));
+}
+
+test "RSF midpoint L=1 uses only the backward frontier" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const batch: usize = 2;
+    var rsf = try RSF.initWithConfig(allocator, dim, 1, .{ .global_diffusion = false });
+    defer rsf.deinit();
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.2, 0.2, 91051);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ batch, dim }, -0.2, 0.2, 91052);
+    defer x2.deinit();
+    var input = try RSFLatentState.fromHalves(allocator, &rsf, &x1, &x2);
+    defer input.deinit();
+    var target = try input.clone(allocator);
+    defer target.deinit();
+    try rsf.forwardLatent(&target);
+    rsf.resetLayerApplicationCounter();
+    var result = try rsf.midpointCollision(&input, &target, allocator);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), result.forward_layers);
+    try std.testing.expectEqual(@as(usize, 1), result.backward_layers);
+    try std.testing.expectEqual(@as(usize, 1), rsf.layerApplicationCount());
+    try std.testing.expectEqual(@as(usize, 1), rsf.lastFrontierDepth());
+    try std.testing.expect(result.collision_loss < 1.0e-8);
+    const n = try input.blockedLength();
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        try std.testing.expectEqual(input.data.data[k], result.z.data.data[k]);
     }
 }

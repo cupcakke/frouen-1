@@ -2838,6 +2838,284 @@ pub fn couplingBackwardHalves(
     return logdet;
 }
 
+pub const InvertedFlowScratch = struct {
+    allocator: Allocator,
+    dim: usize,
+    x1: []f32,
+    x2: []f32,
+    y1: []f32,
+    y2: []f32,
+    scale: []f32,
+    trans: []f32,
+    ds: []f32,
+    dx2: []f32,
+    g1: []f32,
+    g2: []f32,
+    ds_weight: []f32,
+    dt_weight: []f32,
+
+    pub fn init(allocator: Allocator, dim: usize) !InvertedFlowScratch {
+        if (dim == 0) return Error.InvalidShape;
+        const params_len = try std.math.mul(usize, dim, coupling_width);
+        const x1 = try allocator.alloc(f32, dim);
+        errdefer allocator.free(x1);
+        const x2 = try allocator.alloc(f32, dim);
+        errdefer allocator.free(x2);
+        const y1 = try allocator.alloc(f32, dim);
+        errdefer allocator.free(y1);
+        const y2 = try allocator.alloc(f32, dim);
+        errdefer allocator.free(y2);
+        const scale = try allocator.alloc(f32, dim);
+        errdefer allocator.free(scale);
+        const trans = try allocator.alloc(f32, dim);
+        errdefer allocator.free(trans);
+        const ds = try allocator.alloc(f32, dim);
+        errdefer allocator.free(ds);
+        const dx2 = try allocator.alloc(f32, dim);
+        errdefer allocator.free(dx2);
+        const g1 = try allocator.alloc(f32, dim);
+        errdefer allocator.free(g1);
+        const g2 = try allocator.alloc(f32, dim);
+        errdefer allocator.free(g2);
+        const ds_weight = try allocator.alloc(f32, params_len);
+        errdefer allocator.free(ds_weight);
+        const dt_weight = try allocator.alloc(f32, params_len);
+        errdefer allocator.free(dt_weight);
+        return .{
+            .allocator = allocator,
+            .dim = dim,
+            .x1 = x1,
+            .x2 = x2,
+            .y1 = y1,
+            .y2 = y2,
+            .scale = scale,
+            .trans = trans,
+            .ds = ds,
+            .dx2 = dx2,
+            .g1 = g1,
+            .g2 = g2,
+            .ds_weight = ds_weight,
+            .dt_weight = dt_weight,
+        };
+    }
+
+    pub fn deinit(self: *InvertedFlowScratch) void {
+        self.allocator.free(self.x1);
+        self.allocator.free(self.x2);
+        self.allocator.free(self.y1);
+        self.allocator.free(self.y2);
+        self.allocator.free(self.scale);
+        self.allocator.free(self.trans);
+        self.allocator.free(self.ds);
+        self.allocator.free(self.dx2);
+        self.allocator.free(self.g1);
+        self.allocator.free(self.g2);
+        self.allocator.free(self.ds_weight);
+        self.allocator.free(self.dt_weight);
+    }
+
+    fn paramsLen(self: *const InvertedFlowScratch) usize {
+        return self.dim * coupling_width;
+    }
+
+    fn gradTargets(self: *InvertedFlowScratch, ds_grad: ?[]f32, dt_grad: ?[]f32) Error!struct { ds: []f32, dt: []f32 } {
+        const len = self.paramsLen();
+        if (ds_grad) |g| {
+            if (g.len < len) return Error.InvalidShape;
+        } else {
+            @memset(self.ds_weight[0..len], 0.0);
+        }
+        if (dt_grad) |g| {
+            if (g.len < len) return Error.InvalidShape;
+        } else {
+            @memset(self.dt_weight[0..len], 0.0);
+        }
+        return .{ .ds = ds_grad orelse self.ds_weight[0..len], .dt = dt_grad orelse self.dt_weight[0..len] };
+    }
+};
+
+pub fn couplingAdjointRow(
+    params: RSFCouplingParams,
+    x1_row: []const f32,
+    x2_row: []const f32,
+    dy1_row: []const f32,
+    dy2_row: []const f32,
+    dx1_out: []f32,
+    dx2_out: []f32,
+    ds_grad: ?[]f32,
+    dt_grad: ?[]f32,
+    grad_scale: f32,
+    logdet_adjoint: f32,
+    scratch: *InvertedFlowScratch,
+) Error!f64 {
+    const dim = params.dim;
+    if (scratch.dim != dim) return Error.InvalidArgument;
+    if (x1_row.len < dim or x2_row.len < dim) return Error.InvalidShape;
+    if (dy1_row.len < dim or dy2_row.len < dim) return Error.InvalidShape;
+    if (dx1_out.len < dim or dx2_out.len < dim) return Error.InvalidShape;
+    const targets = try scratch.gradTargets(ds_grad, dt_grad);
+    const x1 = scratch.x1[0..dim];
+    const x2 = scratch.x2[0..dim];
+    const y1 = scratch.y1[0..dim];
+    const y2 = scratch.y2[0..dim];
+    @memcpy(x1, x1_row[0..dim]);
+    @memcpy(x2, x2_row[0..dim]);
+    @memcpy(y1, x1_row[0..dim]);
+    @memcpy(y2, x2_row[0..dim]);
+    const logdet = try couplingForwardHalves(params, y1, y2, scratch.scale[0..dim], scratch.trans[0..dim]);
+    const g1 = scratch.g1[0..dim];
+    const g2 = scratch.g2[0..dim];
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        g1[d] = grad_scale * dy1_row[d];
+        g2[d] = grad_scale * dy2_row[d];
+    }
+    _ = try couplingBackwardHalves(params, x1, x2, y1, g1, g2, logdet_adjoint, targets.ds, targets.dt, dx1_out[0..dim], dx2_out[0..dim]);
+    return logdet;
+}
+
+pub fn couplingAdjointRows(
+    params: RSFCouplingParams,
+    x1_rows: []const f32,
+    x2_rows: []const f32,
+    dy1_rows: []const f32,
+    dy2_rows: []const f32,
+    dx1_out: []f32,
+    dx2_out: []f32,
+    ds_grad: ?[]f32,
+    dt_grad: ?[]f32,
+    batch: usize,
+    grad_scale: f32,
+    logdet_adjoint: f32,
+    scratch: *InvertedFlowScratch,
+) Error!f64 {
+    const dim = params.dim;
+    if (scratch.dim != dim) return Error.InvalidArgument;
+    const total = try std.math.mul(usize, batch, dim);
+    if (x1_rows.len < total or x2_rows.len < total) return Error.InvalidShape;
+    if (dy1_rows.len < total or dy2_rows.len < total) return Error.InvalidShape;
+    if (dx1_out.len < total or dx2_out.len < total) return Error.InvalidShape;
+    const targets = try scratch.gradTargets(ds_grad, dt_grad);
+    var logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        const base = b * dim;
+        const x1 = scratch.x1[0..dim];
+        const x2 = scratch.x2[0..dim];
+        const y1 = scratch.y1[0..dim];
+        const y2 = scratch.y2[0..dim];
+        @memcpy(x1, x1_rows[base..][0..dim]);
+        @memcpy(x2, x2_rows[base..][0..dim]);
+        @memcpy(y1, x1_rows[base..][0..dim]);
+        @memcpy(y2, x2_rows[base..][0..dim]);
+        logdet += try couplingForwardHalves(params, y1, y2, scratch.scale[0..dim], scratch.trans[0..dim]);
+        const g1 = scratch.g1[0..dim];
+        const g2 = scratch.g2[0..dim];
+        var d: usize = 0;
+        while (d < dim) : (d += 1) {
+            g1[d] = grad_scale * dy1_rows[base + d];
+            g2[d] = grad_scale * dy2_rows[base + d];
+        }
+        _ = try couplingBackwardHalves(params, x1, x2, y1, g1, g2, logdet_adjoint, targets.ds, targets.dt, dx1_out[base..][0..dim], dx2_out[base..][0..dim]);
+    }
+    return logdet;
+}
+
+pub fn couplingInvertedFlowAdjointRow(
+    params: RSFCouplingParams,
+    y1_row: []const f32,
+    y2_row: []const f32,
+    g1_row: []const f32,
+    g2_row: []const f32,
+    gy1_out: []f32,
+    gy2_out: []f32,
+    ds_grad: ?[]f32,
+    dt_grad: ?[]f32,
+    grad_scale: f32,
+    ld_shift: f32,
+    scratch: *InvertedFlowScratch,
+) Error!f64 {
+    const dim = params.dim;
+    if (scratch.dim != dim) return Error.InvalidArgument;
+    if (y1_row.len < dim or y2_row.len < dim) return Error.InvalidShape;
+    if (g1_row.len < dim or g2_row.len < dim) return Error.InvalidShape;
+    if (gy1_out.len < dim or gy2_out.len < dim) return Error.InvalidShape;
+    const targets = try scratch.gradTargets(ds_grad, dt_grad);
+    const ds_weight = targets.ds;
+    const dt_weight = targets.dt;
+    var logdet: f64 = 0.0;
+    var d: usize = 0;
+    while (d < dim) : (d += 1) {
+        const w_s = params.scaleWeight(d);
+        const b_s = params.scaleBias(d);
+        const w_t = params.translationWeight(d);
+        const b_t = params.translationBias(d);
+        const y1 = y1_row[d];
+        const y2 = y2_row[d];
+        const x2 = y2 - w_t * y1 - b_t;
+        const raw = w_s * x2 + b_s;
+        const clipped = clipCoupling(raw, params.clip_min, params.clip_max);
+        logdet += clipped;
+        const saturated = couplingSaturates(raw, params.clip_min, params.clip_max);
+        const inv_scale = @exp(-clipped);
+        const x1 = y1 * inv_scale;
+        var ds: f32 = -g1_row[d] * x1 - ld_shift;
+        if (saturated) ds = 0.0;
+        const dx2 = g2_row[d] + w_s * ds;
+        gy1_out[d] = g1_row[d] * inv_scale - w_t * dx2;
+        gy2_out[d] = dx2;
+        ds_weight[d * coupling_width + coupling_weight_column] += grad_scale * ds * x2;
+        ds_weight[d * coupling_width + coupling_bias_column] += grad_scale * ds;
+        dt_weight[d * coupling_width + coupling_weight_column] += -grad_scale * dx2 * y1;
+        dt_weight[d * coupling_width + coupling_bias_column] += -grad_scale * dx2;
+    }
+    return logdet;
+}
+
+pub fn couplingInvertedFlowAdjointRows(
+    params: RSFCouplingParams,
+    y1_rows: []const f32,
+    y2_rows: []const f32,
+    g1_rows: []const f32,
+    g2_rows: []const f32,
+    gy1_out: []f32,
+    gy2_out: []f32,
+    ds_grad: ?[]f32,
+    dt_grad: ?[]f32,
+    batch: usize,
+    grad_scale: f32,
+    ld_shift: f32,
+    scratch: *InvertedFlowScratch,
+) Error!f64 {
+    const dim = params.dim;
+    if (scratch.dim != dim) return Error.InvalidArgument;
+    const total = try std.math.mul(usize, batch, dim);
+    if (y1_rows.len < total or y2_rows.len < total) return Error.InvalidShape;
+    if (g1_rows.len < total or g2_rows.len < total) return Error.InvalidShape;
+    if (gy1_out.len < total or gy2_out.len < total) return Error.InvalidShape;
+    const targets = try scratch.gradTargets(ds_grad, dt_grad);
+    var logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        const base = b * dim;
+        logdet += try couplingInvertedFlowAdjointRow(
+            params,
+            y1_rows[base..][0..dim],
+            y2_rows[base..][0..dim],
+            g1_rows[base..][0..dim],
+            g2_rows[base..][0..dim],
+            gy1_out[base..][0..dim],
+            gy2_out[base..][0..dim],
+            targets.ds,
+            targets.dt,
+            grad_scale,
+            ld_shift,
+            scratch,
+        );
+    }
+    return logdet;
+}
+
 pub fn couplingBackwardRows(
     params: RSFCouplingParams,
     inputs: []const f32,
@@ -4370,4 +4648,254 @@ test "causal coupling rejects malformed shapes" {
     defer empty.deinit();
     try std.testing.expectEqual(@as(f64, 0.0), try causalCouplingForward(params, empty, &x1, &x2, &y1, &y2, &key, &scale, &trans));
     try std.testing.expectEqual(@as(f64, 0.0), try causalCouplingInverse(params, empty, &x1, &x2, &y1, &y2, &key, &scale, &trans));
+}
+
+test "tensor inverted-flow adjoint matches central finite differences" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 5;
+    const s_weight = [_]f32{ 0.30, 0.05, -0.20, 0.10, 0.02, 0.40, -0.15, 0.25, -0.35, 0.12 };
+    const t_weight = [_]f32{ -0.25, 0.10, 0.35, -0.05, 0.20, 0.15, -0.30, 0.05, 0.28, -0.18 };
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const y1_base = [_]f32{ 0.40, -0.30, 0.55, -0.20, 0.35 };
+    const y2_base = [_]f32{ -0.45, 0.25, 0.10, 0.50, -0.30 };
+    const g1 = [_]f32{ 0.70, -0.40, 0.20, 0.90, -0.60 };
+    const g2 = [_]f32{ -0.50, 0.80, 0.30, -0.20, 0.60 };
+    const ld_shift: f32 = 0.35;
+    var scratch = try InvertedFlowScratch.init(allocator, dim);
+    defer scratch.deinit();
+    var ds_grad = [_]f32{0.0} ** (dim * coupling_width);
+    var dt_grad = [_]f32{0.0} ** (dim * coupling_width);
+    var gy1 = [_]f32{0.0} ** dim;
+    var gy2 = [_]f32{0.0} ** dim;
+    const logdet = try couplingInvertedFlowAdjointRow(params, &y1_base, &y2_base, &g1, &g2, &gy1, &gy2, &ds_grad, &dt_grad, 1.0, ld_shift, &scratch);
+    try std.testing.expect(std.math.isFinite(logdet));
+    const Loss = struct {
+        fn value(p: RSFCouplingParams, a: []const f32, b: []const f32, ga: []const f32, gb: []const f32, ld: f32, w1: []f32, w2: []f32, sc: []f32, tr: []f32) !f64 {
+            @memcpy(w1[0..p.dim], a[0..p.dim]);
+            @memcpy(w2[0..p.dim], b[0..p.dim]);
+            const volume = try couplingInverseHalves(p, w1[0..p.dim], w2[0..p.dim], sc[0..p.dim], tr[0..p.dim]);
+            var acc: f64 = 0.0;
+            for (0..p.dim) |d| acc += @as(f64, ga[d]) * @as(f64, w1[d]) + @as(f64, gb[d]) * @as(f64, w2[d]);
+            return acc - @as(f64, ld) * volume;
+        }
+    };
+    var work1 = [_]f32{0.0} ** dim;
+    var work2 = [_]f32{0.0} ** dim;
+    var scale = [_]f32{0.0} ** dim;
+    var trans = [_]f32{0.0} ** dim;
+    var plus1 = y1_base;
+    var plus2 = y2_base;
+    var minus1 = y1_base;
+    var minus2 = y2_base;
+    const h: f32 = 1.0e-4;
+    var k: usize = 0;
+    while (k < dim) : (k += 1) {
+        plus1[k] += h;
+        minus1[k] -= h;
+        const lp = try Loss.value(params, &plus1, &plus2, &g1, &g2, ld_shift, &work1, &work2, &scale, &trans);
+        const lm = try Loss.value(params, &minus1, &minus2, &g1, &g2, ld_shift, &work1, &work2, &scale, &trans);
+        const numeric = (lp - lm) / (2.0 * @as(f64, h));
+        plus1[k] = y1_base[k];
+        minus1[k] = y1_base[k];
+        const analytic: f64 = gy1[k];
+        try std.testing.expect(@abs(numeric - analytic) <= 2.0e-3 + 2.0e-2 * @abs(analytic));
+        plus2[k] += h;
+        minus2[k] -= h;
+        const lp2 = try Loss.value(params, &plus1, &plus2, &g1, &g2, ld_shift, &work1, &work2, &scale, &trans);
+        const lm2 = try Loss.value(params, &minus1, &minus2, &g1, &g2, ld_shift, &work1, &work2, &scale, &trans);
+        const numeric2 = (lp2 - lm2) / (2.0 * @as(f64, h));
+        plus2[k] = y2_base[k];
+        minus2[k] = y2_base[k];
+        const analytic2: f64 = gy2[k];
+        try std.testing.expect(@abs(numeric2 - analytic2) <= 2.0e-3 + 2.0e-2 * @abs(analytic2));
+    }
+}
+test "tensor inverted-flow adjoint weight gradients match central finite differences" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    var s_weight = [_]f32{ 0.25, -0.10, 0.30, 0.15, -0.20, 0.05, 0.35, -0.25 };
+    var t_weight = [_]f32{ -0.15, 0.20, 0.10, -0.30, 0.25, 0.12, -0.05, 0.18 };
+    const y1 = [_]f32{ 0.35, -0.25, 0.45, -0.15 };
+    const y2 = [_]f32{ -0.40, 0.20, 0.15, 0.42 };
+    const g1 = [_]f32{ 0.60, -0.35, 0.25, 0.80 };
+    const g2 = [_]f32{ -0.45, 0.70, 0.22, -0.18 };
+    const ld_shift: f32 = 0.4;
+    var scratch = try InvertedFlowScratch.init(allocator, dim);
+    defer scratch.deinit();
+    var ds_grad = [_]f32{0.0} ** (dim * coupling_width);
+    var dt_grad = [_]f32{0.0} ** (dim * coupling_width);
+    var gy1 = [_]f32{0.0} ** dim;
+    var gy2 = [_]f32{0.0} ** dim;
+    _ = try couplingInvertedFlowAdjointRow(try RSFCouplingParams.default(&s_weight, &t_weight, dim), &y1, &y2, &g1, &g2, &gy1, &gy2, &ds_grad, &dt_grad, 1.0, ld_shift, &scratch);
+    const Loss = struct {
+        fn value(sw: []const f32, tw: []const f32, d: usize, a: []const f32, b: []const f32, ga: []const f32, gb: []const f32, ld: f32, w1: []f32, w2: []f32, sc: []f32, tr: []f32) !f64 {
+            const p = try RSFCouplingParams.default(sw, tw, d);
+            @memcpy(w1[0..d], a[0..d]);
+            @memcpy(w2[0..d], b[0..d]);
+            const volume = try couplingInverseHalves(p, w1[0..d], w2[0..d], sc[0..d], tr[0..d]);
+            var acc: f64 = 0.0;
+            for (0..d) |i| acc += @as(f64, ga[i]) * @as(f64, w1[i]) + @as(f64, gb[i]) * @as(f64, w2[i]);
+            return acc - @as(f64, ld) * volume;
+        }
+    };
+    var work1 = [_]f32{0.0} ** dim;
+    var work2 = [_]f32{0.0} ** dim;
+    var scale = [_]f32{0.0} ** dim;
+    var trans = [_]f32{0.0} ** dim;
+    const h: f32 = 1.0e-4;
+    var k: usize = 0;
+    while (k < dim * coupling_width) : (k += 1) {
+        const saved_s = s_weight[k];
+        s_weight[k] = saved_s + h;
+        const lp_s = try Loss.value(&s_weight, &t_weight, dim, &y1, &y2, &g1, &g2, ld_shift, &work1, &work2, &scale, &trans);
+        s_weight[k] = saved_s - h;
+        const lm_s = try Loss.value(&s_weight, &t_weight, dim, &y1, &y2, &g1, &g2, ld_shift, &work1, &work2, &scale, &trans);
+        s_weight[k] = saved_s;
+        const numeric_s = (lp_s - lm_s) / (2.0 * @as(f64, h));
+        const analytic_s: f64 = ds_grad[k];
+        try std.testing.expect(@abs(numeric_s - analytic_s) <= 5.0e-3 + 5.0e-2 * @abs(analytic_s));
+        const saved_t = t_weight[k];
+        t_weight[k] = saved_t + h;
+        const lp_t = try Loss.value(&s_weight, &t_weight, dim, &y1, &y2, &g1, &g2, ld_shift, &work1, &work2, &scale, &trans);
+        t_weight[k] = saved_t - h;
+        const lm_t = try Loss.value(&s_weight, &t_weight, dim, &y1, &y2, &g1, &g2, ld_shift, &work1, &work2, &scale, &trans);
+        t_weight[k] = saved_t;
+        const numeric_t = (lp_t - lm_t) / (2.0 * @as(f64, h));
+        const analytic_t: f64 = dt_grad[k];
+        try std.testing.expect(@abs(numeric_t - analytic_t) <= 5.0e-3 + 5.0e-2 * @abs(analytic_t));
+    }
+}
+test "tensor coupling adjoint row equals couplingBackwardHalves" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 4;
+    const s_weight = [_]f32{ 0.22, -0.08, 0.31, 0.14, -0.19, 0.06, 0.33, -0.27 };
+    const t_weight = [_]f32{ -0.13, 0.21, 0.09, -0.29, 0.24, 0.11, -0.04, 0.17 };
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const x1 = [_]f32{ 0.30, -0.20, 0.40, -0.10 };
+    const x2 = [_]f32{ -0.35, 0.15, 0.25, 0.45 };
+    const dy1 = [_]f32{ 0.55, -0.30, 0.20, 0.75 };
+    const dy2 = [_]f32{ -0.40, 0.65, 0.18, -0.22 };
+    const logdet_adjoint: f32 = 0.5;
+    var scratch = try InvertedFlowScratch.init(allocator, dim);
+    defer scratch.deinit();
+    var ds_grad = [_]f32{0.0} ** (dim * coupling_width);
+    var dt_grad = [_]f32{0.0} ** (dim * coupling_width);
+    var dx1 = [_]f32{0.0} ** dim;
+    var dx2 = [_]f32{0.0} ** dim;
+    const logdet = try couplingAdjointRow(params, &x1, &x2, &dy1, &dy2, &dx1, &dx2, &ds_grad, &dt_grad, 1.0, logdet_adjoint, &scratch);
+    var ref_y1 = x1;
+    var ref_y2 = x2;
+    var ref_scale = [_]f32{0.0} ** dim;
+    var ref_trans = [_]f32{0.0} ** dim;
+    const ref_logdet = try couplingForwardHalves(params, &ref_y1, &ref_y2, &ref_scale, &ref_trans);
+    try std.testing.expectEqual(ref_logdet, logdet);
+    var ref_ds = [_]f32{0.0} ** (dim * coupling_width);
+    var ref_dt = [_]f32{0.0} ** (dim * coupling_width);
+    var ref_dx1 = [_]f32{0.0} ** dim;
+    var ref_dx2 = [_]f32{0.0} ** dim;
+    _ = try couplingBackwardHalves(params, &x1, &x2, &ref_y1, &dy1, &dy2, logdet_adjoint, &ref_ds, &ref_dt, &ref_dx1, &ref_dx2);
+    for (0..dim) |d| {
+        try std.testing.expectEqual(ref_dx1[d], dx1[d]);
+        try std.testing.expectEqual(ref_dx2[d], dx2[d]);
+    }
+    for (0..dim * coupling_width) |k| {
+        try std.testing.expectEqual(ref_ds[k], ds_grad[k]);
+        try std.testing.expectEqual(ref_dt[k], dt_grad[k]);
+    }
+}
+test "tensor coupling adjoint rows batch equals the per-row adjoint" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 3;
+    const batch: usize = 4;
+    const s_weight = [_]f32{ 0.18, -0.09, 0.27, 0.12, -0.21, 0.07 };
+    const t_weight = [_]f32{ -0.11, 0.19, 0.08, -0.26, 0.23, 0.13 };
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    var x1_rows = [_]f32{0.0} ** (batch * dim);
+    var x2_rows = [_]f32{0.0} ** (batch * dim);
+    var dy1_rows = [_]f32{0.0} ** (batch * dim);
+    var dy2_rows = [_]f32{0.0} ** (batch * dim);
+    var seed: u64 = 4242;
+    var i: usize = 0;
+    while (i < batch * dim) : (i += 1) {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const u: f32 = @floatFromInt(seed >> 40);
+        x1_rows[i] = (u / 8388608.0) - 0.5;
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const v: f32 = @floatFromInt(seed >> 40);
+        x2_rows[i] = (v / 8388608.0) - 0.5;
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const w: f32 = @floatFromInt(seed >> 40);
+        dy1_rows[i] = (w / 8388608.0) - 0.5;
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        const z: f32 = @floatFromInt(seed >> 40);
+        dy2_rows[i] = (z / 8388608.0) - 0.5;
+    }
+    var batch_scratch = try InvertedFlowScratch.init(allocator, dim);
+    defer batch_scratch.deinit();
+    var row_scratch = try InvertedFlowScratch.init(allocator, dim);
+    defer row_scratch.deinit();
+    var batch_ds = [_]f32{0.0} ** (dim * coupling_width);
+    var batch_dt = [_]f32{0.0} ** (dim * coupling_width);
+    var batch_dx1 = [_]f32{0.0} ** (batch * dim);
+    var batch_dx2 = [_]f32{0.0} ** (batch * dim);
+    const batch_logdet = try couplingAdjointRows(params, &x1_rows, &x2_rows, &dy1_rows, &dy2_rows, &batch_dx1, &batch_dx2, &batch_ds, &batch_dt, batch, 0.5, 0.25, &batch_scratch);
+    var row_ds = [_]f32{0.0} ** (dim * coupling_width);
+    var row_dt = [_]f32{0.0} ** (dim * coupling_width);
+    var row_dx1 = [_]f32{0.0} ** dim;
+    var row_dx2 = [_]f32{0.0} ** dim;
+    var row_logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        const base = b * dim;
+        row_logdet += try couplingAdjointRow(params, x1_rows[base..][0..dim], x2_rows[base..][0..dim], dy1_rows[base..][0..dim], dy2_rows[base..][0..dim], &row_dx1, &row_dx2, &row_ds, &row_dt, 0.5, 0.25, &row_scratch);
+        for (0..dim) |d| {
+            try std.testing.expectEqual(row_dx1[d], batch_dx1[base + d]);
+            try std.testing.expectEqual(row_dx2[d], batch_dx2[base + d]);
+        }
+    }
+    try std.testing.expectEqual(row_logdet, batch_logdet);
+    for (0..dim * coupling_width) |k| {
+        try std.testing.expectEqual(row_ds[k], batch_ds[k]);
+        try std.testing.expectEqual(row_dt[k], batch_dt[k]);
+    }
+}
+test "tensor inverted-flow adjoint rows batch equals the per-row adjoint" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 3;
+    const batch: usize = 3;
+    const s_weight = [_]f32{ 0.16, -0.07, 0.29, 0.11, -0.23, 0.09 };
+    const t_weight = [_]f32{ -0.12, 0.18, 0.06, -0.28, 0.21, 0.14 };
+    const params = try RSFCouplingParams.default(&s_weight, &t_weight, dim);
+    const y1_rows = [_]f32{ 0.31, -0.22, 0.17, 0.26, -0.13, 0.34, -0.19, 0.28, 0.12 };
+    const y2_rows = [_]f32{ -0.27, 0.19, 0.23, -0.14, 0.32, -0.21, 0.18, -0.25, 0.29 };
+    const g1_rows = [_]f32{ 0.41, -0.33, 0.27, -0.18, 0.36, 0.22, -0.29, 0.15, 0.38 };
+    const g2_rows = [_]f32{ -0.31, 0.24, 0.19, 0.28, -0.16, 0.33, -0.22, 0.31, -0.12 };
+    var batch_scratch = try InvertedFlowScratch.init(allocator, dim);
+    defer batch_scratch.deinit();
+    var row_scratch = try InvertedFlowScratch.init(allocator, dim);
+    defer row_scratch.deinit();
+    var batch_ds = [_]f32{0.0} ** (dim * coupling_width);
+    var batch_dt = [_]f32{0.0} ** (dim * coupling_width);
+    var batch_gy1 = [_]f32{0.0} ** (batch * dim);
+    var batch_gy2 = [_]f32{0.0} ** (batch * dim);
+    const batch_logdet = try couplingInvertedFlowAdjointRows(params, &y1_rows, &y2_rows, &g1_rows, &g2_rows, &batch_gy1, &batch_gy2, &batch_ds, &batch_dt, batch, 0.25, 0.5, &batch_scratch);
+    var row_ds = [_]f32{0.0} ** (dim * coupling_width);
+    var row_dt = [_]f32{0.0} ** (dim * coupling_width);
+    var row_gy1 = [_]f32{0.0} ** dim;
+    var row_gy2 = [_]f32{0.0} ** dim;
+    var row_logdet: f64 = 0.0;
+    var b: usize = 0;
+    while (b < batch) : (b += 1) {
+        const base = b * dim;
+        row_logdet += try couplingInvertedFlowAdjointRow(params, y1_rows[base..][0..dim], y2_rows[base..][0..dim], g1_rows[base..][0..dim], g2_rows[base..][0..dim], &row_gy1, &row_gy2, &row_ds, &row_dt, 0.25, 0.5, &row_scratch);
+        for (0..dim) |d| {
+            try std.testing.expectEqual(row_gy1[d], batch_gy1[base + d]);
+            try std.testing.expectEqual(row_gy2[d], batch_gy2[base + d]);
+        }
+    }
+    try std.testing.expectEqual(row_logdet, batch_logdet);
+    for (0..dim * coupling_width) |k| {
+        try std.testing.expectEqual(row_ds[k], batch_ds[k]);
+        try std.testing.expectEqual(row_dt[k], batch_dt[k]);
+    }
 }
