@@ -494,42 +494,166 @@ pub fn bitmaskWordCount(node_count: usize) usize {
     return (node_count + 63) / 64;
 }
 
-pub fn bitmaskSignalPropagate(bitmask: []const u64, node_count: usize, signal: []const f32, decay: f32, out: []f32) void {
-    if (signal.len < node_count or out.len < node_count) return;
-    const words_per_row = bitmaskWordCount(node_count);
-    if (node_count == 0 or words_per_row == 0) return;
-    if (bitmask.len < node_count * words_per_row) return;
+fn propagateExactStrided(bitmask: []const u64, row_stride_words: usize, row_count: usize, col_count: usize, signal: []const f32, decay: f32, out: []f32) void {
+    if (row_count == 0 or col_count == 0 or row_stride_words == 0) return;
+    if (signal.len < col_count or signal.len < row_count or out.len < row_count) return;
+    if (bitmask.len < row_count * row_stride_words) return;
 
-    const vector_len: usize = 4;
     var src: usize = 0;
-    while (src < node_count) : (src += 1) {
-        const row = bitmask[src * words_per_row ..][0..words_per_row];
-        var acc: f32 = 0.0;
+    while (src < row_count) : (src += 1) {
+        const row = bitmask[src * row_stride_words ..][0..row_stride_words];
+        var acc: f64 = 0.0;
         var w: usize = 0;
-        while (w + vector_len <= words_per_row) : (w += vector_len) {
-            const word_block: @Vector(vector_len, u64) = row[w..][0..vector_len].*;
-            var v: usize = 0;
-            while (v < vector_len) : (v += 1) {
-                var bits = word_block[v];
-                while (bits != 0) {
-                    const bit: u6 = @intCast(@ctz(bits));
-                    const tgt = (w + v) * 64 + @as(usize, bit);
-                    if (tgt < node_count) acc += signal[tgt];
-                    bits &= bits -% 1;
-                }
-            }
-        }
-        while (w < words_per_row) : (w += 1) {
+        while (w < row_stride_words) : (w += 1) {
             var bits = row[w];
             while (bits != 0) {
                 const bit: u6 = @intCast(@ctz(bits));
                 const tgt = w * 64 + @as(usize, bit);
-                if (tgt < node_count) acc += signal[tgt];
+                if (tgt < col_count) acc += @as(f64, @floatCast(signal[tgt]));
                 bits &= bits -% 1;
             }
         }
-        out[src] = signal[src] + decay * acc;
+        out[src] = signal[src] + decay * @as(f32, @floatCast(acc));
     }
+}
+
+fn propagateExactReference(bitmask: []const u64, node_count: usize, signal: []const f32, decay: f32, out: []f32) void {
+    if (node_count == 0) return;
+    propagateExactStrided(bitmask, bitmaskWordCount(node_count), node_count, node_count, signal, decay, out);
+}
+
+pub fn bitmaskSignalPropagateExactStrided(bitmask: []const u64, row_stride_words: usize, row_count: usize, col_count: usize, signal: []const f32, decay: f32, out: []f32) void {
+    propagateExactStrided(bitmask, row_stride_words, row_count, col_count, signal, decay, out);
+}
+
+pub fn bitmaskLastWordMask(node_count: usize, words_per_row: usize) u64 {
+    if (words_per_row == 0) return 0;
+    const valid_bits = node_count - (words_per_row - 1) * 64;
+    if (valid_bits >= 64) return ~@as(u64, 0);
+    return (@as(u64, 1) << @as(u6, @intCast(valid_bits))) - 1;
+}
+
+pub fn bitmaskRowNeighborCount(row: []const u64, node_count: usize, words_per_row: usize) usize {
+    if (row.len < words_per_row or words_per_row == 0) return 0;
+    const last_mask = bitmaskLastWordMask(node_count, words_per_row);
+    var count: usize = 0;
+    var w: usize = 0;
+    while (w + 1 < words_per_row) : (w += 1) count += @popCount(row[w]);
+    count += @popCount(row[w] & last_mask);
+    return count;
+}
+
+pub const bitplane_count: usize = 8;
+pub const bitplane_vector_len: usize = 8;
+
+fn propagatePlanes(allocator: Allocator, bitmask: []const u64, node_count: usize, words_per_row: usize, row_stride_words: usize, signal: []const f32, decay: f32, out: []f32) !void {
+    if (row_stride_words < words_per_row) return error.InvalidBitmaskStride;
+    const plane_words = std.math.mul(usize, bitplane_count, words_per_row) catch return error.Overflow;
+    const planes = try allocator.alloc(u64, plane_words);
+    defer allocator.free(planes);
+    @memset(planes, 0);
+    const quantized = try allocator.alloc(u8, node_count);
+    defer allocator.free(quantized);
+
+    var max_abs: f32 = 0.0;
+    for (0..node_count) |j| max_abs = @max(max_abs, @abs(signal[j]));
+    if (max_abs <= 1e-8) {
+        for (0..node_count) |i| out[i] = signal[i];
+        return;
+    }
+
+    const quant_scale: f32 = 127.5 / max_abs;
+    for (0..node_count) |j| {
+        const shifted = (signal[j] + max_abs) * quant_scale;
+        const rounded = @min(@max(shifted + 0.5, 0.0), 255.0);
+        quantized[j] = @as(u8, @intFromFloat(rounded));
+    }
+    for (0..node_count) |j| {
+        const q = quantized[j];
+        const w = j >> 6;
+        const bit: u64 = @as(u64, 1) << @as(u6, @intCast(j & 63));
+        inline for (0..bitplane_count) |p| {
+            if ((q >> @as(u3, @intCast(p))) & 1 == 1) planes[p * words_per_row + w] |= bit;
+        }
+    }
+
+    const dequant_step: f64 = @as(f64, @floatCast(max_abs)) / 127.5;
+    const offset: f64 = @as(f64, @floatCast(max_abs));
+    const plane_weights = [bitplane_count]f64{ 1, 2, 4, 8, 16, 32, 64, 128 };
+    const last_mask = bitmaskLastWordMask(node_count, words_per_row);
+
+    for (0..node_count) |i| {
+        const row = bitmask[i * row_stride_words ..][0..words_per_row];
+        var sum_q: f64 = 0.0;
+        inline for (0..bitplane_count) |p| {
+            const plane = planes[p * words_per_row ..][0..words_per_row];
+            var plane_count: u64 = 0;
+            var w: usize = 0;
+            while (w + bitplane_vector_len <= words_per_row) : (w += bitplane_vector_len) {
+                const rv: @Vector(bitplane_vector_len, u64) = row[w..][0..bitplane_vector_len].*;
+                const pv: @Vector(bitplane_vector_len, u64) = plane[w..][0..bitplane_vector_len].*;
+                const masked = rv & pv;
+                inline for (0..bitplane_vector_len) |lane| plane_count += @as(u64, @intCast(@popCount(masked[lane])));
+            }
+            while (w < words_per_row) : (w += 1) plane_count += @as(u64, @intCast(@popCount(row[w] & plane[w])));
+            sum_q += @as(f64, @floatFromInt(plane_count)) * plane_weights[p];
+        }
+        var neighbors: u64 = 0;
+        var w: usize = 0;
+        while (w + bitplane_vector_len <= words_per_row) : (w += bitplane_vector_len) {
+            const rv: @Vector(bitplane_vector_len, u64) = row[w..][0..bitplane_vector_len].*;
+            inline for (0..bitplane_vector_len) |lane| neighbors += @as(u64, @intCast(@popCount(rv[lane])));
+        }
+        while (w < words_per_row) : (w += 1) neighbors += @as(u64, @intCast(@popCount(row[w])));
+        neighbors -= @as(u64, @intCast(@popCount(row[words_per_row - 1] & ~last_mask)));
+        const approx_sum = sum_q * dequant_step - offset * @as(f64, @floatFromInt(neighbors));
+        out[i] = signal[i] + decay * @as(f32, @floatCast(approx_sum));
+    }
+}
+
+pub fn bitmaskSignalPropagateExact(bitmask: []const u64, node_count: usize, signal: []const f32, decay: f32, out: []f32) void {
+    propagateExactReference(bitmask, node_count, signal, decay, out);
+}
+
+pub fn bitmaskSignalPropagate(bitmask: []const u64, node_count: usize, signal: []const f32, decay: f32, out: []f32) void {
+    propagateExactReference(bitmask, node_count, signal, decay, out);
+}
+
+pub fn bitmaskSignalPropagateWithAllocator(allocator: Allocator, bitmask: []const u64, node_count: usize, signal: []const f32, decay: f32, out: []f32) !void {
+    if (signal.len < node_count or out.len < node_count) return error.InvalidSignalLength;
+    const words_per_row = bitmaskWordCount(node_count);
+    if (node_count == 0 or words_per_row == 0) return;
+    if (bitmask.len < node_count * words_per_row) return error.InvalidBitmaskLength;
+    try propagatePlanes(allocator, bitmask, node_count, words_per_row, words_per_row, signal, decay, out);
+}
+
+pub fn bitmaskSignalPropagateBitPlane(bitmask: []const u64, node_count: usize, signal: []const f32, decay: f32, out: []f32) void {
+    if (signal.len < node_count or out.len < node_count) return;
+    const words_per_row = bitmaskWordCount(node_count);
+    if (node_count == 0 or words_per_row == 0) return;
+    if (bitmask.len < node_count * words_per_row) return;
+    propagatePlanes(std.heap.smp_allocator, bitmask, node_count, words_per_row, words_per_row, signal, decay, out) catch {
+        propagateExactReference(bitmask, node_count, signal, decay, out);
+    };
+}
+
+pub fn bitmaskSignalPropagateBitPlaneStrided(allocator: Allocator, bitmask: []const u64, row_stride_words: usize, row_count: usize, col_count: usize, signal: []const f32, decay: f32, out: []f32) !void {
+    if (row_count == 0 or col_count == 0 or row_stride_words == 0) return;
+    if (signal.len < col_count or signal.len < row_count or out.len < row_count) return error.InvalidSignalLength;
+    const words_per_row = bitmaskWordCount(col_count);
+    if (row_stride_words < words_per_row) return error.InvalidBitmaskStride;
+    if (bitmask.len < row_count * row_stride_words) return error.InvalidBitmaskLength;
+    if (row_count != col_count) {
+        propagateExactStrided(bitmask, row_stride_words, row_count, col_count, signal, decay, out);
+        return;
+    }
+    try propagatePlanes(allocator, bitmask, col_count, words_per_row, row_stride_words, signal, decay, out);
+}
+
+pub fn bitmaskSignalPropagateBound(decay: f32, max_abs: f32, neighbors: usize) f32 {
+    const decay_abs: f32 = @abs(decay);
+    const propagated: f32 = decay_abs * @as(f32, @floatFromInt(neighbors)) * max_abs;
+    return propagated / 255.0 + 1e-5 * (1.0 + propagated);
 }
 
 pub fn bitmaskIntersectionCount(bitmask_a: []const u64, bitmask_b: []const u64) usize {
@@ -1791,4 +1915,221 @@ test "bulkImportFromGPU: graph is clean after re-import of same hashes" {
 
     try g.bulkImportFromGPU(&hashes, &ones, &zeros, &zeros, &zeros, &srcs, &tgts);
     try testing.expectEqual(first_nodes, g.nodeCount());
+}
+
+fn nsirTestSignal(buffer: []f32, distribution: usize, node_count: usize) f32 {
+    var max_abs: f32 = 0.0;
+    for (0..node_count) |j| {
+        const base: f32 = 0.1 + @as(f32, @floatFromInt(j % 13)) * 0.07;
+        const value: f32 = switch (distribution) {
+            0 => base,
+            1 => -base,
+            2 => if (j % 2 == 0) base else -base,
+            else => if (j == 0) @as(f32, 3.0) else @as(f32, 0.01),
+        };
+        buffer[j] = value;
+        max_abs = @max(max_abs, @abs(value));
+    }
+    return max_abs;
+}
+
+fn nsirTestMask(buffer: []u64, node_count: usize, words: usize, density: f64, seed: u64) void {
+    @memset(buffer, 0);
+    if (density <= 0.0) {
+        const last = words - 1;
+        for (0..node_count) |i| buffer[i * words + last] |= ~bitmaskLastWordMask(node_count, words);
+        return;
+    }
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    for (0..node_count) |i| {
+        for (0..node_count) |j| {
+            if (random.float(f64) > density) continue;
+            buffer[i * words + (j >> 6)] |= @as(u64, 1) << @as(u6, @intCast(j & 63));
+        }
+    }
+    if (density >= 1.0) {
+        const last = words - 1;
+        for (0..node_count) |i| buffer[i * words + last] |= ~bitmaskLastWordMask(node_count, words);
+    }
+}
+
+fn nsirExactReference(allocator: std.mem.Allocator, mask: []const u64, node_count: usize, words: usize, signal: []const f32, decay: f32, out: []f32, neighbors_out: []usize) !void {
+    for (0..node_count) |i| {
+        var acc: f64 = 0.0;
+        var count: usize = 0;
+        for (0..node_count) |j| {
+            const bit = (mask[i * words + (j >> 6)] >> @as(u6, @intCast(j & 63))) & 1;
+            if (bit != 1) continue;
+            acc += @as(f64, @floatCast(signal[j]));
+            count += 1;
+        }
+        neighbors_out[i] = count;
+        out[i] = signal[i] + decay * @as(f32, @floatCast(acc));
+    }
+    _ = allocator;
+}
+
+test "bit-plane propagation stays within the documented bound across sizes densities and signs" {
+    const allocator = std.testing.allocator;
+    const counts = [_]usize{ 1, 3, 7, 63, 64, 65, 128, 511, 512 };
+    const densities = [_]f64{ 0.0, 0.01, 0.5, 1.0 };
+    const decays = [_]f32{ 0.0, 0.5, -0.25, 1.0 };
+    for (counts) |node_count| {
+        const words = bitmaskWordCount(node_count);
+        const mask = try allocator.alloc(u64, node_count * words);
+        defer allocator.free(mask);
+        const signal = try allocator.alloc(f32, node_count);
+        defer allocator.free(signal);
+        const out_exact = try allocator.alloc(f32, node_count);
+        defer allocator.free(out_exact);
+        const out_planes = try allocator.alloc(f32, node_count);
+        defer allocator.free(out_planes);
+        const out_public = try allocator.alloc(f32, node_count);
+        defer allocator.free(out_public);
+        const neighbors = try allocator.alloc(usize, node_count);
+        defer allocator.free(neighbors);
+        for (densities, 0..) |density, density_index| {
+            for (0..4) |distribution| {
+                const max_abs = nsirTestSignal(signal, distribution, node_count);
+                nsirTestMask(mask, node_count, words, density, 0x9E3779B97F4A7C15 *% (@as(u64, node_count) + density_index * 7 + distribution));
+                try nsirExactReference(allocator, mask, node_count, words, signal, 0.0, out_exact, neighbors);
+                for (decays) |decay| {
+                    try nsirExactReference(allocator, mask, node_count, words, signal, decay, out_exact, neighbors);
+                    bitmaskSignalPropagateExact(mask, node_count, signal, decay, out_planes);
+                    for (0..node_count) |i| {
+                        try std.testing.expectApproxEqAbs(out_exact[i], out_planes[i], 1e-5);
+                        try std.testing.expectEqual(neighbors[i], bitmaskRowNeighborCount(mask[i * words ..][0..words], node_count, words));
+                    }
+                    @memset(out_planes, -12345.0);
+                    bitmaskSignalPropagateBitPlane(mask, node_count, signal, decay, out_planes);
+                    try bitmaskSignalPropagateWithAllocator(allocator, mask, node_count, signal, decay, out_public);
+                    for (0..node_count) |i| {
+                        try std.testing.expectEqualSlices(f32, out_planes[i .. i + 1], out_public[i .. i + 1]);
+                        const bound = bitmaskSignalPropagateBound(decay, max_abs, neighbors[i]);
+                        const observed = @abs(out_planes[i] - out_exact[i]);
+                        try std.testing.expect(observed <= bound);
+                        if (decay == 0.0) {
+                            try std.testing.expectEqual(signal[i], out_planes[i]);
+                            try std.testing.expectEqual(signal[i], out_public[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "bit-plane propagation writes the signal through when nothing can propagate" {
+    const allocator = std.testing.allocator;
+    const node_count: usize = 9;
+    const words = bitmaskWordCount(node_count);
+    const mask = try allocator.alloc(u64, node_count * words);
+    defer allocator.free(mask);
+    const signal = try allocator.alloc(f32, node_count);
+    defer allocator.free(signal);
+    const out = try allocator.alloc(f32, node_count);
+    defer allocator.free(out);
+    nsirTestMask(mask, node_count, words, 1.0, 7);
+    @memset(signal, 0.0);
+    @memset(out, 999.0);
+    bitmaskSignalPropagateBitPlane(mask, node_count, signal, 1.0, out);
+    for (0..node_count) |i| try std.testing.expectEqual(@as(f32, 0.0), out[i]);
+    for (0..node_count) |i| signal[i] = 1e-12;
+    @memset(out, 999.0);
+    bitmaskSignalPropagateBitPlane(mask, node_count, signal, 1.0, out);
+    for (0..node_count) |i| try std.testing.expectEqual(signal[i], out[i]);
+    for (0..node_count) |i| signal[i] = -1e-13;
+    @memset(out, 999.0);
+    bitmaskSignalPropagateBitPlane(mask, node_count, signal, 0.5, out);
+    for (0..node_count) |i| try std.testing.expectEqual(signal[i], out[i]);
+}
+
+test "bit-plane propagation reproduces exact results for zero decay and empty masks" {
+    const allocator = std.testing.allocator;
+    const node_count: usize = 65;
+    const words = bitmaskWordCount(node_count);
+    const mask = try allocator.alloc(u64, node_count * words);
+    defer allocator.free(mask);
+    const signal = try allocator.alloc(f32, node_count);
+    defer allocator.free(signal);
+    const out_planes = try allocator.alloc(f32, node_count);
+    defer allocator.free(out_planes);
+    const out_exact = try allocator.alloc(f32, node_count);
+    defer allocator.free(out_exact);
+    const neighbors = try allocator.alloc(usize, node_count);
+    defer allocator.free(neighbors);
+    _ = nsirTestSignal(signal, 2, node_count);
+    nsirTestMask(mask, node_count, words, 0.0, 3);
+    bitmaskSignalPropagateBitPlane(mask, node_count, signal, 1.0, out_planes);
+    bitmaskSignalPropagateExact(mask, node_count, signal, 1.0, out_exact);
+    for (0..node_count) |i| {
+        try std.testing.expectEqual(signal[i], out_planes[i]);
+        try std.testing.expectEqual(signal[i], out_exact[i]);
+    }
+    nsirTestMask(mask, node_count, words, 0.5, 11);
+    bitmaskSignalPropagateBitPlane(mask, node_count, signal, 0.0, out_planes);
+    try nsirExactReference(allocator, mask, node_count, words, signal, 0.0, out_exact, neighbors);
+    for (0..node_count) |i| {
+        try std.testing.expectEqual(signal[i], out_planes[i]);
+        try std.testing.expectEqual(signal[i], out_exact[i]);
+        try std.testing.expect(bitmaskSignalPropagateBound(0.0, 1.0, neighbors[i]) <= 1e-5);
+    }
+}
+
+test "propagation entry points honour their guard clauses" {
+    const allocator = std.testing.allocator;
+    const node_count: usize = 64;
+    const words = bitmaskWordCount(node_count);
+    const mask = try allocator.alloc(u64, node_count * words);
+    defer allocator.free(mask);
+    const signal = try allocator.alloc(f32, node_count);
+    defer allocator.free(signal);
+    const out = try allocator.alloc(f32, node_count);
+    defer allocator.free(out);
+    nsirTestMask(mask, node_count, words, 1.0, 5);
+    _ = nsirTestSignal(signal, 3, node_count);
+
+    @memset(out, 4242.0);
+    bitmaskSignalPropagateBitPlane(mask, 0, signal, 1.0, out);
+    for (out) |v| try std.testing.expectEqual(@as(f32, 4242.0), v);
+    bitmaskSignalPropagateExact(mask, 0, signal, 1.0, out);
+    for (out) |v| try std.testing.expectEqual(@as(f32, 4242.0), v);
+    bitmaskSignalPropagate(mask, 0, signal, 1.0, out);
+    for (out) |v| try std.testing.expectEqual(@as(f32, 4242.0), v);
+
+    bitmaskSignalPropagateBitPlane(mask, node_count, signal[0..10], 1.0, out);
+    for (out) |v| try std.testing.expectEqual(@as(f32, 4242.0), v);
+    bitmaskSignalPropagateBitPlane(mask, node_count, signal, 1.0, out[0..10]);
+    for (out) |v| try std.testing.expectEqual(@as(f32, 4242.0), v);
+    bitmaskSignalPropagateBitPlane(mask[0..2], node_count, signal, 1.0, out);
+    for (out) |v| try std.testing.expectEqual(@as(f32, 4242.0), v);
+
+    try std.testing.expectError(error.InvalidSignalLength, bitmaskSignalPropagateWithAllocator(allocator, mask, node_count, signal[0..10], 1.0, out));
+    try std.testing.expectError(error.InvalidBitmaskLength, bitmaskSignalPropagateWithAllocator(allocator, mask[0..2], node_count, signal, 1.0, out));
+    try bitmaskSignalPropagateWithAllocator(allocator, mask, node_count, signal, 1.0, out);
+    try bitmaskSignalPropagateWithAllocator(allocator, mask, 0, signal, 1.0, out);
+}
+
+test "public exact path equals the f64 neighbour reference" {
+    const allocator = std.testing.allocator;
+    const node_count: usize = 129;
+    const words = bitmaskWordCount(node_count);
+    const mask = try allocator.alloc(u64, node_count * words);
+    defer allocator.free(mask);
+    const signal = try allocator.alloc(f32, node_count);
+    defer allocator.free(signal);
+    const out = try allocator.alloc(f32, node_count);
+    defer allocator.free(out);
+    const reference = try allocator.alloc(f32, node_count);
+    defer allocator.free(reference);
+    const neighbors = try allocator.alloc(usize, node_count);
+    defer allocator.free(neighbors);
+    _ = nsirTestSignal(signal, 2, node_count);
+    nsirTestMask(mask, node_count, words, 0.5, 17);
+    bitmaskSignalPropagate(mask, node_count, signal, 0.75, out);
+    try nsirExactReference(allocator, mask, node_count, words, signal, 0.75, reference, neighbors);
+    for (0..node_count) |i| try std.testing.expectApproxEqAbs(reference[i], out[i], 1e-6);
+    bitmaskSignalPropagateExact(mask, node_count, signal, 0.75, out);
+    for (0..node_count) |i| try std.testing.expectApproxEqAbs(reference[i], out[i], 1e-6);
 }
