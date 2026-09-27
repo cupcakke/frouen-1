@@ -107,7 +107,6 @@ let topk [n] (k: i64) (scores: [n]f32) (indices: [n]i64): ([k]f32, [k]i64) =
 
 let oftb_scale_kernels : f32 = 0.7071067811865476
 
--- Permutation gather used by entry rsf_forward/rsf_forward_multilayer/rsf_backward in this file; a permutation matrix has log|det|=0.
 let rsf_scatter [n] (x: [n]f32) (indices: [n]i64): [n]f32 =
   if n <= 0 then copy x
   else tabulate n (\i ->
@@ -374,7 +373,6 @@ let minhash_signature [n] (tokens: [n]u32) (num_perm: i64) (seed: u64): []u64 =
       in min_h
     )
 
--- 1-D weight context path used by entry compute_rsf_context; not the stack training map.
 let rsf_relational_context [seq_len][d_model] (spectral_input: [seq_len][d_model]f32) (_temporal_input: [seq_len][d_model]f32) (value: [seq_len][d_model]f32) (s_weight: [d_model]f32) (t_weight: [d_model]f32) (_eps: f32): [seq_len][d_model]f32 =
   if seq_len == 0 || d_model == 0 then copy value
   else
@@ -881,7 +879,6 @@ let rgpu_measure_probability_batch [n] (states: [n]complex): [n]f32 =
        then replicate n (1f32 / f32.i64 n)
        else map (\p -> p / total) raw
 
--- Complex single-qubit Hadamard of the quantum path; not the real normalized FWHT of Theta = Q_r tensor H_2^k.
 let rgpu_hadamard_transform (state: complex): complex =
   let inv_sqrt2 = 1f32 / f32.sqrt 2f32
   in {re = inv_sqrt2 * (state.re + state.im), im = inv_sqrt2 * (state.re - state.im)}

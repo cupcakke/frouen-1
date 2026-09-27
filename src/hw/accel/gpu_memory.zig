@@ -32,6 +32,7 @@ pub const EstimateConfig = struct {
     graph_chunk_size: usize = 0,
     spectral_temps: bool = false,
     coupling: CouplingLayout = .diagonal,
+    fisher_block: bool = true,
     reserve_bytes: u64 = 2 * 1024 * 1024 * 1024,
     reserve_fraction: f32 = 0.10,
 };
@@ -53,6 +54,10 @@ pub const Estimate = struct {
     activation_bytes: u64 = 0,
     coupling_columns: usize = 2,
     elements_per_stack: u64 = 0,
+    fisher_elements_per_stack: u64 = 0,
+    fisher_bytes_s: u64 = 0,
+    fisher_bytes_t: u64 = 0,
+    fisher_bytes: u64 = 0,
 
     pub fn add(self: *Estimate, name: []const u8, bytes: u64, persistent: bool) MemoryError!void {
         if (self.item_count >= self.items.len) return MemoryError.Overflow;
@@ -99,6 +104,15 @@ pub fn stackElements(model_dim: usize, num_layers: usize, layout: CouplingLayout
     return mulU64(per, @intCast(num_layers));
 }
 
+pub fn fisherStackElements(model_dim: usize, num_layers: usize, fisher_block: bool) MemoryError!u64 {
+    if (model_dim == 0 or model_dim % 2 != 0) return MemoryError.InvalidDimensions;
+    if (num_layers == 0) return MemoryError.InvalidDimensions;
+    const half: u64 = @intCast(model_dim / 2);
+    const cols: u64 = if (fisher_block) 3 else 2;
+    const per = try mulU64(half, cols);
+    return mulU64(per, @intCast(num_layers));
+}
+
 pub fn estimate(config: EstimateConfig) MemoryError!Estimate {
     if (config.model_dim == 0 or config.model_dim % 2 != 0) return MemoryError.InvalidDimensions;
     if (config.num_layers == 0 or config.vocab_size == 0) return MemoryError.InvalidDimensions;
@@ -107,19 +121,25 @@ pub fn estimate(config: EstimateConfig) MemoryError!Estimate {
     var out = Estimate{};
     out.coupling_columns = try couplingColumns(config.model_dim, config.coupling);
     out.elements_per_stack = try stackElements(config.model_dim, config.num_layers, config.coupling);
+    out.fisher_elements_per_stack = try fisherStackElements(config.model_dim, config.num_layers, config.fisher_block);
 
     const stack_f32 = try bytesOf(out.elements_per_stack, 4);
     const stack_f16 = try bytesOf(out.elements_per_stack, 2);
     const two_f16 = try mulU64(stack_f16, 2);
     const two_f32 = try mulU64(stack_f32, 2);
+    const fisher_f32 = try bytesOf(out.fisher_elements_per_stack, 4);
+    const two_fisher = try mulU64(fisher_f32, 2);
+    out.fisher_bytes_s = fisher_f32;
+    out.fisher_bytes_t = fisher_f32;
+    out.fisher_bytes = two_fisher;
 
     try out.add("rsf_fp16_forward_s_t", two_f16, true);
     try out.add("rsf_fp32_master_s_t", two_f32, true);
     try out.add("rsf_fp32_momentum_s_t", two_f32, true);
-    try out.add("rsf_fp32_fisher_s_t", two_f32, true);
+    try out.add("rsf_fp32_fisher_s_t", two_fisher, true);
     try out.add("rsf_fp32_step_gradients_s_t", two_f32, false);
     try out.add("rsf_fp32_optimizer_replacement", two_f32, false);
-    out.rsf_param_bytes = try addU64(try addU64(two_f16, two_f32), try addU64(two_f32, two_f32));
+    out.rsf_param_bytes = try addU64(try addU64(two_f16, two_f32), try addU64(two_f32, two_fisher));
 
     if (!config.stack_only) {
         try out.add("rsf_legacy_per_layer_fp16_mirrors", two_f16, true);
@@ -257,6 +277,13 @@ test "diagonal stack is O(layers*dim)" {
     try std.testing.expectEqual(@as(u64, 11 * 8192 * 2), elems);
 }
 
+test "block fisher stack is three columns per row" {
+    const elems = try fisherStackElements(16384, 11, true);
+    try std.testing.expectEqual(@as(u64, 11 * 8192 * 3), elems);
+    const diag = try fisherStackElements(16384, 11, false);
+    try std.testing.expectEqual(@as(u64, 11 * 8192 * 2), diag);
+}
+
 test "stack-only estimate excludes mirrors" {
     const with_mirrors = try estimate(.{
         .model_dim = 64,
@@ -266,6 +293,7 @@ test "stack-only estimate excludes mirrors" {
         .max_seq_len = 8,
         .stack_only = false,
         .coupling = .diagonal,
+        .fisher_block = true,
     });
     const stack_only = try estimate(.{
         .model_dim = 64,
@@ -275,8 +303,34 @@ test "stack-only estimate excludes mirrors" {
         .max_seq_len = 8,
         .stack_only = true,
         .coupling = .diagonal,
+        .fisher_block = true,
     });
     try std.testing.expect(with_mirrors.persistent_bytes > stack_only.persistent_bytes);
+}
+
+test "block fisher estimate exceeds diagonal fisher" {
+    const block = try estimate(.{
+        .model_dim = 64,
+        .num_layers = 2,
+        .vocab_size = 32,
+        .batch_size = 2,
+        .max_seq_len = 8,
+        .coupling = .diagonal,
+        .fisher_block = true,
+    });
+    const diagonal = try estimate(.{
+        .model_dim = 64,
+        .num_layers = 2,
+        .vocab_size = 32,
+        .batch_size = 2,
+        .max_seq_len = 8,
+        .coupling = .diagonal,
+        .fisher_block = false,
+    });
+    try std.testing.expect(block.fisher_elements_per_stack > diagonal.fisher_elements_per_stack);
+    try std.testing.expect(block.persistent_bytes > diagonal.persistent_bytes);
+    try std.testing.expectEqual(@as(u64, 2 * 32 * 3), block.fisher_elements_per_stack);
+    try std.testing.expectEqual(@as(u64, 2 * 32 * 2), diagonal.fisher_elements_per_stack);
 }
 
 test "frozen target smaller than clone" {
@@ -287,6 +341,7 @@ test "frozen target smaller than clone" {
         .batch_size = 1,
         .max_seq_len = 4,
         .frozen_target_f16_only = false,
+        .fisher_block = true,
     });
     const frozen = try estimate(.{
         .model_dim = 64,
@@ -295,6 +350,7 @@ test "frozen target smaller than clone" {
         .batch_size = 1,
         .max_seq_len = 4,
         .frozen_target_f16_only = true,
+        .fisher_block = true,
     });
     try std.testing.expect(clone.persistent_bytes > frozen.persistent_bytes);
 }

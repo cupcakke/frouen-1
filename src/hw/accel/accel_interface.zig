@@ -3,10 +3,12 @@ const cuda = @import("cuda_bindings.zig");
 const futhark = @import("futhark_bindings.zig");
 const core_tensor = @import("../../core/tensor.zig");
 const core_memory = @import("../../core/memory.zig");
+const types = @import("../../core/types.zig");
 
 pub const gpu_enabled: bool = @import("build_options").gpu_acceleration;
 
 pub const rsf_coupling_width: usize = 2;
+pub const rsf_fisher_width: usize = 3;
 pub const rsf_bias_column: usize = 1;
 pub const pinned_alignment: usize = 64;
 pub const rsf_default_clip_min: f16 = -5.0;
@@ -53,6 +55,7 @@ pub const AccelError = error{
     InvalidResourceState,
     OptimizerStepOverflow,
     InvalidAlignment,
+    InvalidCausalMask,
 };
 
 pub const BackendDiagnostics = struct {
@@ -134,6 +137,17 @@ fn allFiniteF32(values: []const f32) bool {
 fn allFiniteNonNegativeF32(values: []const f32) bool {
     for (values) |value| {
         if (!std.math.isFinite(value) or value < 0.0) return false;
+    }
+    return true;
+}
+
+fn allFiniteFisherBlocks(values: []const f32) bool {
+    if (values.len % 3 != 0) return false;
+    var index: usize = 0;
+    while (index < values.len) : (index += 3) {
+        if (!std.math.isFinite(values[index]) or values[index] < 0.0) return false;
+        if (!std.math.isFinite(values[index + 1])) return false;
+        if (!std.math.isFinite(values[index + 2]) or values[index + 2] < 0.0) return false;
     }
     return true;
 }
@@ -1842,6 +1856,8 @@ pub const RSFOptimizerState = struct {
     master_weights_t: []f32 = &.{},
     momentum_s: []f32 = &.{},
     momentum_t: []f32 = &.{},
+    fisher_blocks_s: []f32 = &.{},
+    fisher_blocks_t: []f32 = &.{},
     fisher_s: []f32 = &.{},
     fisher_t: []f32 = &.{},
     step: u64 = 0,
@@ -1870,17 +1886,74 @@ pub const RSFOptimizerState = struct {
             self.allocator.free(self.momentum_t);
             self.momentum_t = &.{};
         }
-        if (self.fisher_s.len > 0) {
+        if (self.fisher_blocks_s.len > 0) {
+            self.allocator.free(self.fisher_blocks_s);
+            self.fisher_blocks_s = &.{};
+            self.fisher_s = &.{};
+        } else if (self.fisher_s.len > 0) {
             self.allocator.free(self.fisher_s);
             self.fisher_s = &.{};
         }
-        if (self.fisher_t.len > 0) {
+        if (self.fisher_blocks_t.len > 0) {
+            self.allocator.free(self.fisher_blocks_t);
+            self.fisher_blocks_t = &.{};
+            self.fisher_t = &.{};
+        } else if (self.fisher_t.len > 0) {
             self.allocator.free(self.fisher_t);
             self.fisher_t = &.{};
         }
         self.step = 0;
     }
+
+    pub fn clone(self: *const Self) AccelError!Self {
+        var out = Self.empty(self.allocator);
+        var committed = false;
+        defer if (!committed) out.deinit();
+        if (self.master_weights_s.len > 0) out.master_weights_s = try dupeHost(f32, self.allocator, self.master_weights_s);
+        if (self.master_weights_t.len > 0) out.master_weights_t = try dupeHost(f32, self.allocator, self.master_weights_t);
+        if (self.momentum_s.len > 0) out.momentum_s = try dupeHost(f32, self.allocator, self.momentum_s);
+        if (self.momentum_t.len > 0) out.momentum_t = try dupeHost(f32, self.allocator, self.momentum_t);
+        if (self.fisher_blocks_s.len > 0) {
+            out.fisher_blocks_s = try dupeHost(f32, self.allocator, self.fisher_blocks_s);
+            out.fisher_s = out.fisher_blocks_s;
+        } else if (self.fisher_s.len > 0) {
+            out.fisher_s = try dupeHost(f32, self.allocator, self.fisher_s);
+        }
+        if (self.fisher_blocks_t.len > 0) {
+            out.fisher_blocks_t = try dupeHost(f32, self.allocator, self.fisher_blocks_t);
+            out.fisher_t = out.fisher_blocks_t;
+        } else if (self.fisher_t.len > 0) {
+            out.fisher_t = try dupeHost(f32, self.allocator, self.fisher_t);
+        }
+        out.step = self.step;
+        committed = true;
+        return out;
+    }
 };
+
+
+pub fn promoteDiagonalFisher(allocator: std.mem.Allocator, fisher_s: []const f32, fisher_t: []const f32) AccelError!struct { blocks_s: []f32, blocks_t: []f32 } {
+    if (fisher_s.len != fisher_t.len) return AccelError.InvalidDataLength;
+    if (fisher_s.len % 2 != 0) return AccelError.InvalidDataLength;
+    const pairs = fisher_s.len / 2;
+    const block_len = std.math.mul(usize, pairs, 3) catch return AccelError.Overflow;
+    const blocks_s = try allocHost(f32, allocator, block_len);
+    errdefer allocator.free(blocks_s);
+    const blocks_t = try allocHost(f32, allocator, block_len);
+    errdefer allocator.free(blocks_t);
+    var pair: usize = 0;
+    while (pair < pairs) : (pair += 1) {
+        const src = pair * 2;
+        const dst = pair * 3;
+        blocks_s[dst] = fisher_s[src];
+        blocks_s[dst + 1] = 0.0;
+        blocks_s[dst + 2] = fisher_s[src + 1];
+        blocks_t[dst] = fisher_t[src];
+        blocks_t[dst + 1] = 0.0;
+        blocks_t[dst + 2] = fisher_t[src + 1];
+    }
+    return .{ .blocks_s = blocks_s, .blocks_t = blocks_t };
+}
 
 pub const EmbeddingOptimizerState = struct {
     master_weights: []f32 = &.{},
@@ -1918,6 +1991,12 @@ pub const FusedStepScalars = struct {
     logdet_mean: f32,
 };
 
+pub const MidpointStepScalars = struct {
+    collision_loss: f32,
+    logdet_forward_mean: f32,
+    logdet_backward_mean: f32,
+};
+
 pub const FusedStepState = enum {
     pending,
     finalized,
@@ -1951,6 +2030,8 @@ pub const FusedStepResult = struct {
     pending: ?*futhark.struct_futhark_opaque_tup6_fused_stack_gradients,
     state: FusedStepState,
     scalars: FusedStepScalars,
+    midpoint: ?MidpointStepScalars,
+    map_midpoint: bool,
     failure: ?AccelError,
 
     const Self = @This();
@@ -1977,6 +2058,8 @@ pub const FusedStepResult = struct {
             .pending = tuple,
             .state = .pending,
             .scalars = .{ .loss = 0.0, .reconstruction_loss = 0.0, .logdet_mean = 0.0 },
+            .midpoint = null,
+            .map_midpoint = false,
             .failure = null,
         };
     }
@@ -2033,7 +2116,20 @@ pub const FusedStepResult = struct {
             self.failure = AccelError.FutharkTrainingStepFailed;
             return self.failure.?;
         }
-        self.scalars = .{ .loss = loss, .reconstruction_loss = reconstruction, .logdet_mean = logdet };
+        if (self.map_midpoint) {
+            self.midpoint = .{
+                .collision_loss = loss,
+                .logdet_forward_mean = reconstruction,
+                .logdet_backward_mean = logdet,
+            };
+            self.scalars = .{
+                .loss = loss,
+                .reconstruction_loss = loss,
+                .logdet_mean = reconstruction + logdet,
+            };
+        } else {
+            self.scalars = .{ .loss = loss, .reconstruction_loss = reconstruction, .logdet_mean = logdet };
+        }
         self.state = .finalized;
         return self.scalars;
     }
@@ -2106,6 +2202,9 @@ pub const FusedStepResult = struct {
         self.pending = null;
         self.state = .deinitialized;
         self.owner = null;
+        self.map_midpoint = false;
+        self.midpoint = null;
+        self.failure = null;
     }
 };
 
@@ -2131,6 +2230,10 @@ pub const RSFAccelerator = struct {
     num_layers: usize,
     clip_min: f16,
     clip_max: f16,
+    diffusion_enabled: bool,
+    diffusion_radix: i64,
+    diffusion_block: i64,
+    diffusion_stages: i64,
     initialized: bool,
     optimizer_step: u64,
     last_spectral_before_s: f32,
@@ -2147,6 +2250,10 @@ pub const RSFAccelerator = struct {
     stack_momentum_t: ?FutharkArray3DF32,
     stack_fisher_s: ?FutharkArray3DF32,
     stack_fisher_t: ?FutharkArray3DF32,
+    cached_mask: ?*futhark.struct_futhark_u8_2d,
+    cached_mask_id: usize,
+    cached_mask_seq: usize,
+    cached_mask_nnz: usize,
 
     const Self = @This();
 
@@ -2236,10 +2343,21 @@ pub const RSFAccelerator = struct {
         errdefer momentum_s.deinit();
         var momentum_t = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
         errdefer momentum_t.deinit();
-        var fisher_s = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
+        var fisher_s = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, rsf_fisher_width, allocator);
         errdefer fisher_s.deinit();
-        var fisher_t = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, columns, allocator);
+        var fisher_t = try FutharkArray3DF32.newZeros(&ctx, num_layers, half, rsf_fisher_width, allocator);
         errdefer fisher_t.deinit();
+
+        var diffusion_enabled = false;
+        var diffusion_radix: i64 = 1;
+        var diffusion_block: i64 = try checkedSigned(model_dim);
+        var diffusion_stages: i64 = 0;
+        if (types.rsfDiffusionLayout(model_dim)) |layout| {
+            diffusion_enabled = true;
+            diffusion_radix = try checkedSigned(layout.radix);
+            diffusion_block = try checkedSigned(layout.block);
+            diffusion_stages = try checkedSigned(layout.stages);
+        }
 
         var accelerator = Self{
             .ctx = ctx,
@@ -2249,6 +2367,10 @@ pub const RSFAccelerator = struct {
             .num_layers = num_layers,
             .clip_min = rsf_default_clip_min,
             .clip_max = rsf_default_clip_max,
+            .diffusion_enabled = diffusion_enabled,
+            .diffusion_radix = diffusion_radix,
+            .diffusion_block = diffusion_block,
+            .diffusion_stages = diffusion_stages,
             .initialized = true,
             .optimizer_step = 0,
             .last_spectral_before_s = 0.0,
@@ -2265,6 +2387,10 @@ pub const RSFAccelerator = struct {
             .stack_momentum_t = momentum_t,
             .stack_fisher_s = fisher_s,
             .stack_fisher_t = fisher_t,
+            .cached_mask = null,
+            .cached_mask_id = 0,
+            .cached_mask_seq = 0,
+            .cached_mask_nnz = 0,
         };
         try accelerator.checkInvariants();
         return accelerator;
@@ -2303,6 +2429,55 @@ pub const RSFAccelerator = struct {
         self.stack_master_weights_s = null;
         self.stack_weights_t = null;
         self.stack_weights_s = null;
+        self.releaseCachedMask();
+    }
+
+    fn releaseCachedMask(self: *Self) void {
+        const arr = self.cached_mask orelse return;
+        if (self.owner) |owner| {
+            owner.lock();
+            defer owner.unlock();
+            if (owner.requireHandleUnlocked()) |handle| {
+                _ = futhark.futhark_free_u8_2d(handle, arr);
+            } else |_| {}
+        }
+        self.cached_mask = null;
+        self.cached_mask_id = 0;
+        self.cached_mask_seq = 0;
+        self.cached_mask_nnz = 0;
+    }
+
+    fn releaseCachedMaskUnlocked(self: *Self, owner: *ContextOwner) void {
+        if (self.cached_mask) |arr| {
+            if (owner.requireHandleUnlocked()) |handle| {
+                _ = futhark.futhark_free_u8_2d(handle, arr);
+            } else |_| {}
+        }
+        self.cached_mask = null;
+        self.cached_mask_id = 0;
+        self.cached_mask_seq = 0;
+        self.cached_mask_nnz = 0;
+    }
+
+    fn uploadMaskUnlocked(self: *Self, owner: *ContextOwner, mask: *const types.RSFSequenceMask) AccelError!*futhark.struct_futhark_u8_2d {
+        const id = @intFromPtr(mask);
+        if (self.cached_mask) |existing| {
+            if (self.cached_mask_id == id and self.cached_mask_seq == mask.seq_len and self.cached_mask_nnz == mask.nnz) {
+                return existing;
+            }
+        }
+        self.releaseCachedMaskUnlocked(owner);
+        const bytes = mask.toBytes(self.allocator) catch return AccelError.AllocationFailed;
+        defer self.allocator.free(bytes);
+        try self.validateMaskBytes(bytes, mask.seq_len);
+        const handle = try owner.requireHandleUnlocked();
+        const seq_i64 = try checkedDimension(mask.seq_len);
+        const mask_arr = futhark.futhark_new_u8_2d(handle, bytes.ptr, seq_i64, seq_i64) orelse return owner.recordFailureUnlocked(AccelError.FutharkArrayNewFailed);
+        self.cached_mask = mask_arr;
+        self.cached_mask_id = id;
+        self.cached_mask_seq = mask.seq_len;
+        self.cached_mask_nnz = mask.nnz;
+        return mask_arr;
     }
 
     pub fn numLayers(self: *const Self) usize {
@@ -2378,8 +2553,8 @@ pub const RSFAccelerator = struct {
         try checkStackArray3D(self.stack_master_weights_t, self.num_layers, half, columns, owner.id);
         try checkStackArray3D(self.stack_momentum_s, self.num_layers, half, columns, owner.id);
         try checkStackArray3D(self.stack_momentum_t, self.num_layers, half, columns, owner.id);
-        try checkStackArray3D(self.stack_fisher_s, self.num_layers, half, columns, owner.id);
-        try checkStackArray3D(self.stack_fisher_t, self.num_layers, half, columns, owner.id);
+        try checkStackArray3D(self.stack_fisher_s, self.num_layers, half, rsf_fisher_width, owner.id);
+        try checkStackArray3D(self.stack_fisher_t, self.num_layers, half, rsf_fisher_width, owner.id);
     }
 
     fn ensureScratchLengthsUnlocked(self: *Self, count: usize) AccelError![]i64 {
@@ -2435,7 +2610,7 @@ pub const RSFAccelerator = struct {
             var layer_t = try FutharkArray2DF16.newFromFlatUnlocked(owner, weights_t[start .. start + per_layer], half, columns);
             defer layer_t.deinitUnlocked();
             const source: *const FutharkArray2DF16 = if (produced) |*current| current else input;
-            const next = try rsfForwardLayerUnlocked(owner, source, &layer_s, &layer_t, clip_min_bits, clip_max_bits);
+            const next = try rsfForwardLayerUnlocked(owner, source, &layer_s, &layer_t, clip_min_bits, clip_max_bits, self.diffusion_enabled, self.diffusion_radix, self.diffusion_block, self.diffusion_stages);
             if (produced) |*previous| previous.deinitUnlocked();
             produced = next;
         }
@@ -2469,6 +2644,10 @@ pub const RSFAccelerator = struct {
             weights_t.arr,
             @bitCast(self.clip_min),
             @bitCast(self.clip_max),
+            self.diffusion_enabled,
+            self.diffusion_radix,
+            self.diffusion_block,
+            self.diffusion_stages,
         );
         if (rc != 0 or out == null) {
             if (out) |produced| _ = futhark.futhark_free_f16_3d(handle, produced);
@@ -2503,6 +2682,10 @@ pub const RSFAccelerator = struct {
             weights_t.arr,
             @bitCast(self.clip_min),
             @bitCast(self.clip_max),
+            self.diffusion_enabled,
+            self.diffusion_radix,
+            self.diffusion_block,
+            self.diffusion_stages,
         );
         if (rc != 0 or out == null) {
             if (out) |produced| _ = futhark.futhark_free_f16_3d(handle, produced);
@@ -2570,6 +2753,10 @@ pub const RSFAccelerator = struct {
             weights_t.arr,
             @bitCast(self.clip_min),
             @bitCast(self.clip_max),
+            self.diffusion_enabled,
+            self.diffusion_radix,
+            self.diffusion_block,
+            self.diffusion_stages,
         );
         if (forward_rc != 0 or final_outputs == null) {
             if (final_outputs) |produced| _ = futhark.futhark_free_f16_3d(handle, produced);
@@ -2594,6 +2781,10 @@ pub const RSFAccelerator = struct {
             reconstruction_alpha,
             forward_scale,
             logdet_weight,
+            self.diffusion_enabled,
+            self.diffusion_radix,
+            self.diffusion_block,
+            self.diffusion_stages,
         );
         if (backward_rc != 0 or tuple == null) {
             if (tuple) |produced| freeFusedTupleUnlocked(owner, produced);
@@ -2685,10 +2876,11 @@ pub const RSFAccelerator = struct {
         try momentum_t.requireLiveUnlocked();
         try fisher_s.requireLiveUnlocked();
         try fisher_t.requireLiveUnlocked();
+        if (fisher_s.dim2 != rsf_fisher_width or fisher_t.dim2 != rsf_fisher_width) return AccelError.InvalidDimensions;
         const handle = try owner.requireHandleUnlocked();
 
         var tuple_s: ?*futhark.struct_futhark_opaque_tup3_stack_sfd = null;
-        const rc_s = futhark.futhark_entry_stack_update_sfd_master(
+        const rc_s = futhark.futhark_entry_stack_update_sfd_block2x2_master(
             handle,
             &tuple_s,
             master_s.arr,
@@ -2708,7 +2900,7 @@ pub const RSFAccelerator = struct {
             return owner.recordFailureUnlocked(AccelError.FutharkSFDUpdateFailed);
         }
         var tuple_t: ?*futhark.struct_futhark_opaque_tup3_stack_sfd = null;
-        const rc_t = futhark.futhark_entry_stack_update_sfd_master(
+        const rc_t = futhark.futhark_entry_stack_update_sfd_block2x2_master(
             handle,
             &tuple_t,
             master_t.arr,
@@ -2773,10 +2965,10 @@ pub const RSFAccelerator = struct {
         const shapes_valid = blk: {
             validateShapeF32_3DUnlocked(owner, new_master_s.?, self.num_layers, half, columns) catch break :blk false;
             validateShapeF32_3DUnlocked(owner, new_momentum_s.?, self.num_layers, half, columns) catch break :blk false;
-            validateShapeF32_3DUnlocked(owner, new_fisher_s.?, self.num_layers, half, columns) catch break :blk false;
+            validateShapeF32_3DUnlocked(owner, new_fisher_s.?, self.num_layers, half, rsf_fisher_width) catch break :blk false;
             validateShapeF32_3DUnlocked(owner, new_master_t.?, self.num_layers, half, columns) catch break :blk false;
             validateShapeF32_3DUnlocked(owner, new_momentum_t.?, self.num_layers, half, columns) catch break :blk false;
-            validateShapeF32_3DUnlocked(owner, new_fisher_t.?, self.num_layers, half, columns) catch break :blk false;
+            validateShapeF32_3DUnlocked(owner, new_fisher_t.?, self.num_layers, half, rsf_fisher_width) catch break :blk false;
             break :blk true;
         };
         if (!shapes_valid) return AccelError.FutharkShapeFailed;
@@ -2803,8 +2995,8 @@ pub const RSFAccelerator = struct {
         self.stack_master_weights_t = FutharkArray3DF32.adoptUnlocked(owner, new_master_t.?, self.num_layers, half, columns);
         self.stack_momentum_s = FutharkArray3DF32.adoptUnlocked(owner, new_momentum_s.?, self.num_layers, half, columns);
         self.stack_momentum_t = FutharkArray3DF32.adoptUnlocked(owner, new_momentum_t.?, self.num_layers, half, columns);
-        self.stack_fisher_s = FutharkArray3DF32.adoptUnlocked(owner, new_fisher_s.?, self.num_layers, half, columns);
-        self.stack_fisher_t = FutharkArray3DF32.adoptUnlocked(owner, new_fisher_t.?, self.num_layers, half, columns);
+        self.stack_fisher_s = FutharkArray3DF32.adoptUnlocked(owner, new_fisher_s.?, self.num_layers, half, rsf_fisher_width);
+        self.stack_fisher_t = FutharkArray3DF32.adoptUnlocked(owner, new_fisher_t.?, self.num_layers, half, rsf_fisher_width);
         committed_shadow_s = true;
         committed_shadow_t = true;
 
@@ -2827,21 +3019,19 @@ pub const RSFAccelerator = struct {
         try self.checkInvariantsUnlocked();
     }
 
-    pub fn spectralNormalizeLayers(self: *Self, target: f32, iterations: usize) AccelError!void {
+    pub fn spectralNormalizeLayers(self: *Self, target: f32) AccelError!void {
         const owner = try self.requireOwnerLive();
         if (!std.math.isFinite(target) or target <= 0.0) return AccelError.InvalidHyperparameter;
-        if (iterations == 0) return AccelError.InvalidHyperparameter;
-        _ = try checkedDimension(iterations);
         owner.lock();
         defer owner.unlock();
         try self.checkInvariantsUnlocked();
 
         const master_s = self.stack_master_weights_s orelse return AccelError.InvalidResourceState;
         const master_t = self.stack_master_weights_t orelse return AccelError.InvalidResourceState;
-        var normalized_s = try normalizeMasterStackUnlocked(owner, &master_s, target, iterations);
+        var normalized_s = try normalizeMasterStackUnlocked(owner, &master_s, target);
         var committed_s = false;
         defer if (!committed_s) normalized_s.array.deinitUnlocked();
-        var normalized_t = try normalizeMasterStackUnlocked(owner, &master_t, target, iterations);
+        var normalized_t = try normalizeMasterStackUnlocked(owner, &master_t, target);
         var committed_t = false;
         defer if (!committed_t) normalized_t.array.deinitUnlocked();
 
@@ -2917,7 +3107,9 @@ pub const RSFAccelerator = struct {
         defer self.allocator.free(momentum_host);
         const fisher_host = try fisher_current.valuesFlatUnlocked(self.allocator);
         defer self.allocator.free(fisher_host);
-        if (master_host.len != stack_count or momentum_host.len != stack_count or fisher_host.len != stack_count) {
+        const fisher_per_layer = try checkedElementCount2(half, rsf_fisher_width);
+        const fisher_stack = try checkedElementCount2(self.num_layers, fisher_per_layer);
+        if (master_host.len != stack_count or momentum_host.len != stack_count or fisher_host.len != fisher_stack) {
             return AccelError.InvalidDimensions;
         }
 
@@ -2926,7 +3118,11 @@ pub const RSFAccelerator = struct {
         while (index < per_layer) : (index += 1) {
             master_host[start + index] = @floatCast(data[index]);
             momentum_host[start + index] = 0.0;
-            fisher_host[start + index] = 0.0;
+        }
+        const fisher_start = layer_idx * fisher_per_layer;
+        var fisher_index: usize = 0;
+        while (fisher_index < fisher_per_layer) : (fisher_index += 1) {
+            fisher_host[fisher_start + fisher_index] = 0.0;
         }
 
         var new_master = try FutharkArray3DF32.newFromFlatUnlocked(owner, master_host, self.num_layers, half, columns);
@@ -2935,7 +3131,7 @@ pub const RSFAccelerator = struct {
         var new_momentum = try FutharkArray3DF32.newFromFlatUnlocked(owner, momentum_host, self.num_layers, half, columns);
         var committed_momentum = false;
         defer if (!committed_momentum) new_momentum.deinitUnlocked();
-        var new_fisher = try FutharkArray3DF32.newFromFlatUnlocked(owner, fisher_host, self.num_layers, half, columns);
+        var new_fisher = try FutharkArray3DF32.newFromFlatUnlocked(owner, fisher_host, self.num_layers, half, rsf_fisher_width);
         var committed_fisher = false;
         defer if (!committed_fisher) new_fisher.deinitUnlocked();
         var new_shadow = try convertMasterToF16_3DUnlocked(owner, &new_master);
@@ -2981,11 +3177,17 @@ pub const RSFAccelerator = struct {
         state.master_weights_t = try master_t.valuesFlatUnlocked(allocator);
         state.momentum_s = try momentum_s.valuesFlatUnlocked(allocator);
         state.momentum_t = try momentum_t.valuesFlatUnlocked(allocator);
-        state.fisher_s = try fisher_s.valuesFlatUnlocked(allocator);
-        state.fisher_t = try fisher_t.valuesFlatUnlocked(allocator);
+        state.fisher_blocks_s = try fisher_s.valuesFlatUnlocked(allocator);
+        state.fisher_blocks_t = try fisher_t.valuesFlatUnlocked(allocator);
+        state.fisher_s = state.fisher_blocks_s;
+        state.fisher_t = state.fisher_blocks_t;
         state.step = self.optimizer_step;
         committed = true;
         return state;
+    }
+
+    pub fn getOptimizerState(self: *Self, allocator: std.mem.Allocator) AccelError!RSFOptimizerState {
+        return self.readOptimizerState(allocator);
     }
 
     pub fn setOptimizerState(
@@ -3006,12 +3208,13 @@ pub const RSFAccelerator = struct {
         const columns = rsf_coupling_width;
         const per_layer = try checkedElementCount2(half, columns);
         const total = try checkedElementCount2(self.num_layers, per_layer);
+        const fisher_total = try checkedElementCount2(self.num_layers, try checkedElementCount2(half, rsf_fisher_width));
         if (master_weights_s.len != total or master_weights_t.len != total or
             momentum_s.len != total or momentum_t.len != total or
-            fisher_s.len != total or fisher_t.len != total) return AccelError.InvalidDataLength;
+            fisher_s.len != fisher_total or fisher_t.len != fisher_total) return AccelError.InvalidDataLength;
         if (!allFiniteF32(master_weights_s) or !allFiniteF32(master_weights_t)) return AccelError.InvalidHyperparameter;
         if (!allFiniteF32(momentum_s) or !allFiniteF32(momentum_t)) return AccelError.InvalidHyperparameter;
-        if (!allFiniteNonNegativeF32(fisher_s) or !allFiniteNonNegativeF32(fisher_t)) return AccelError.InvalidHyperparameter;
+        if (!allFiniteFisherBlocks(fisher_s) or !allFiniteFisherBlocks(fisher_t)) return AccelError.InvalidHyperparameter;
 
         var new_master_s = try FutharkArray3DF32.newFromFlatUnlocked(owner, master_weights_s, self.num_layers, half, columns);
         var committed_master_s = false;
@@ -3025,10 +3228,10 @@ pub const RSFAccelerator = struct {
         var new_momentum_t = try FutharkArray3DF32.newFromFlatUnlocked(owner, momentum_t, self.num_layers, half, columns);
         var committed_momentum_t = false;
         defer if (!committed_momentum_t) new_momentum_t.deinitUnlocked();
-        var new_fisher_s = try FutharkArray3DF32.newFromFlatUnlocked(owner, fisher_s, self.num_layers, half, columns);
+        var new_fisher_s = try FutharkArray3DF32.newFromFlatUnlocked(owner, fisher_s, self.num_layers, half, rsf_fisher_width);
         var committed_fisher_s = false;
         defer if (!committed_fisher_s) new_fisher_s.deinitUnlocked();
-        var new_fisher_t = try FutharkArray3DF32.newFromFlatUnlocked(owner, fisher_t, self.num_layers, half, columns);
+        var new_fisher_t = try FutharkArray3DF32.newFromFlatUnlocked(owner, fisher_t, self.num_layers, half, rsf_fisher_width);
         var committed_fisher_t = false;
         defer if (!committed_fisher_t) new_fisher_t.deinitUnlocked();
         var new_shadow_s = try convertMasterToF16_3DUnlocked(owner, &new_master_s);
@@ -3094,6 +3297,242 @@ pub const RSFAccelerator = struct {
         return owner.syncContextUnlocked();
     }
 
+
+    pub fn fusedMidpointTrainingStep(
+        self: *Self,
+        inputs: *FutharkArray3DF16,
+        targets: *FutharkArray3DF16,
+        sequence_lengths: []const usize,
+        grad_mean: bool,
+        gradient_scale: f32,
+        logdet_weight: f32,
+    ) AccelError!FusedStepResult {
+        const owner = try self.requireOwnerLive();
+        try inputs.requireSameContext(&self.ctx);
+        try targets.requireSameContext(&self.ctx);
+        if (!std.math.isFinite(gradient_scale) or gradient_scale < 0.0 or gradient_scale > 1.0) return AccelError.InvalidHyperparameter;
+        if (!std.math.isFinite(logdet_weight) or logdet_weight < 0.0) return AccelError.InvalidHyperparameter;
+        if (inputs.dim0 == 0 or inputs.dim1 == 0 or inputs.dim2 == 0) return AccelError.InvalidDimensions;
+        if (inputs.dim0 != targets.dim0 or inputs.dim1 != targets.dim1 or inputs.dim2 != targets.dim2) return AccelError.InvalidDimensions;
+        if (inputs.dim2 != self.model_dim) return AccelError.InvalidDimensions;
+        if (sequence_lengths.len != inputs.dim0) return AccelError.InvalidDimensions;
+
+        owner.lock();
+        defer owner.unlock();
+        try self.checkInvariantsUnlocked();
+        try inputs.requireLiveUnlocked();
+        try targets.requireLiveUnlocked();
+
+        const lengths_i64 = try self.ensureScratchLengthsUnlocked(sequence_lengths.len);
+        for (sequence_lengths, lengths_i64) |length, *target| {
+            if (length == 0) return AccelError.InvalidSequenceLength;
+            if (length > inputs.dim1) return AccelError.InvalidSequenceLength;
+            target.* = try checkedSigned(length);
+        }
+        var lengths_array = try FutharkArray1DI64.newFromSliceUnlocked(owner, lengths_i64);
+        defer lengths_array.deinitUnlocked();
+
+        const weights_s = self.stack_weights_s orelse return AccelError.InvalidResourceState;
+        const weights_t = self.stack_weights_t orelse return AccelError.InvalidResourceState;
+        try weights_s.requireLiveUnlocked();
+        try weights_t.requireLiveUnlocked();
+        const handle = try owner.requireHandleUnlocked();
+        const clip_min_f32: f32 = @floatCast(self.clip_min);
+        const clip_max_f32: f32 = @floatCast(self.clip_max);
+
+        var tuple: ?*futhark.struct_futhark_opaque_tup6_fused_stack_gradients = null;
+        const rc = futhark.futhark_entry_rsf_stack_midpoint_fused(
+            handle,
+            &tuple,
+            inputs.arr,
+            targets.arr,
+            lengths_array.arr,
+            weights_s.arr,
+            weights_t.arr,
+            clip_min_f32,
+            clip_max_f32,
+            logdet_weight,
+            self.diffusion_enabled,
+            grad_mean,
+            gradient_scale,
+            self.diffusion_radix,
+            self.diffusion_block,
+            self.diffusion_stages,
+        );
+        if (rc != 0 or tuple == null) {
+            if (tuple) |produced| freeFusedTupleUnlocked(owner, produced);
+            return owner.recordFailureUnlocked(AccelError.FutharkTrainingStepFailed);
+        }
+        const pending_tuple = tuple.?;
+
+        var gradient_s: ?*futhark.struct_futhark_f32_3d = null;
+        var gradient_t: ?*futhark.struct_futhark_f32_3d = null;
+        var delta: ?*futhark.struct_futhark_f16_3d = null;
+        const p0 = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_0(handle, &gradient_s, pending_tuple);
+        const p1 = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_1(handle, &gradient_t, pending_tuple);
+        const p2 = futhark.futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_2(handle, &delta, pending_tuple);
+        if (p0 != 0 or p1 != 0 or p2 != 0 or gradient_s == null or gradient_t == null or delta == null) {
+            if (gradient_s) |produced| _ = futhark.futhark_free_f32_3d(handle, produced);
+            if (gradient_t) |produced| _ = futhark.futhark_free_f32_3d(handle, produced);
+            if (delta) |produced| _ = futhark.futhark_free_f16_3d(handle, produced);
+            freeFusedTupleUnlocked(owner, pending_tuple);
+            return owner.recordFailureUnlocked(AccelError.FutharkProjectionFailed);
+        }
+        const half = self.model_dim / 2;
+        const columns = rsf_coupling_width;
+        const shapes_valid = blk: {
+            validateShapeF32_3DUnlocked(owner, gradient_s.?, self.num_layers, half, columns) catch break :blk false;
+            validateShapeF32_3DUnlocked(owner, gradient_t.?, self.num_layers, half, columns) catch break :blk false;
+            validateShapeF16_3DUnlocked(owner, delta.?, inputs.dim0, inputs.dim1, inputs.dim2) catch break :blk false;
+            break :blk true;
+        };
+        if (!shapes_valid) {
+            _ = futhark.futhark_free_f32_3d(handle, gradient_s.?);
+            _ = futhark.futhark_free_f32_3d(handle, gradient_t.?);
+            _ = futhark.futhark_free_f16_3d(handle, delta.?);
+            freeFusedTupleUnlocked(owner, pending_tuple);
+            return AccelError.FutharkShapeFailed;
+        }
+        var result = FusedStepResult.initOwned(
+            owner,
+            gradient_s.?,
+            gradient_t.?,
+            delta.?,
+            pending_tuple,
+            self.num_layers,
+            half,
+            columns,
+            inputs.dim0,
+            inputs.dim1,
+            inputs.dim2,
+        );
+        result.map_midpoint = true;
+        return result;
+    }
+
+    fn validateMaskBytes(bytes: []const u8, seq_len: usize) AccelError!void {
+        const expected = std.math.mul(usize, seq_len, seq_len) catch return AccelError.Overflow;
+        if (bytes.len != expected) return AccelError.InvalidCausalMask;
+        var i: usize = 0;
+        while (i < seq_len) : (i += 1) {
+            var j: usize = 0;
+            while (j < seq_len) : (j += 1) {
+                const value = bytes[i * seq_len + j];
+                if (value != 0 and value != 1) return AccelError.InvalidCausalMask;
+                if (value == 1 and j >= i) return AccelError.InvalidCausalMask;
+            }
+        }
+    }
+
+    fn layerWeights2DUnlocked(self: *Self, owner: *ContextOwner, stack: *const FutharkArray3DF16, layer: usize) AccelError!FutharkArray2DF16 {
+        const half = self.model_dim / 2;
+        const columns = rsf_coupling_width;
+        const per_layer = try checkedElementCount2(half, columns);
+        const host = try stack.valuesFlatUnlocked(self.allocator);
+        defer self.allocator.free(host);
+        const start = layer * per_layer;
+        if (start >= host.len or host.len - start < per_layer) return AccelError.InvalidDimensions;
+        return FutharkArray2DF16.newFromFlatUnlocked(owner, host[start .. start + per_layer], half, columns);
+    }
+
+    pub fn causalSequenceForward(self: *Self, state: *FutharkArray3DF16, mask: *const types.RSFSequenceMask, layer: usize) AccelError!void {
+        const owner = try self.requireOwnerLive();
+        try state.requireSameContext(&self.ctx);
+        if (layer >= self.num_layers) return AccelError.InvalidDimensions;
+        if (state.dim2 != self.model_dim) return AccelError.InvalidDimensions;
+        if (mask.seq_len != state.dim1) return AccelError.InvalidDimensions;
+        owner.lock();
+        defer owner.unlock();
+        try self.checkInvariantsUnlocked();
+        try state.requireLiveUnlocked();
+        const mask_arr = try self.uploadMaskUnlocked(owner, mask);
+        const handle = try owner.requireHandleUnlocked();
+        const weights_s_stack = self.stack_weights_s orelse return AccelError.InvalidResourceState;
+        const weights_t_stack = self.stack_weights_t orelse return AccelError.InvalidResourceState;
+        try weights_s_stack.requireLiveUnlocked();
+        try weights_t_stack.requireLiveUnlocked();
+        var layer_s = try self.layerWeights2DUnlocked(owner, &weights_s_stack, layer);
+        defer layer_s.deinitUnlocked();
+        var layer_t = try self.layerWeights2DUnlocked(owner, &weights_t_stack, layer);
+        defer layer_t.deinitUnlocked();
+        var out: ?*futhark.struct_futhark_f16_3d = null;
+        const rc = futhark.futhark_entry_rsf_causal_bitmask_forward(
+            handle,
+            &out,
+            state.arr,
+            mask_arr,
+            layer_s.arr,
+            layer_t.arr,
+            @floatCast(self.clip_min),
+            @floatCast(self.clip_max),
+            self.diffusion_enabled,
+            self.diffusion_radix,
+            self.diffusion_block,
+            self.diffusion_stages,
+        );
+        if (rc != 0 or out == null) {
+            if (out) |produced| _ = futhark.futhark_free_f16_3d(handle, produced);
+            return owner.recordFailureUnlocked(AccelError.FutharkForwardFailed);
+        }
+        validateShapeF16_3DUnlocked(owner, out.?, state.dim0, state.dim1, state.dim2) catch |err| {
+            _ = futhark.futhark_free_f16_3d(handle, out.?);
+            return err;
+        };
+        var produced = FutharkArray3DF16.adoptUnlocked(owner, out.?, state.dim0, state.dim1, state.dim2);
+        var previous = state.*;
+        state.* = produced;
+        previous.deinitUnlocked();
+    }
+
+    pub fn causalSequenceInverse(self: *Self, state: *FutharkArray3DF16, mask: *const types.RSFSequenceMask, layer: usize) AccelError!void {
+        const owner = try self.requireOwnerLive();
+        try state.requireSameContext(&self.ctx);
+        if (layer >= self.num_layers) return AccelError.InvalidDimensions;
+        if (state.dim2 != self.model_dim) return AccelError.InvalidDimensions;
+        if (mask.seq_len != state.dim1) return AccelError.InvalidDimensions;
+        owner.lock();
+        defer owner.unlock();
+        try self.checkInvariantsUnlocked();
+        try state.requireLiveUnlocked();
+        const mask_arr = try self.uploadMaskUnlocked(owner, mask);
+        const handle = try owner.requireHandleUnlocked();
+        const weights_s_stack = self.stack_weights_s orelse return AccelError.InvalidResourceState;
+        const weights_t_stack = self.stack_weights_t orelse return AccelError.InvalidResourceState;
+        try weights_s_stack.requireLiveUnlocked();
+        try weights_t_stack.requireLiveUnlocked();
+        var layer_s = try self.layerWeights2DUnlocked(owner, &weights_s_stack, layer);
+        defer layer_s.deinitUnlocked();
+        var layer_t = try self.layerWeights2DUnlocked(owner, &weights_t_stack, layer);
+        defer layer_t.deinitUnlocked();
+        var out: ?*futhark.struct_futhark_f16_3d = null;
+        const rc = futhark.futhark_entry_rsf_causal_bitmask_inverse(
+            handle,
+            &out,
+            state.arr,
+            mask_arr,
+            layer_s.arr,
+            layer_t.arr,
+            @floatCast(self.clip_min),
+            @floatCast(self.clip_max),
+            self.diffusion_enabled,
+            self.diffusion_radix,
+            self.diffusion_block,
+            self.diffusion_stages,
+        );
+        if (rc != 0 or out == null) {
+            if (out) |produced| _ = futhark.futhark_free_f16_3d(handle, produced);
+            return owner.recordFailureUnlocked(AccelError.FutharkInverseFailed);
+        }
+        validateShapeF16_3DUnlocked(owner, out.?, state.dim0, state.dim1, state.dim2) catch |err| {
+            _ = futhark.futhark_free_f16_3d(handle, out.?);
+            return err;
+        };
+        var produced = FutharkArray3DF16.adoptUnlocked(owner, out.?, state.dim0, state.dim1, state.dim2);
+        var previous = state.*;
+        state.* = produced;
+        previous.deinitUnlocked();
+    }
+
     pub fn forwardFromTensor(self: *Self, input: *const core_tensor.Tensor, allocator: std.mem.Allocator) AccelError!core_tensor.Tensor {
         if (input.shape.dims.len != 2) return AccelError.InvalidDimensions;
         const rows = input.shape.dims[0];
@@ -3133,6 +3572,10 @@ fn rsfForwardLayerUnlocked(
     weights_t: *const FutharkArray2DF16,
     clip_min_bits: u16,
     clip_max_bits: u16,
+    diffusion: bool,
+    radix: i64,
+    block: i64,
+    stages: i64,
 ) AccelError!FutharkArray2DF16 {
     const handle = try owner.requireHandleUnlocked();
     try input.requireLiveUnlocked();
@@ -3149,6 +3592,10 @@ fn rsfForwardLayerUnlocked(
         weights_t.arr,
         clip_min_bits,
         clip_max_bits,
+        diffusion,
+        radix,
+        block,
+        stages,
     );
     if (rc != 0 or out == null) {
         if (out) |produced| _ = futhark.futhark_free_f16_2d(handle, produced);
@@ -3162,14 +3609,12 @@ fn normalizeMasterStackUnlocked(
     owner: *ContextOwner,
     master: *const FutharkArray3DF32,
     target: f32,
-    iterations: usize,
 ) AccelError!NormalizedStack {
     const handle = try owner.requireHandleUnlocked();
     try master.requireLiveUnlocked();
     const master_arr = master.arr orelse return AccelError.InvalidResourceState;
-    const iteration_count = try checkedDimension(iterations);
     var tuple: ?*futhark.struct_futhark_opaque_tup3_stack_spectral = null;
-    const rc = futhark.futhark_entry_stack_spectral_normalize(handle, &tuple, master_arr, target, iteration_count);
+    const rc = futhark.futhark_entry_stack_spectral_normalize_exact(handle, &tuple, master_arr, target);
     if (rc != 0 or tuple == null) {
         if (tuple) |produced| freeStackSpectralTupleUnlocked(owner, produced);
         return owner.recordFailureUnlocked(AccelError.FutharkNormalizationFailed);
@@ -4895,9 +5340,8 @@ test "rsf layer replacement survives optimizer update and spectral normalization
     try std.testing.expect(@abs(after_update.master_weights_s[1] - 0.25) < 1e-3);
     try std.testing.expect(@abs(after_update.master_weights_t[0] - 0.5) < 1e-3);
 
-    try std.testing.expectError(AccelError.InvalidHyperparameter, accel.spectralNormalizeLayers(0.0, 4));
-    try std.testing.expectError(AccelError.InvalidHyperparameter, accel.spectralNormalizeLayers(1.0, 0));
-    try accel.spectralNormalizeLayers(2.0, 4);
+    try std.testing.expectError(AccelError.InvalidHyperparameter, accel.spectralNormalizeLayers(0.0));
+    try accel.spectralNormalizeLayers(2.0);
 
     var after_norm = try accel.readOptimizerState(allocator);
     defer after_norm.deinit();
@@ -4934,8 +5378,9 @@ test "rsf optimizer state round trip preserves every value" {
     try std.testing.expectEqual(total, snapshot.master_weights_t.len);
     try std.testing.expectEqual(total, snapshot.momentum_s.len);
     try std.testing.expectEqual(total, snapshot.momentum_t.len);
-    try std.testing.expectEqual(total, snapshot.fisher_s.len);
-    try std.testing.expectEqual(total, snapshot.fisher_t.len);
+    const fisher_total = accel.numLayers() * half * rsf_fisher_width;
+    try std.testing.expectEqual(fisher_total, snapshot.fisher_s.len);
+    try std.testing.expectEqual(fisher_total, snapshot.fisher_t.len);
     try std.testing.expectEqual(@as(u64, 1), snapshot.step);
 
     try std.testing.expectError(

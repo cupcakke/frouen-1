@@ -50,7 +50,6 @@ let diffuse_row [n] (x: [n]f32) (radix: i64) (block: i64) (stages: i64) : [n]f32
 let apply_diffuse [n] (x: [n]f32) (diffusion: bool) (radix: i64) (block: i64) (stages: i64) : [n]f32 =
   if diffusion then diffuse_row x radix block stages else x
 
--- a,b,c accumulated in f64 from sanitized f32 via f64.f32, reduced with reduce (+) 0f64, closed form in f64, result f32.f64 guarded by f32.max 0.
 let gram_sigma_max_2col [m] (w: [m][2]f32) : f32 =
   let a = reduce (+) 0f64 (map (\i ->
     let x = f64.f32 (sanitize_f32 w[i][0])
@@ -162,7 +161,6 @@ entry rsf_forward [n][half] (input: [n][half*2]f16)
     let result = rsf_stack_coupling_row row_f32 weights_s weights_t clip_min_f32 clip_max_f32 diffusion radix block stages
     in map (\v -> f16.f32 (clamp_f16_value v)) result) input
 
--- Dense [vocab_size][dim] embedding operand: 2x2 Gram closed form is inapplicable; keep diagonal sfd_fisher_update_core for embedding_update_sfd_master.
 let sfd_fisher_update_core [d][e]
   (weights: [d][e]f32) (gradients: [d][e]f32)
   (momentum_state: [d][e]f32) (fisher_state: [d][e]f32)
@@ -282,7 +280,6 @@ entry stack_update_sfd_block2x2_master [layers][rows]
 entry master_weights_to_f16_2d [rows][columns] (weights: [rows][columns]f32): *[rows][columns]f16 =
   map (map (\value -> f16.f32 (clamp_f16_weight value))) weights
 
--- Dense [vocab_size][dim] embedding operand: 2x2 Gram closed form is inapplicable; keep diagonal sfd_fisher_update_core.
 entry embedding_update_sfd_master [vocab_size][dim]
   (master_weight: *[vocab_size][dim]f32) (grad_weight: [vocab_size][dim]f32)
   (momentum_state: *[vocab_size][dim]f32) (fisher_state: *[vocab_size][dim]f32)
@@ -357,7 +354,6 @@ entry embedding_backward_padded [n][batch_size][seq_len][dim][vocab_size]
   let updates = hist (map2 (+)) (replicate dim 0f32) vocab_size safe_tokens masked_grads
   in map2 (map2 (+)) grad_weight updates
 
--- Dense [vocab_size][dim] embedding matrix: 2x2 Gram closed form is inapplicable (Section 4.9); ping-pong power iteration retained.
 entry embedding_spectral_normalize [vocab_size][dim]
   (weight: *[vocab_size][dim]f32)
   (u: *[vocab_size]f32)
@@ -665,7 +661,6 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
   in (copy gs_normalized, copy gt_normalized, input_delta_3d,
       f32.max 0f32 loss, f32.max 0f32 recon_loss, logdet_mean)
 
--- Dual-frontier midpoint: two independent map/loop nests over the token axis so the compiler schedules the frontiers as independent work; two further independent adjoint nests.
 entry rsf_stack_midpoint_fused [batch_size][seq_len][half][num_layers]
   (inputs: [batch_size][seq_len][half*2]f16)
   (targets: [batch_size][seq_len][half*2]f16)
