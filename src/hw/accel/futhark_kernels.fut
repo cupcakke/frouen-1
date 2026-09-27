@@ -17,13 +17,6 @@ let matmul_tiled [m][n][k] (a: [m][k]f32) (b: [k][n]f32): [m][n]f32 =
     ) bt
   ) a
 
-let matmul_tiled_t32 [m][n][k] (a: [m][k]f32) (b: [k][n]f32): [m][n]f32 =
-  #[incremental_flattening(only_intra)]
-  map (\a_row ->
-    let bt = transpose b
-    in map (\b_col -> reduce (+) 0f32 (map2 (*) a_row b_col)) bt
-  ) a
-
 let batched_matmul [batch][m][n][k] (a: [batch][m][k]f32) (c: [batch][k][n]f32): [batch][m][n]f32 =
   map2 (\a_mat c_mat -> matmul_tiled a_mat c_mat) a c
 
@@ -112,20 +105,15 @@ let topk [n] (k: i64) (scores: [n]f32) (indices: [n]i64): ([k]f32, [k]i64) =
   )
   in (take safe_k desc_scores :> [k]f32, take safe_k desc_indices :> [k]i64)
 
+let oftb_scale_kernels : f32 = 0.7071067811865476
+
+-- Permutation gather used by entry rsf_forward/rsf_forward_multilayer/rsf_backward in this file; a permutation matrix has log|det|=0.
 let rsf_scatter [n] (x: [n]f32) (indices: [n]i64): [n]f32 =
-  if n < 2 then copy x
-  else
-    let half = n / 2
-    let inv_sqrt2 = 1f32 / f32.sqrt 2f32
-    in tabulate n (\i ->
-      if i < half then
-        let j = (i64.abs indices[i]) % half
-        in inv_sqrt2 * (x[j] + x[j + half])
-      else if i < half * 2 then
-        let j = (i64.abs indices[i]) % half
-        in inv_sqrt2 * (x[j] - x[j + half])
-      else x[i]
-    )
+  if n <= 0 then copy x
+  else tabulate n (\i ->
+    let j = (i64.abs indices[i]) % n
+    in x[j]
+  )
 
 let rsf_flow [half] (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (clip_min: f32) (clip_max: f32): [half*2]f32 =
   let d = half * 2
@@ -141,7 +129,9 @@ let rsf_flow [half] (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][
     t_weight[j][0] * y1[j] + t_weight[j][1]
   )
   let y2 = map2 (+) x2 trans
-  in (y1 ++ y2) :> [half*2]f32
+  let o1 = map2 (\a b -> (a - b) * oftb_scale_kernels) y1 y2
+  let o2 = map2 (\a b -> (a + b) * oftb_scale_kernels) y1 y2
+  in (o1 ++ o2) :> [half*2]f32
 
 let rsf_flow_logdet [half] (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (clip_min: f32) (clip_max: f32): ([half*2]f32, f32) =
   let d = half * 2
@@ -157,12 +147,16 @@ let rsf_flow_logdet [half] (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: 
     t_weight[j][0] * y1[j] + t_weight[j][1]
   )
   let y2 = map2 (+) x2 trans
-  in ((y1 ++ y2) :> [half*2]f32, logdet)
+  let o1 = map2 (\a b -> (a - b) * oftb_scale_kernels) y1 y2
+  let o2 = map2 (\a b -> (a + b) * oftb_scale_kernels) y1 y2
+  in ((o1 ++ o2) :> [half*2]f32, logdet)
 
 let rsf_invert_flow [half] (y: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (clip_min: f32) (clip_max: f32): [half*2]f32 =
   let d = half * 2
-  let y1 = y[0:half] :> [half]f32
-  let y2 = y[half:d] :> [half]f32
+  let y1p = y[0:half] :> [half]f32
+  let y2p = y[half:d] :> [half]f32
+  let y1 = map2 (\a b -> (a + b) * oftb_scale_kernels) y1p y2p
+  let y2 = map2 (\a b -> (b - a) * oftb_scale_kernels) y1p y2p
   let trans = tabulate half (\j ->
     t_weight[j][0] * y1[j] + t_weight[j][1]
   )
@@ -187,24 +181,10 @@ let rsf_forward_multi [num_layers][half] (x: [half*2]f32) (s_ws: [num_layers][ha
     rsf_forward_layer acc s_ws[i] t_ws[i] perms[i] clip_min clip_max
 
 let rsf_backward_scatter [n] (grad: [n]f32) (indices: [n]i64): [n]f32 =
-  if n < 2 then copy grad
+  if n <= 0 then copy grad
   else
-    let half = n / 2
-    let inv_sqrt2 = 1f32 / f32.sqrt 2f32
-    let safe_idx = tabulate n (\i -> (i64.abs indices[i]) % half)
-    let idx_first = tabulate half (\i -> safe_idx[i])
-    let idx_second = tabulate half (\i -> safe_idx[i + half])
-    let grad_first = tabulate half (\i -> inv_sqrt2 * grad[i])
-    let grad_second = tabulate half (\i -> inv_sqrt2 * grad[i + half])
-    let grad_lower = reduce_by_index (replicate half 0f32) (+) 0f32
-      (idx_first ++ idx_second) (grad_first ++ grad_second)
-    let grad_upper = reduce_by_index (replicate half 0f32) (+) 0f32
-      (idx_first ++ idx_second)
-      (grad_first ++ map (\g -> -g) grad_second)
-    let base = grad_lower ++ grad_upper
-    in tabulate n (\i ->
-      if i < half * 2 then base[i] else grad[i]
-    )
+    let safe_idx = tabulate n (\i -> (i64.abs indices[i]) % n)
+    in reduce_by_index (replicate n 0f32) (+) 0f32 safe_idx grad
 
 let rsf_backward_flow [half] (grad_out: [half*2]f32) (x: [half*2]f32) (s_weight: [half][2]f32) (t_weight: [half][2]f32) (clip_min: f32) (clip_max: f32): ([half*2]f32, [half][2]f32, [half][2]f32) =
   let d = half * 2
@@ -218,8 +198,10 @@ let rsf_backward_flow [half] (grad_out: [half*2]f32) (x: [half*2]f32) (s_weight:
     in f32.exp clipped
   ) pre_scale
   let y1 = map2 (*) x1 scale
-  let dy1 = grad_out[0:half] :> [half]f32
-  let dy2 = grad_out[half:d] :> [half]f32
+  let g1p = grad_out[0:half] :> [half]f32
+  let g2p = grad_out[half:d] :> [half]f32
+  let dy1 = map2 (\a b -> (a + b) * oftb_scale_kernels) g1p g2p
+  let dy2 = map2 (\a b -> (b - a) * oftb_scale_kernels) g1p g2p
   let dy1_total = tabulate half (\j ->
     dy1[j] + t_weight[j][0] * dy2[j]
   )
@@ -245,8 +227,14 @@ let rsf_backward_smr [half] (grad_out: [half*2]f32) (y_out: [half*2]f32)
                             (clip_min: f32) (clip_max: f32) (logdet_weight: f32)
                             : ([half*2]f32, ([half][2]f32, [half][2]f32), f32) =
   let d = half * 2
-  let y1 = y_out[0:half] :> [half]f32
-  let y2 = y_out[half:d] :> [half]f32
+  let y1p = y_out[0:half] :> [half]f32
+  let y2p = y_out[half:d] :> [half]f32
+  let y1 = map2 (\a b -> (a + b) * oftb_scale_kernels) y1p y2p
+  let y2 = map2 (\a b -> (b - a) * oftb_scale_kernels) y1p y2p
+  let g1p = grad_out[0:half] :> [half]f32
+  let g2p = grad_out[half:d] :> [half]f32
+  let grad_c1 = map2 (\a b -> (a + b) * oftb_scale_kernels) g1p g2p
+  let grad_c2 = map2 (\a b -> (b - a) * oftb_scale_kernels) g1p g2p
   let trans = tabulate half (\j ->
     t_weight[j][0] * y1[j] + t_weight[j][1]
   )
@@ -262,8 +250,8 @@ let rsf_backward_smr [half] (grad_out: [half*2]f32) (y_out: [half*2]f32)
     let s = f32.max scale[j] 1e-30f32
     in y1[j] / s
   )
-  let dy1 = grad_out[0:half] :> [half]f32
-  let dy2 = grad_out[half:d] :> [half]f32
+  let dy1 = grad_c1
+  let dy2 = grad_c2
   let dy1_total = tabulate half (\j ->
     dy1[j] + t_weight[j][0] * dy2[j]
   )
@@ -307,14 +295,6 @@ let rsf_backward_layer_smr [half] (grad_out: [half*2]f32) (y_out: [half*2]f32) (
 let hash_sequence [m] (tokens: [m]u32): u64 =
   loop h = 14695981039346656037u64 for i < m do
     (h ^ u64.u32 tokens[i]) * 1099511628211u64
-
-let ssi_hash_insert [n] (hashes: [n]u64) (new_hash: u64): [n+1]u64 =
-  let pos = reduce (+) 0i64 (map (\h -> if h < new_hash then 1i64 else 0i64) hashes)
-  in tabulate (n + 1) (\i ->
-    if i < pos then hashes[i]
-    else if i == pos then new_hash
-    else hashes[i - 1]
-  )
 
 let ssi_search [n][m] (tree_hashes: [n]u64) (query: [m]u32): i64 =
   if n == 0 then -1i64
@@ -394,6 +374,7 @@ let minhash_signature [n] (tokens: [n]u32) (num_perm: i64) (seed: u64): []u64 =
       in min_h
     )
 
+-- 1-D weight context path used by entry compute_rsf_context; not the stack training map.
 let rsf_relational_context [seq_len][d_model] (spectral_input: [seq_len][d_model]f32) (_temporal_input: [seq_len][d_model]f32) (value: [seq_len][d_model]f32) (s_weight: [d_model]f32) (t_weight: [d_model]f32) (_eps: f32): [seq_len][d_model]f32 =
   if seq_len == 0 || d_model == 0 then copy value
   else
@@ -528,6 +509,37 @@ entry sfd_fused_step_1d [n] (weights: [n]f32) (grads: [n]f32) (moments: [n]f32) 
                             (learning_rate: f32) (momentum_coeff: f32) (fisher_decay: f32)
                             (eps: f32) (grad_scale: f32): ([]f32, []f32, []f32) =
   sfd_fisher_fused_1d weights grads moments fishers learning_rate momentum_coeff fisher_decay eps grad_scale
+
+let resolvent_2x2 (fww: f32) (fwb: f32) (fbb: f32) (gw: f32) (gb: f32) (damping: f32) : [2]f32 =
+  let lam = f32.max (if f32.isnan damping || f32.isinf damping then 0f32 else damping) 1e-12f32
+  let a = f32.max 0f32 (if f32.isnan fww || f32.isinf fww then 0f32 else fww) + lam
+  let b = if f32.isnan fwb || f32.isinf fwb then 0f32 else fwb
+  let c = f32.max 0f32 (if f32.isnan fbb || f32.isinf fbb then 0f32 else fbb) + lam
+  let det = f32.max 1e-12f32 (a * c - b * b)
+  let sd = f32.sqrt det
+  let s = f32.sqrt (f32.max 0f32 (a + c + 2f32 * sd))
+  let alpha = 1f32 / (sd * f32.max s 1e-12f32)
+  let ngw = alpha * ((c + sd) * gw - b * gb)
+  let ngb = alpha * ((-b) * gw + (a + sd) * gb)
+  let ngw_s = if f32.isnan ngw || f32.isinf ngw then 0f32 else ngw
+  let ngb_s = if f32.isnan ngb || f32.isinf ngb then 0f32 else ngb
+  in [ngw_s, ngb_s] :> [2]f32
+
+entry block_natural_grad_2x2 [n] (grad_pairs: [n][2]f32) (fisher_blocks: [n][3]f32) (damping: f32) : [n][2]f32 =
+  map2 (\g f -> resolvent_2x2 f[0] f[1] f[2] g[0] g[1] damping) grad_pairs fisher_blocks
+
+entry update_fisher_block [n] (fisher_blocks: [n][3]f32) (grad_pairs: [n][2]f32) (decay: f32) : [n][3]f32 =
+  let safe_decay = f32.max 0f32 (f32.min 1f32 decay)
+  in map2 (\f g ->
+    let gw = if f32.isnan g[0] || f32.isinf g[0] then 0f32 else g[0]
+    let gb = if f32.isnan g[1] || f32.isinf g[1] then 0f32 else g[1]
+    let fww = f32.min 1e6f32 (f32.max 0f32 (if f32.isnan f[0] || f32.isinf f[0] then 0f32 else f[0]))
+    let fwb = f32.min 1e6f32 (f32.max (-1e6f32) (if f32.isnan f[1] || f32.isinf f[1] then 0f32 else f[1]))
+    let fbb = f32.min 1e6f32 (f32.max 0f32 (if f32.isnan f[2] || f32.isinf f[2] then 0f32 else f[2]))
+    let nww = f32.min 1e6f32 (f32.max 0f32 (safe_decay * fww + (1f32 - safe_decay) * gw * gw))
+    let nwb = f32.min 1e6f32 (f32.max (-1e6f32) (safe_decay * fwb + (1f32 - safe_decay) * gw * gb))
+    let nbb = f32.min 1e6f32 (f32.max 0f32 (safe_decay * fbb + (1f32 - safe_decay) * gb * gb))
+    in [nww, nwb, nbb] :> [3]f32) fisher_blocks grad_pairs
 
 entry rank_segments [n] (query_hash: u64) (segment_hashes: [n]u64) (base_scores: [n]f32): [n]f32 = score_segments query_hash segment_hashes base_scores
 entry select_topk [n] (k: i64) (scores: [n]f32): ([]f32, []i64) =
@@ -869,6 +881,7 @@ let rgpu_measure_probability_batch [n] (states: [n]complex): [n]f32 =
        then replicate n (1f32 / f32.i64 n)
        else map (\p -> p / total) raw
 
+-- Complex single-qubit Hadamard of the quantum path; not the real normalized FWHT of Theta = Q_r tensor H_2^k.
 let rgpu_hadamard_transform (state: complex): complex =
   let inv_sqrt2 = 1f32 / f32.sqrt 2f32
   in {re = inv_sqrt2 * (state.re + state.im), im = inv_sqrt2 * (state.re - state.im)}
@@ -882,23 +895,6 @@ let rgpu_phase_shift (state: complex) (theta: f32): complex =
 
 let rgpu_phase_shift_batch [n] (states: [n]complex) (thetas: [n]f32): [n]complex =
   map2 rgpu_phase_shift states thetas
-
-let rgpu_pauli_x (state: complex): complex =
-  {re = state.im, im = state.re}
-
-let rgpu_pauli_y (state: complex): complex =
-  {re = -state.im, im = state.re}
-
-let rgpu_pauli_z (state: complex): complex =
-  {re = state.re, im = -state.im}
-
-let rgpu_cnot (control: complex) (target: complex): (complex, complex) =
-  let phase = f32.atan2 control.im control.re
-  let cos_p = f32.cos phase
-  let sin_p = f32.sin phase
-  let new_target = {re = cos_p * target.re - sin_p * target.im,
-                    im = sin_p * target.re + cos_p * target.im}
-  in (control, new_target)
 
 let rgpu_fractal_transform (state: complex) (depth: i64): complex =
   loop current = state for i < (i64.max 0 depth) do
@@ -1138,56 +1134,15 @@ entry rgpu_rel_xor (re1: f32) (im1: f32) (re2: f32) (im2: f32): (f32, f32) =
   let result = rgpu_relational_xor {re=re1, im=im1} {re=re2, im=im2}
   in (result.re, result.im)
 
-let rsf_backward_full [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2]f16)
-  (weights_s: [half][2]f16) (weights_t: [half][2]f16)
-  (clip_min: f16) (clip_max: f16)
-  : ([half][2]f16, [half][2]f16, [n][half*2]f16) =
-  let per_tok = map2 (\row g_row ->
-    let x1 = row[0:half] :> [half]f16
-    let x2 = row[half:half*2] :> [half]f16
-    let pre_scale = map (\j ->
-      weights_s[j][0] f16.* x2[j] f16.+ weights_s[j][1]
-    ) (iota half)
-    let scale = map (\ps -> f16.exp (f16.max clip_min (f16.min clip_max ps))) pre_scale
-    let y1 = map2 (f16.*) x1 scale
-    let dy1 = g_row[0:half] :> [half]f16
-    let dy2 = g_row[half:half*2] :> [half]f16
-    let dy1_total = map2 (\dy1_j j ->
-      dy1_j f16.+ weights_t[j][0] f16.* dy2[j]
-    ) dy1 (iota half)
-    let ds = map2 (\j ps ->
-      if ps f16.>= clip_min && ps f16.<= clip_max
-      then dy1_total[j] f16.* y1[j]
-      else f16.i32 0
-    ) (iota half) pre_scale
-    let dx1 = map2 (f16.*) dy1_total scale
-    let dx2 = map2 (f16.+) dy2 (map2 (f16.*) ds (map (\j -> weights_s[j][0]) (iota half)))
-    in (ds, x2, dy2, y1, dx1 ++ dx2 :> [half*2]f16)
-  ) input grad_output
-  let ds_all = map (\(a,_,_,_,_) -> a) per_tok
-  let x2_all = map (\(_,b,_,_,_) -> b) per_tok
-  let dy2_all = map (\(_,_,c,_,_) -> c) per_tok
-  let y1_all = map (\(_,_,_,d,_) -> d) per_tok
-  let g_in = map (\(_,_,_,_,e) -> e) per_tok
-  let ds_t = transpose ds_all
-  let x2_t = transpose x2_all
-  let dy2_t = transpose dy2_all
-  let y1_t = transpose y1_all
-  let acc_ws = map2 (\ds_row x2_row ->
-    [f16.sum (map2 (f16.*) ds_row x2_row), f16.sum ds_row] :> [2]f16
-  ) ds_t x2_t
-  let acc_wt = map2 (\dy2_row y1_row ->
-    [f16.sum (map2 (f16.*) dy2_row y1_row), f16.sum dy2_row] :> [2]f16
-  ) dy2_t y1_t
-  in (acc_ws, acc_wt, g_in)
-
 let rsf_backward_smr_f16 [n][half] (y_output: [n][half*2]f16) (grad_output: [n][half*2]f16)
   (weights_s: [half][2]f16) (weights_t: [half][2]f16)
   (clip_min: f32) (clip_max: f32) (logdet_weight: f32)
   : ([half][2]f32, [half][2]f32, [n][half*2]f32, [n][half*2]f32, f32) =
   let per_tok = map2 (\y_row g_row ->
-    let y1 = map f32.f16 (y_row[0:half] :> [half]f16)
-    let y2 = map f32.f16 (y_row[half:half*2] :> [half]f16)
+    let y1p = map f32.f16 (y_row[0:half] :> [half]f16)
+    let y2p = map f32.f16 (y_row[half:half*2] :> [half]f16)
+    let y1 = map2 (\a b -> (a + b) * oftb_scale_kernels) y1p y2p
+    let y2 = map2 (\a b -> (b - a) * oftb_scale_kernels) y1p y2p
     let trans = map (\j ->
       f32.f16 weights_t[j][0] * y1[j] + f32.f16 weights_t[j][1]
     ) (iota half)
@@ -1197,8 +1152,10 @@ let rsf_backward_smr_f16 [n][half] (y_output: [n][half*2]f16) (grad_output: [n][
     ) (iota half)
     let scale = map (\ps -> f32.exp (f32.max clip_min (f32.min clip_max ps))) pre_scale
     let x1 = map2 (\y1_v s -> y1_v / f32.max s 1e-30f32) y1 scale
-    let dy1 = map f32.f16 (g_row[0:half] :> [half]f16)
-    let dy2 = map f32.f16 (g_row[half:half*2] :> [half]f16)
+    let g1p = map f32.f16 (g_row[0:half] :> [half]f16)
+    let g2p = map f32.f16 (g_row[half:half*2] :> [half]f16)
+    let dy1 = map2 (\a b -> (a + b) * oftb_scale_kernels) g1p g2p
+    let dy2 = map2 (\a b -> (b - a) * oftb_scale_kernels) g1p g2p
     let dy1_total = map2 (\dy1_j j ->
       dy1_j + f32.f16 weights_t[j][0] * dy2[j]
     ) dy1 (iota half)
