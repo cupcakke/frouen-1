@@ -6,9 +6,14 @@ const types = @import("../core/types.zig");
 const BitSet = types.BitSet;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const SSI = @import("../index/ssi.zig").SSI;
+const SSIScoringConfig = @import("../index/ssi.zig").SSIScoringConfig;
 const core_io = @import("../core/io.zig");
 const stableHash = core_io.stableHash;
 const Error = types.Error;
+const rsf_mod = @import("../processor/rsf.zig");
+const RSF = rsf_mod.RSF;
+const RSFLatentState = rsf_mod.RSFLatentState;
+const SFD = @import("../optimizer/sfd.zig").SFD;
 
 pub const RankerConfig = struct {
     pub const STREAMING_BUFFER_SIZE: usize = 1024;
@@ -28,7 +33,16 @@ pub const RankerConfig = struct {
     pub const PROXIMITY_SCALE: u64 = 1024;
     pub const SCORE_SIGMOID_CENTER: f32 = 0.8;
     pub const SCORE_SIGMOID_WIDTH: f32 = 0.4;
+    pub const HEAD_DIM: usize = 2;
+    pub const HEAD_LAYERS: usize = 1;
+    pub const HEAD_STATE: usize = 4;
+    pub const HEAD_COUPLING_WIDTH: usize = 2;
+    pub const EXPORT_VERSION: u8 = 3;
+    pub const EXPORT_VERSION_LEGACY: u8 = 2;
+    pub const RAW_FUSE_DIVISOR: f32 = 10.0;
 };
+
+const head_pair_len: usize = RankerConfig.HEAD_DIM * RankerConfig.HEAD_COUPLING_WIDTH;
 
 fn tokenToLEBytes(token: u32) [4]u8 {
     return mem.toBytes(mem.nativeToLittle(u32, token));
@@ -72,6 +86,13 @@ const RankedSegmentComparator = struct {
     }
 };
 
+pub const CandidateEvaluation = struct {
+    score: f32,
+    latent_similarity: f32,
+    reconstruction_confidence: f32,
+    volume_surprise: f32,
+};
+
 pub const Ranker = struct {
     ngram_weights: []f32,
     lsh_hash_params: []u64,
@@ -79,11 +100,60 @@ pub const Ranker = struct {
     num_ngrams: usize,
     seed: u64,
     allocator: Allocator,
+    head: RSF,
+    head_sfd: SFD,
+    model_id: u64,
+    model_dim: usize,
+    model_global_diffusion: bool,
 
-    pub fn init(allocator: Allocator, num_ngrams: usize, num_hash_funcs: usize, seed: u64) !Ranker {
+    fn seedHeadWeights(head: *RSF, seed: u64, allocator: Allocator) !void {
+        const plen = head_pair_len;
+        const s_buf = try allocator.alloc(f32, plen);
+        defer allocator.free(s_buf);
+        const t_buf = try allocator.alloc(f32, plen);
+        defer allocator.free(t_buf);
+        var prng = types.PRNG.init(seed ^ 0xC0FFEE00FF00FF00);
+        const bound: f32 = @sqrt(6.0 / 4.0);
+        var i: usize = 0;
+        while (i < plen) : (i += 1) {
+            s_buf[i] = prng.float() * (2.0 * bound) - bound;
+            t_buf[i] = prng.float() * (2.0 * bound) - bound;
+        }
+        var d: usize = 0;
+        while (d < RankerConfig.HEAD_DIM) : (d += 1) {
+            s_buf[d * RankerConfig.HEAD_COUPLING_WIDTH + 1] = 0.0;
+            t_buf[d * RankerConfig.HEAD_COUPLING_WIDTH + 1] = 0.0;
+        }
+        try head.writeLayerWeights(0, s_buf, t_buf);
+    }
+
+    fn createHead(allocator: Allocator, seed: u64) !RSF {
+        var head = try RSF.initWithConfig(allocator, RankerConfig.HEAD_DIM, RankerConfig.HEAD_LAYERS, .{
+            .global_diffusion = false,
+            .clip_min = -5.0,
+            .clip_max = 5.0,
+        });
+        errdefer head.deinit();
+        try seedHeadWeights(&head, seed, allocator);
+        return head;
+    }
+
+    fn resetHead(self: *Ranker) !void {
+        self.head_sfd.deinit();
+        self.head.deinit();
+        self.head = try createHead(self.allocator, self.seed);
+        errdefer self.head.deinit();
+        self.head_sfd = try SFD.init(self.allocator, &self.head);
+    }
+
+    pub fn init(allocator: Allocator, num_ngrams: usize, num_hash_funcs: usize, seed: u64, model: *const RSF) !Ranker {
         if (num_ngrams == 0) return error.InvalidParameter;
         if (num_ngrams > RankerConfig.MAX_NGRAM_ORDER) return error.InvalidParameter;
         if (num_hash_funcs == 0) return error.InvalidParameter;
+        if (model.id == 0) return Error.RSFModelMismatch;
+        const model_dim = try model.dim();
+        if (model_dim == 0) return error.InvalidParameter;
+        const model_gd = try model.globalDiffusionEnabled();
 
         const weights = try allocator.alloc(f32, num_ngrams);
         errdefer allocator.free(weights);
@@ -105,6 +175,11 @@ pub const Ranker = struct {
             hash_params[i * 2 + 1] = seed +% (i_plus_one *% RankerConfig.HASH_SEED_MULTIPLIER_B);
         }
 
+        var head = try createHead(allocator, seed);
+        errdefer head.deinit();
+        var head_sfd = try SFD.init(allocator, &head);
+        errdefer head_sfd.deinit();
+
         return .{
             .ngram_weights = weights,
             .lsh_hash_params = hash_params,
@@ -112,12 +187,224 @@ pub const Ranker = struct {
             .num_ngrams = num_ngrams,
             .seed = seed,
             .allocator = allocator,
+            .head = head,
+            .head_sfd = head_sfd,
+            .model_id = model.id,
+            .model_dim = model_dim,
+            .model_global_diffusion = model_gd,
         };
     }
 
     pub fn deinit(self: *Ranker) void {
+        self.head_sfd.deinit();
+        self.head.deinit();
         self.allocator.free(self.ngram_weights);
         self.allocator.free(self.lsh_hash_params);
+    }
+
+    fn requireModel(self: *const Ranker, model: *const RSF, ssi: *const SSI) !void {
+        if (model.id == 0 or model.id != self.model_id) return Error.RSFModelMismatch;
+        const dim = try model.dim();
+        if (dim != self.model_dim) return Error.RSFModelMismatch;
+        const gd = try model.globalDiffusionEnabled();
+        if (gd != self.model_global_diffusion) return Error.RSFModelMismatch;
+        if (ssi.identity_set) {
+            if (ssi.dim != self.model_dim) return Error.RSFModelMismatch;
+            if (ssi.global_diffusion != self.model_global_diffusion) return Error.RSFModelMismatch;
+            if (ssi.model_id != 0 and ssi.model_id != self.model_id) return Error.RSFModelMismatch;
+        }
+    }
+
+    fn requireQuery(self: *const Ranker, model: *const RSF, query_state: *const RSFLatentState, ssi: *const SSI) !void {
+        try self.requireModel(model, ssi);
+        try query_state.requireModel(model);
+        if (query_state.data.shape.dims.len != 3) return error.InvalidShape;
+        if (query_state.data.shape.dims[0] == 0) return error.EmptyInput;
+        if (query_state.data.shape.dims[1] != self.model_dim or query_state.data.shape.dims[2] != 2) return Error.RSFDimMismatch;
+    }
+
+    fn packStateBlocked(state: *const RSFLatentState, dim: usize, out: []f32) !void {
+        if (state.data.shape.dims.len != 3) return error.InvalidShape;
+        if (state.data.shape.dims[1] != dim or state.data.shape.dims[2] != 2) return error.ShapeMismatch;
+        if (state.data.shape.dims[0] == 0) return error.EmptyInput;
+        if (out.len < dim * 2) return error.DataLengthMismatch;
+        const data = state.data.data;
+        var d: usize = 0;
+        while (d < dim) : (d += 1) {
+            out[d] = data[d * 2];
+            out[dim + d] = data[d * 2 + 1];
+        }
+    }
+
+    fn latentStateFromBlocked(allocator: Allocator, model: *const RSF, blocked: []const f32) !RSFLatentState {
+        const dim = try model.dim();
+        if (blocked.len != dim * 2) return error.ShapeMismatch;
+        var x1 = try Tensor.init(allocator, &[_]usize{ 1, dim });
+        defer x1.deinit();
+        var x2 = try Tensor.init(allocator, &[_]usize{ 1, dim });
+        defer x2.deinit();
+        @memcpy(x1.data[0..dim], blocked[0..dim]);
+        @memcpy(x2.data[0..dim], blocked[dim .. dim * 2]);
+        return RSFLatentState.fromHalves(allocator, model, &x1, &x2);
+    }
+
+    fn hashEmbedTokens(tokens: []const u32, dim: usize, seed: u64, out: []f32) void {
+        const total = dim * 2;
+        if (out.len < total or dim == 0) return;
+        var d: usize = 0;
+        while (d < total) : (d += 1) {
+            var acc: u64 = seed ^ (@as(u64, @intCast(d)) *% RankerConfig.HASH_SEED_MULTIPLIER_A);
+            var ti: usize = 0;
+            while (ti < tokens.len) : (ti += 1) {
+                const le = tokenToLEBytes(tokens[ti]);
+                acc = stableHash(&le, acc);
+            }
+            const top = acc >> 40;
+            const u = @as(f32, @floatFromInt(top)) / 16777216.0;
+            var v = u * 2.0 - 1.0;
+            if (!std.math.isFinite(v)) v = 0.0;
+            out[d] = v;
+        }
+    }
+
+    fn cosineClamped(a: []const f32, b: []const f32) f32 {
+        if (a.len == 0 or b.len == 0 or a.len != b.len) return 0.0;
+        var dot: f64 = 0.0;
+        var na: f64 = 0.0;
+        var nb: f64 = 0.0;
+        var i: usize = 0;
+        while (i < a.len) : (i += 1) {
+            if (!std.math.isFinite(a[i]) or !std.math.isFinite(b[i])) continue;
+            const x: f64 = a[i];
+            const y: f64 = b[i];
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        const denom = @sqrt(na) * @sqrt(nb) + @as(f64, SSIScoringConfig.cosine_eps);
+        const cos: f32 = @floatCast(dot / denom);
+        if (!std.math.isFinite(cos)) return 0.0;
+        return math.clamp(cos, 0.0, 1.0);
+    }
+
+    fn volumeSurprise(segment_log_det: f32, query_log_det: f32) f32 {
+        const sl = if (std.math.isFinite(segment_log_det)) segment_log_det else 0.0;
+        const ql = if (std.math.isFinite(query_log_det)) query_log_det else 0.0;
+        const delta = @abs(sl - ql) / SSIScoringConfig.volume_kappa;
+        const v: f32 = @floatCast(@exp(@as(f64, -delta)));
+        if (!std.math.isFinite(v)) return 0.0;
+        return math.clamp(v, 0.0, 1.0);
+    }
+
+    fn queryStateFromTokens(self: *const Ranker, model: *RSF, tokens: []const u32, allocator: Allocator) !RSFLatentState {
+        const dim = self.model_dim;
+        const blocked = try allocator.alloc(f32, dim * 2);
+        defer allocator.free(blocked);
+        hashEmbedTokens(tokens, dim, self.seed, blocked);
+        var state = try latentStateFromBlocked(allocator, model, blocked);
+        errdefer state.deinit();
+        try model.forwardLatent(&state);
+        return state;
+    }
+
+    fn candidateLatent(self: *const Ranker, model: *RSF, tokens: []const u32, position: u64, ssi: *const SSI, allocator: Allocator, out: []f32, log_det_out: *f32) !void {
+        const dim = self.model_dim;
+        if (out.len < dim * 2) return error.DataLengthMismatch;
+        if (ssi.getSegment(position)) |seg| {
+            if (seg.latent_version == 1 and seg.latent.len == dim * 2) {
+                @memcpy(out[0 .. dim * 2], seg.latent[0 .. dim * 2]);
+                log_det_out.* = seg.log_det;
+                return;
+            }
+        }
+        hashEmbedTokens(tokens, dim, self.seed, out);
+        var state = try latentStateFromBlocked(allocator, model, out[0 .. dim * 2]);
+        defer state.deinit();
+        try model.forwardLatent(&state);
+        try packStateBlocked(&state, dim, out);
+        log_det_out.* = state.log_det;
+    }
+
+    fn headForwardAlloc(self: *Ranker, z: [4]f32, allocator: Allocator) !f32 {
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            if (!std.math.isFinite(z[i])) return error.NonFinite;
+        }
+        var x = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        defer x.deinit();
+        @memcpy(x.data[0..RankerConfig.HEAD_STATE], &z);
+        try self.head.forward(&x);
+        const readout = x.data[0] + x.data[1];
+        if (!std.math.isFinite(readout)) return error.NonFinite;
+        return readout;
+    }
+
+    pub fn headForward(self: *Ranker, z: [4]f32) !f32 {
+        return self.headForwardAlloc(z, self.allocator);
+    }
+
+    fn fusedFromZ(self: *Ranker, z: [4]f32, allocator: Allocator) !f32 {
+        const raw = try self.headForwardAlloc(z, allocator);
+        return sigmoidScale(raw * (RankerConfig.MAX_RAW_SCORE / RankerConfig.RAW_FUSE_DIVISOR));
+    }
+
+    fn criteriaVector(
+        self: *Ranker,
+        model: *RSF,
+        query_state: *const RSFLatentState,
+        query_tokens: []const u32,
+        tokens: []const u32,
+        position: u64,
+        ssi: *const SSI,
+        allocator: Allocator,
+    ) ![4]f32 {
+        const dim = self.model_dim;
+        const z_token = if (query_tokens.len > 0)
+            try self.scoreSequenceWithQueryAlloc(tokens, query_tokens, ssi, allocator)
+        else
+            try self.scoreSequenceAlloc(tokens, ssi, allocator);
+        const q_blocked = try allocator.alloc(f32, dim * 2);
+        defer allocator.free(q_blocked);
+        try packStateBlocked(query_state, dim, q_blocked);
+        const c_blocked = try allocator.alloc(f32, dim * 2);
+        defer allocator.free(c_blocked);
+        var cand_log_det: f32 = 0.0;
+        try self.candidateLatent(model, tokens, position, ssi, allocator, c_blocked, &cand_log_det);
+        const z_latent = cosineClamped(q_blocked, c_blocked);
+        var cand_state = try latentStateFromBlocked(allocator, model, c_blocked);
+        defer cand_state.deinit();
+        const rt = cand_state.roundtripError(model, allocator) catch math.inf(f32);
+        const z_recon = if (std.math.isFinite(rt)) math.clamp(1.0 - rt, 0.0, 1.0) else 0.0;
+        const z_volume = volumeSurprise(cand_log_det, query_state.log_det);
+        const zt = if (std.math.isFinite(z_token)) math.clamp(z_token, 0.0, 1.0) else 0.0;
+        return .{ zt, z_latent, z_recon, z_volume };
+    }
+
+    fn evaluateCandidate(
+        self: *Ranker,
+        model: *RSF,
+        query_state: *const RSFLatentState,
+        query_tokens: []const u32,
+        tokens: []const u32,
+        position: u64,
+        ssi: *const SSI,
+        allocator: Allocator,
+    ) !CandidateEvaluation {
+        const z = try self.criteriaVector(model, query_state, query_tokens, tokens, position, ssi, allocator);
+        const score = try self.fusedFromZ(z, allocator);
+        return .{
+            .score = score,
+            .latent_similarity = z[1],
+            .reconstruction_confidence = z[2],
+            .volume_surprise = z[3],
+        };
+    }
+
+    fn applyEvaluation(seg: *types.RankedSegment, evaluated: CandidateEvaluation) void {
+        seg.score = evaluated.score;
+        seg.latent_similarity = evaluated.latent_similarity;
+        seg.reconstruction_confidence = evaluated.reconstruction_confidence;
+        seg.volume_surprise = evaluated.volume_surprise;
     }
 
     fn windowHash(self: *const Ranker, window: []const u32) u64 {
@@ -338,10 +625,6 @@ pub const Ranker = struct {
         return 1.0 - math.clamp(@as(f32, @floatFromInt(mean)) / @as(f32, @floatFromInt(RankerConfig.PROXIMITY_SCALE)), 0.0, 1.0);
     }
 
-    pub fn rankCandidates(self: *const Ranker, candidates: []types.RankedSegment, ssi: *const SSI, allocator: Allocator) !void {
-        return self.rankCandidatesWithQuery(candidates, &[_]u32{}, ssi, allocator);
-    }
-
     fn rearrangeCandidatesByIndices(candidates: []types.RankedSegment, indices: []const usize, scores: []const f32, allocator: Allocator) !void {
         if (candidates.len == 0) return;
         if (indices.len != candidates.len) return error.LengthMismatch;
@@ -388,35 +671,25 @@ pub const Ranker = struct {
         try rearrangeCandidatesByIndices(candidates, indices, scores, allocator);
     }
 
-    pub fn rankCandidatesWithQuery(self: *const Ranker, candidates: []types.RankedSegment, query: []const u32, ssi: *const SSI, allocator: Allocator) !void {
+    pub fn rankCandidatesWithModel(self: *Ranker, model: *RSF, query_state: *const RSFLatentState, candidates: []types.RankedSegment, ssi: *const SSI, allocator: Allocator) !void {
+        try self.requireQuery(model, query_state, ssi);
         if (candidates.len == 0) return;
 
         const scores = try allocator.alloc(f32, candidates.len);
         defer allocator.free(scores);
 
-        if (query.len > 0) {
-            const retrieved = try ssi.retrieveTopK(query, RankerConfig.SCORE_RETRIEVAL_LIMIT, allocator);
-            defer freeRankedSegments(retrieved, allocator);
-            var i: usize = 0;
-            while (i < candidates.len) : (i += 1) {
-                scores[i] = try self.combinedScore(candidates[i].tokens, query, candidates[i].position, candidates[i].position, retrieved, null, allocator);
-            }
-        } else {
-            var i: usize = 0;
-            while (i < candidates.len) : (i += 1) {
-                const retrieved = try ssi.retrieveTopK(candidates[i].tokens, RankerConfig.SCORE_RETRIEVAL_LIMIT, allocator);
-                scores[i] = self.combinedScore(candidates[i].tokens, &.{}, candidates[i].position, candidates[i].position, retrieved, null, allocator) catch |err| {
-                    freeRankedSegments(retrieved, allocator);
-                    return err;
-                };
-                freeRankedSegments(retrieved, allocator);
-            }
+        var i: usize = 0;
+        while (i < candidates.len) : (i += 1) {
+            const evaluated = try self.evaluateCandidate(model, query_state, &.{}, candidates[i].tokens, candidates[i].position, ssi, allocator);
+            applyEvaluation(&candidates[i], evaluated);
+            scores[i] = evaluated.score;
         }
 
         try sortCandidatesByScore(candidates, scores, allocator);
     }
 
-    pub fn batchScore(self: *const Ranker, sequences: []const []const u32, ssi: *const SSI, allocator: Allocator) ![]f32 {
+    pub fn batchScore(self: *Ranker, sequences: []const []const u32, ssi: *const SSI, model: *RSF, query_state: *const RSFLatentState, allocator: Allocator) ![]f32 {
+        try self.requireQuery(model, query_state, ssi);
         if (sequences.len == 0) return allocator.alloc(f32, 0);
 
         const batch_size = sequences.len;
@@ -425,12 +698,14 @@ pub const Ranker = struct {
 
         var b: usize = 0;
         while (b < batch_size) : (b += 1) {
-            scores[b] = try self.scoreSequenceAlloc(sequences[b], ssi, allocator);
+            const evaluated = try self.evaluateCandidate(model, query_state, &.{}, sequences[b], 0, ssi, allocator);
+            scores[b] = evaluated.score;
         }
         return scores;
     }
 
-    pub fn topKHeap(self: *const Ranker, ssi: *const SSI, query: []const u32, k: usize, allocator: Allocator) ![]types.RankedSegment {
+    pub fn topKHeap(self: *Ranker, ssi: *const SSI, query: []const u32, query_state: *const RSFLatentState, model: *RSF, k: usize, allocator: Allocator) ![]types.RankedSegment {
+        try self.requireQuery(model, query_state, ssi);
         if (k == 0) return allocator.alloc(types.RankedSegment, 0);
 
         const retrieval_count = @max(k, RankerConfig.DEFAULT_TOP_N_RETRIEVAL);
@@ -444,21 +719,28 @@ pub const Ranker = struct {
             heap.deinit();
         }
 
-        const candidates = try ssi.retrieveTopK(query, retrieval_count, allocator);
-        defer freeRankedSegments(candidates, allocator);
+        const dim = self.model_dim;
+        const q_blocked = try allocator.alloc(f32, dim * 2);
+        defer allocator.free(q_blocked);
+        try packStateBlocked(query_state, dim, q_blocked);
 
-        const reference_len = @min(candidates.len, RankerConfig.SCORE_RETRIEVAL_LIMIT);
-        const reference = candidates[0..reference_len];
+        const candidates = ssi.retrieveTopKLatent(q_blocked, query_state.log_det, retrieval_count, allocator) catch |err| switch (err) {
+            error.RSFModelMismatch => return err,
+            else => try ssi.retrieveTopK(query, retrieval_count, allocator),
+        };
+        defer freeRankedSegments(candidates, allocator);
 
         var i: usize = 0;
         while (i < candidates.len) : (i += 1) {
             const cand = candidates[i];
-            const score = try self.combinedScore(cand.tokens, query, cand.position, cand.position, reference, null, allocator);
+            const evaluated = try self.evaluateCandidate(model, query_state, query, cand.tokens, cand.position, ssi, allocator);
+            const score = evaluated.score;
 
             if (math.isNan(score) or math.isInf(score)) continue;
 
             if (heap.count() < k) {
                 var ranked = try types.RankedSegment.init(allocator, cand.tokens, score, cand.position, cand.anchor);
+                applyEvaluation(&ranked, evaluated);
                 heap.add(ranked) catch |err| {
                     ranked.deinit(allocator);
                     return err;
@@ -468,6 +750,7 @@ pub const Ranker = struct {
                     var removed = heap.remove();
                     removed.deinit(allocator);
                     var ranked = try types.RankedSegment.init(allocator, cand.tokens, score, cand.position, cand.anchor);
+                    applyEvaluation(&ranked, evaluated);
                     heap.add(ranked) catch |err| {
                         ranked.deinit(allocator);
                         return err;
@@ -500,16 +783,6 @@ pub const Ranker = struct {
         }
 
         return top_n;
-    }
-
-    pub fn updateWeights(self: *Ranker, gradients: []const f32) void {
-        var i: usize = 0;
-        while (i < @min(self.ngram_weights.len, gradients.len)) : (i += 1) {
-            const grad = gradients[i];
-            if (math.isNan(grad) or math.isInf(grad)) continue;
-            self.ngram_weights[i] -= RankerConfig.LEARNING_RATE * grad;
-            self.ngram_weights[i] = math.clamp(self.ngram_weights[i], 0.0, 1.0);
-        }
     }
 
     pub fn minHashSignature(self: *const Ranker, tokens: []const u32) ![]u64 {
@@ -638,58 +911,6 @@ pub const Ranker = struct {
         return if (union_count == 0) 1.0 else @as(f32, @floatFromInt(intersect)) / @as(f32, @floatFromInt(union_count));
     }
 
-    pub fn vectorScore(embedding: *const Tensor, query_emb: *const Tensor) !f32 {
-        if (!mem.eql(usize, embedding.shape.dims, query_emb.shape.dims)) return Error.ShapeMismatch;
-        if (embedding.data.len != query_emb.data.len) return Error.ShapeMismatch;
-        if (embedding.data.len == 0) return 0.0;
-
-        var dot_prod: f32 = 0.0;
-        var norm_emb: f32 = 0.0;
-        var norm_query: f32 = 0.0;
-
-        const len = embedding.data.len;
-        var i: usize = 0;
-        while (i < len) : (i += 1) {
-            const e = embedding.data[i];
-            const q = query_emb.data[i];
-
-            if (math.isNan(e) or math.isNan(q)) continue;
-            if (math.isInf(e) or math.isInf(q)) continue;
-
-            dot_prod += e * q;
-            norm_emb += e * e;
-            norm_query += q * q;
-        }
-
-        if (norm_emb <= 0.0 or norm_query <= 0.0) return 0.0;
-
-        norm_emb = math.sqrt(norm_emb);
-        norm_query = math.sqrt(norm_query);
-
-        const result = dot_prod / (norm_emb * norm_query);
-        return math.clamp(result, -1.0, 1.0);
-    }
-
-    pub fn dotProductScore(embedding: *const Tensor, query_emb: *const Tensor) !f32 {
-        if (!mem.eql(usize, embedding.shape.dims, query_emb.shape.dims)) return Error.ShapeMismatch;
-        if (embedding.data.len != query_emb.data.len) return Error.ShapeMismatch;
-        if (embedding.data.len == 0) return 0.0;
-
-        var dot_prod: f32 = 0.0;
-        const len = embedding.data.len;
-        var i: usize = 0;
-        while (i < len) : (i += 1) {
-            const e = embedding.data[i];
-            const q = query_emb.data[i];
-
-            if (math.isNan(e) or math.isNan(q)) continue;
-            if (math.isInf(e) or math.isInf(q)) continue;
-
-            dot_prod += e * q;
-        }
-        return dot_prod;
-    }
-
     pub fn weightedAverage(scores: []const f32, weights: []const f32) !f32 {
         if (scores.len != weights.len) return error.LengthMismatch;
         if (scores.len == 0) return 0.0;
@@ -812,7 +1033,8 @@ pub const Ranker = struct {
         try sortCandidatesByScore(candidates, combined, allocator);
     }
 
-    pub fn streamingRank(self: *const Ranker, reader: anytype, ssi: *const SSI, k: usize, allocator: Allocator) ![]types.RankedSegment {
+    pub fn streamingRank(self: *Ranker, reader: anytype, ssi: *const SSI, model: *RSF, query_state: *const RSFLatentState, k: usize, allocator: Allocator) ![]types.RankedSegment {
+        try self.requireQuery(model, query_state, ssi);
         if (k == 0) return allocator.alloc(types.RankedSegment, 0);
 
         var rolling_buffer = std.ArrayList(u32).init(allocator);
@@ -886,11 +1108,13 @@ pub const Ranker = struct {
 
             while (rolling_buffer.items.len >= RankerConfig.STREAMING_WINDOW_SIZE) {
                 const window = rolling_buffer.items[0..RankerConfig.STREAMING_WINDOW_SIZE];
-                const score = try self.scoreSequenceAlloc(window, ssi, allocator);
+                const evaluated = try self.evaluateCandidate(model, query_state, &.{}, window, position, ssi, allocator);
+                const score = evaluated.score;
 
                 if (!math.isNan(score) and !math.isInf(score)) {
                     if (heap.count() < k) {
                         var seg = try types.RankedSegment.init(allocator, window, score, position, false);
+                        applyEvaluation(&seg, evaluated);
                         heap.add(seg) catch |err| {
                             seg.deinit(allocator);
                             return err;
@@ -900,6 +1124,7 @@ pub const Ranker = struct {
                             var removed = heap.remove();
                             removed.deinit(allocator);
                             var seg = try types.RankedSegment.init(allocator, window, score, position, false);
+                        applyEvaluation(&seg, evaluated);
                             heap.add(seg) catch |err| {
                                 seg.deinit(allocator);
                                 return err;
@@ -922,10 +1147,12 @@ pub const Ranker = struct {
 
         if (rolling_buffer.items.len > 0) {
             const tail = rolling_buffer.items;
-            const score = try self.scoreSequenceAlloc(tail, ssi, allocator);
+            const evaluated = try self.evaluateCandidate(model, query_state, &.{}, tail, position, ssi, allocator);
+            const score = evaluated.score;
             if (!math.isNan(score) and !math.isInf(score)) {
                 if (heap.count() < k) {
                     var seg = try types.RankedSegment.init(allocator, tail, score, position, false);
+                    applyEvaluation(&seg, evaluated);
                     heap.add(seg) catch |err| {
                         seg.deinit(allocator);
                         return err;
@@ -935,6 +1162,7 @@ pub const Ranker = struct {
                         var removed = heap.remove();
                         removed.deinit(allocator);
                         var seg = try types.RankedSegment.init(allocator, tail, score, position, false);
+                    applyEvaluation(&seg, evaluated);
                         heap.add(seg) catch |err| {
                             seg.deinit(allocator);
                             return err;
@@ -970,7 +1198,8 @@ pub const Ranker = struct {
         return result;
     }
 
-    pub fn parallelScore(self: *const Ranker, sequences: []const []const u32, ssi: *const SSI, num_threads: usize) ![]f32 {
+    pub fn parallelScore(self: *Ranker, sequences: []const []const u32, ssi: *const SSI, model: *RSF, query_state: *const RSFLatentState, num_threads: usize) ![]f32 {
+        try self.requireQuery(model, query_state, ssi);
         if (sequences.len == 0) return self.allocator.alloc(f32, 0);
 
         const scores = try self.allocator.alloc(f32, sequences.len);
@@ -979,7 +1208,8 @@ pub const Ranker = struct {
         if (num_threads <= 1 or sequences.len <= 1) {
             var i: usize = 0;
             while (i < sequences.len) : (i += 1) {
-                scores[i] = try self.scoreSequence(sequences[i], ssi);
+                const evaluated = try self.evaluateCandidate(model, query_state, &.{}, sequences[i], 0, ssi, self.allocator);
+                scores[i] = evaluated.score;
             }
             return scores;
         }
@@ -990,9 +1220,11 @@ pub const Ranker = struct {
         const remainder_count = sequences.len % effective_threads;
 
         const ThreadContext = struct {
-            ranker: *const Ranker,
+            ranker: *Ranker,
             seqs: []const []const u32,
             ssi_ptr: *const SSI,
+            model: *RSF,
+            query_state: *const RSFLatentState,
             out: []f32,
             start: usize,
             end: usize,
@@ -1017,6 +1249,8 @@ pub const Ranker = struct {
                 .ranker = self,
                 .seqs = sequences,
                 .ssi_ptr = ssi,
+                .model = model,
+                .query_state = query_state,
                 .out = scores,
                 .start = offset,
                 .end = offset + this_chunk,
@@ -1034,19 +1268,21 @@ pub const Ranker = struct {
                     var si: usize = ctx.start;
                     while (si < ctx.end) : (si += 1) {
                         _ = arena.reset(.retain_capacity);
-                        ctx.out[si] = ctx.ranker.scoreSequenceAlloc(ctx.seqs[si], ctx.ssi_ptr, arena.allocator()) catch {
+                        const evaluated = ctx.ranker.evaluateCandidate(ctx.model, ctx.query_state, &.{}, ctx.seqs[si], 0, ctx.ssi_ptr, arena.allocator()) catch {
                             ctx.err_flag = true;
                             return;
                         };
+                        ctx.out[si] = evaluated.score;
                     }
                 }
             }.work, .{&contexts[t]}) catch {
                 var si: usize = contexts[t].start;
                 while (si < contexts[t].end) : (si += 1) {
-                    scores[si] = self.scoreSequenceAlloc(sequences[si], ssi, self.allocator) catch {
+                    const evaluated = self.evaluateCandidate(model, query_state, &.{}, sequences[si], 0, ssi, self.allocator) catch {
                         contexts[t].err_flag = true;
                         break;
                     };
+                    scores[si] = evaluated.score;
                 }
                 thread_spawned[t] = false;
                 continue;
@@ -1074,49 +1310,107 @@ pub const Ranker = struct {
         return scores;
     }
 
-    pub fn calibrateWeights(self: *Ranker, training_data: []const []const u32, labels: []const f32, ssi: *const SSI, epochs: usize) !void {
+    fn logisticPairGrads(score_pos: f32, score_neg: f32) struct { d_pos: f32, d_neg: f32 } {
+        const diff = score_pos - score_neg;
+        var p: f32 = undefined;
+        if (diff >= 0.0) {
+            const e = @exp(-diff);
+            p = e / (1.0 + e);
+        } else {
+            const e = @exp(diff);
+            p = 1.0 / (1.0 + e);
+        }
+        if (!std.math.isFinite(p)) p = 0.0;
+        return .{ .d_pos = -p, .d_neg = p };
+    }
+
+    fn backwardHeadReadout(self: *Ranker, z: [4]f32, d_readout: f32, allocator: Allocator) !void {
+        if (!std.math.isFinite(d_readout) or d_readout == 0.0) return;
+        var input = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        defer input.deinit();
+        var output = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        defer output.deinit();
+        @memcpy(input.data[0..RankerConfig.HEAD_STATE], &z);
+        @memcpy(output.data[0..RankerConfig.HEAD_STATE], &z);
+        try self.head.forward(&output);
+        var grad_out = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        defer grad_out.deinit();
+        @memset(grad_out.data, 0.0);
+        grad_out.data[0] = d_readout;
+        grad_out.data[1] = d_readout;
+        var grad_in = try Tensor.init(allocator, &[_]usize{ 1, RankerConfig.HEAD_STATE });
+        defer grad_in.deinit();
+        try self.head.backward(&grad_out, &input, &output, &grad_in);
+    }
+
+    pub fn trainHead(self: *Ranker, training_data: []const []const u32, labels: []const f32, ssi: *const SSI, model: *RSF, epochs: usize) !void {
         if (training_data.len == 0 or labels.len == 0) return error.InvalidParameter;
         if (training_data.len != labels.len) return error.LengthMismatch;
+        try self.requireModel(model, ssi);
 
-        const gradients = try self.allocator.alloc(f32, self.ngram_weights.len);
-        defer self.allocator.free(gradients);
+        const n = training_data.len;
+        const zs = try self.allocator.alloc([4]f32, n);
+        defer self.allocator.free(zs);
 
-        const sample_grad = try self.allocator.alloc(f32, self.ngram_weights.len);
-        defer self.allocator.free(sample_grad);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var qstate = try self.queryStateFromTokens(model, training_data[i], self.allocator);
+            defer qstate.deinit();
+            const retrieved = try ssi.retrieveTopK(training_data[i], RankerConfig.SCORE_RETRIEVAL_LIMIT, self.allocator);
+            defer freeRankedSegments(retrieved, self.allocator);
+            if (retrieved.len > 0) {
+                zs[i] = try self.criteriaVector(model, &qstate, training_data[i], retrieved[0].tokens, retrieved[0].position, ssi, self.allocator);
+            } else {
+                zs[i] = try self.criteriaVector(model, &qstate, training_data[i], training_data[i], 0, ssi, self.allocator);
+            }
+        }
 
+        const order = try self.allocator.alloc(usize, n);
+        defer self.allocator.free(order);
+        i = 0;
+        while (i < n) : (i += 1) {
+            order[i] = i;
+        }
+        const SortCtx = struct {
+            labels: []const f32,
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                const la = ctx.labels[a];
+                const lb = ctx.labels[b];
+                if (math.isNan(la)) return false;
+                if (math.isNan(lb)) return true;
+                return la < lb;
+            }
+        };
+        std.mem.sort(usize, order, SortCtx{ .labels = labels }, SortCtx.lessThan);
+
+        const scale = RankerConfig.MAX_RAW_SCORE / RankerConfig.RAW_FUSE_DIVISOR;
         var epoch: usize = 0;
         while (epoch < epochs) : (epoch += 1) {
-            @memset(gradients, 0.0);
-
-            var i: usize = 0;
-            while (i < training_data.len) : (i += 1) {
-                const sample = training_data[i];
-                const label = labels[i];
-
-                @memset(sample_grad, 0.0);
-                const raw = try self.scoreSequenceRaw(sample, ssi, sample_grad, self.allocator);
-                const pred = sigmoidScale(raw);
-
-                if (math.isNan(pred) or math.isNan(label)) continue;
-                if (math.isInf(pred) or math.isInf(label)) continue;
-
-                const err_val = pred - label;
-                const d_out = sigmoidDerivative(pred);
-                const scale = err_val * d_out;
-
-                var g: usize = 0;
-                while (g < gradients.len) : (g += 1) {
-                    gradients[g] += sample_grad[g] * scale;
-                }
+            try self.head.zeroGradients();
+            try self.head.ensureGradients();
+            var pair_count: usize = 0;
+            var p: usize = 0;
+            while (p + 1 < n) : (p += 1) {
+                const ineg = order[p];
+                const ipos = order[p + 1];
+                const lneg = labels[ineg];
+                const lpos = labels[ipos];
+                if (math.isNan(lneg) or math.isNan(lpos) or math.isInf(lneg) or math.isInf(lpos)) continue;
+                if (!(lpos > lneg)) continue;
+                const score_neg = self.fusedFromZ(zs[ineg], self.allocator) catch continue;
+                const score_pos = self.fusedFromZ(zs[ipos], self.allocator) catch continue;
+                if (math.isNan(score_neg) or math.isNan(score_pos) or math.isInf(score_neg) or math.isInf(score_pos)) continue;
+                const grads = logisticPairGrads(score_pos, score_neg);
+                const d_raw_pos = grads.d_pos * sigmoidDerivative(score_pos) * scale;
+                const d_raw_neg = grads.d_neg * sigmoidDerivative(score_neg) * scale;
+                try self.backwardHeadReadout(zs[ipos], d_raw_pos, self.allocator);
+                try self.backwardHeadReadout(zs[ineg], d_raw_neg, self.allocator);
+                pair_count += 1;
             }
-
-            const n_samples: f32 = @floatFromInt(training_data.len);
-            var g: usize = 0;
-            while (g < gradients.len) : (g += 1) {
-                gradients[g] = gradients[g] / n_samples;
-            }
-
-            self.updateWeights(gradients);
+            if (pair_count == 0) continue;
+            const inv: f32 = 1.0 / @as(f32, @floatFromInt(pair_count));
+            try self.head.scaleLayerGradients(inv);
+            _ = try self.head_sfd.step(&self.head, RankerConfig.LEARNING_RATE);
         }
     }
 
@@ -1124,7 +1418,7 @@ pub const Ranker = struct {
         const file = try core_io.createFilePath(path, .{});
         defer file.close();
         const writer = file.writer();
-        try writer.writeInt(u8, 2, .little);
+        try writer.writeInt(u8, RankerConfig.EXPORT_VERSION, .little);
         try writer.writeInt(u64, @intCast(self.ngram_weights.len), .little);
         try writer.writeInt(u64, @intCast(self.num_ngrams), .little);
         var i: usize = 0;
@@ -1138,6 +1432,41 @@ pub const Ranker = struct {
             try writer.writeInt(u64, self.lsh_hash_params[i], .little);
         }
         try writer.writeInt(u64, self.seed, .little);
+        try writer.writeInt(u64, self.model_id, .little);
+        try writer.writeInt(u64, @intCast(self.model_dim), .little);
+        try writer.writeByte(if (self.model_global_diffusion) 1 else 0);
+        const head_gd = self.head.globalDiffusionEnabled() catch false;
+        try writer.writeByte(if (head_gd) 1 else 0);
+        const head_dim = self.head.dim() catch RankerConfig.HEAD_DIM;
+        const head_layers = self.head.layerCount() catch RankerConfig.HEAD_LAYERS;
+        try writer.writeInt(u64, @intCast(head_dim), .little);
+        try writer.writeInt(u64, @intCast(head_layers), .little);
+        const plen = head_pair_len;
+        const s_buf = try self.allocator.alloc(f32, plen);
+        defer self.allocator.free(s_buf);
+        const t_buf = try self.allocator.alloc(f32, plen);
+        defer self.allocator.free(t_buf);
+        try self.head.readLayerWeights(0, s_buf, t_buf);
+        try writer.writeInt(u64, @intCast(plen), .little);
+        i = 0;
+        while (i < plen) : (i += 1) {
+            const bits: u32 = @bitCast(s_buf[i]);
+            try writer.writeInt(u32, bits, .little);
+        }
+        try writer.writeInt(u64, @intCast(plen), .little);
+        i = 0;
+        while (i < plen) : (i += 1) {
+            const bits: u32 = @bitCast(t_buf[i]);
+            try writer.writeInt(u32, bits, .little);
+        }
+        const flat = try self.head_sfd.exportFlatState(self.allocator);
+        defer self.allocator.free(flat);
+        try writer.writeInt(u64, @intCast(flat.len), .little);
+        i = 0;
+        while (i < flat.len) : (i += 1) {
+            const bits: u32 = @bitCast(flat[i]);
+            try writer.writeInt(u32, bits, .little);
+        }
     }
 
     pub fn importModel(self: *Ranker, path: []const u8) !void {
@@ -1145,7 +1474,7 @@ pub const Ranker = struct {
         defer file.close();
         const reader = file.reader();
         const version = try reader.readInt(u8, .little);
-        if (version != 2) return error.InvalidVersion;
+        if (version != RankerConfig.EXPORT_VERSION and version != RankerConfig.EXPORT_VERSION_LEGACY) return error.InvalidVersion;
 
         const num_w = try reader.readInt(u64, .little);
         const num_ng = try reader.readInt(u64, .little);
@@ -1191,5 +1520,68 @@ pub const Ranker = struct {
         self.num_ngrams = num_ng_usize;
         self.num_hash_functions = num_h_usize;
         self.seed = new_seed;
+
+        if (version == RankerConfig.EXPORT_VERSION_LEGACY) {
+            try self.resetHead();
+            return;
+        }
+
+        self.model_id = try reader.readInt(u64, .little);
+        const model_dim_u64 = try reader.readInt(u64, .little);
+        if (model_dim_u64 == 0 or model_dim_u64 > std.math.maxInt(usize)) return error.InvalidParameter;
+        self.model_dim = @intCast(model_dim_u64);
+        const model_gd = try reader.readByte();
+        self.model_global_diffusion = model_gd != 0;
+        const head_gd = try reader.readByte();
+        _ = head_gd;
+        const head_dim_u64 = try reader.readInt(u64, .little);
+        const head_layers_u64 = try reader.readInt(u64, .little);
+        if (head_dim_u64 != RankerConfig.HEAD_DIM) return error.InvalidParameter;
+        if (head_layers_u64 != RankerConfig.HEAD_LAYERS) return error.InvalidParameter;
+
+        const s_len = try reader.readInt(u64, .little);
+        const plen = head_pair_len;
+        if (s_len != plen) return error.InvalidParameter;
+        const s_buf = try self.allocator.alloc(f32, plen);
+        defer self.allocator.free(s_buf);
+        i = 0;
+        while (i < plen) : (i += 1) {
+            const bits = try reader.readInt(u32, .little);
+            var v: f32 = @bitCast(bits);
+            if (math.isNan(v) or math.isInf(v)) v = 0.0;
+            s_buf[i] = v;
+        }
+        const t_len = try reader.readInt(u64, .little);
+        if (t_len != plen) return error.InvalidParameter;
+        const t_buf = try self.allocator.alloc(f32, plen);
+        defer self.allocator.free(t_buf);
+        i = 0;
+        while (i < plen) : (i += 1) {
+            const bits = try reader.readInt(u32, .little);
+            var v: f32 = @bitCast(bits);
+            if (math.isNan(v) or math.isInf(v)) v = 0.0;
+            t_buf[i] = v;
+        }
+        try self.head.writeLayerWeights(0, s_buf, t_buf);
+
+        const flat_len_u64 = try reader.readInt(u64, .little);
+        if (flat_len_u64 > std.math.maxInt(usize)) return error.InvalidParameter;
+        const flat_len: usize = @intCast(flat_len_u64);
+        const flat = try self.allocator.alloc(f32, flat_len);
+        defer self.allocator.free(flat);
+        i = 0;
+        while (i < flat_len) : (i += 1) {
+            const bits = try reader.readInt(u32, .little);
+            var v: f32 = @bitCast(bits);
+            if (math.isNan(v) or math.isInf(v)) v = 0.0;
+            flat[i] = v;
+        }
+        self.head_sfd.importFlatState(flat) catch {
+            try self.head.writeLayerWeights(0, s_buf, t_buf);
+            self.head_sfd.deinit();
+            self.head_sfd = try SFD.init(self.allocator, &self.head);
+            return;
+        };
     }
+
 };
