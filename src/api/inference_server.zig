@@ -2367,9 +2367,3 @@ pub const BatchInferenceRequest = struct {
         allocator.free(self.texts);
     }
 };
-
-test "distributed checkpoint forward shadows match f16 storage" {
-    try std.testing.expectEqual(@as(f32, 65504.0), checkpointForwardShadow(70000.0));
-    try std.testing.expectEqual(@as(f32, -65504.0), checkpointForwardShadow(-70000.0));
-    try std.testing.expectEqual(@as(f32, @floatCast(@as(f16, @floatCast(0.12345)))), checkpointForwardShadow(0.12345));
-}

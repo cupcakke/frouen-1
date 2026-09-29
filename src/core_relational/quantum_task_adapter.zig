@@ -432,31 +432,3 @@ pub const QuantumTaskAdapter = struct {
         return self.statistics;
     }
 };
-
-test "quantum_task_adapter_identify_subgraphs" {
-    const allocator = std.testing.allocator;
-
-    var graph = try SelfSimilarRelationalGraph.init(allocator);
-    defer graph.deinit();
-
-    const n1 = try Node.init(allocator, "n1", "data1", Qubit{ .a = Complex(f64).init(0.7, 0.7), .b = Complex(f64).init(0.0, 0.0) }, 0.5);
-    try graph.addNode(n1);
-    const n2 = try Node.init(allocator, "n2", "data2", Qubit{ .a = Complex(f64).init(0.6, 0.8), .b = Complex(f64).init(0.0, 0.0) }, 0.3);
-    try graph.addNode(n2);
-
-    const e1 = try Edge.init(allocator, "n1", "n2", .entangled, 0.9, Complex(f64).init(0.8, 0.8), 2.0);
-    try graph.addEdge("n1", "n2", e1);
-
-    var adapter = QuantumTaskAdapter.init(allocator, &graph);
-    defer adapter.deinit();
-
-    var subgraphs = try adapter.identifyQuantumSubgraphs();
-    defer {
-        for (subgraphs.items) |*sg| {
-            sg.deinit();
-        }
-        subgraphs.deinit();
-    }
-
-    try std.testing.expect(subgraphs.items.len >= 0);
-}

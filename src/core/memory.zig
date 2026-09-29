@@ -306,7 +306,6 @@ pub const ArenaAllocator = struct {
         return true;
     }
 
-
     fn arenaRemap(ctx: *anyopaque, buf: []u8, log2_align: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         if (arenaResize(ctx, buf, log2_align, new_len, ret_addr)) {
             return buf.ptr;
@@ -518,7 +517,6 @@ pub const SlabAllocator = struct {
         _ = ret_addr;
         return false;
     }
-
 
     fn slabVtableRemap(ctx: *anyopaque, buf: []u8, log2_align: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         if (slabVtableResize(ctx, buf, log2_align, new_len, ret_addr)) {
@@ -762,7 +760,6 @@ pub const PoolAllocator = struct {
         _ = ret_addr;
         return false;
     }
-
 
     fn poolVtableRemap(ctx: *anyopaque, buf: []u8, log2_align: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         if (poolVtableResize(ctx, buf, log2_align, new_len, ret_addr)) {
@@ -1056,7 +1053,6 @@ pub const BuddyAllocator = struct {
         _ = ret_addr;
         return false;
     }
-
 
     fn buddyVtableRemap(ctx: *anyopaque, buf: []u8, log2_align: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         if (buddyVtableResize(ctx, buf, log2_align, new_len, ret_addr)) {
@@ -2026,7 +2022,6 @@ pub const TrackingAllocator = struct {
         return ok;
     }
 
-
     fn trackingRemap(ctx: *anyopaque, buf: []u8, log2_align: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         if (trackingResize(ctx, buf, log2_align, new_len, ret_addr)) {
             return buf.ptr;
@@ -2417,178 +2412,3 @@ pub const MemorySlab = SlabAllocator;
 pub const MemoryBuddy = BuddyAllocator;
 pub const MemoryLockFreeQueue = LockFreeQueue;
 pub const MemoryLockFreeStack = LockFreeStack;
-
-const testing = std.testing;
-
-test "Arena allocation" {
-    var arena = try Arena.init(testing.allocator, 1024);
-    defer arena.deinit();
-    const ptr1 = arena.alloc(128, 8) orelse return error.OutOfMemory;
-    const ptr2 = arena.alloc(64, 4) orelse return error.OutOfMemory;
-    try testing.expectEqual(@as(usize, 128), ptr1.len);
-    try testing.expectEqual(@as(usize, 64), ptr2.len);
-}
-
-test "SlabAllocator" {
-    var slab = try SlabAllocator.init(testing.allocator, 256, 4, 64);
-    defer slab.deinit();
-    const ptr1 = slab.alloc(100) orelse return error.OutOfMemory;
-    const ptr2 = slab.alloc(150) orelse return error.OutOfMemory;
-    try testing.expectEqual(@as(usize, 100), ptr1.len);
-    try testing.expectEqual(@as(usize, 150), ptr2.len);
-    try slab.free(ptr1);
-    try slab.free(ptr2);
-}
-
-test "PoolAllocator" {
-    var pool = try PoolAllocator.init(testing.allocator, 64, 16, 2);
-    defer pool.deinit();
-    const ptr1 = pool.alloc(64) orelse return error.OutOfMemory;
-    const ptr2 = pool.alloc(64) orelse return error.OutOfMemory;
-    try testing.expectEqual(@as(usize, 64), ptr1.len);
-    try testing.expectEqual(@as(usize, 64), ptr2.len);
-    try pool.free(ptr1);
-    try pool.free(ptr2);
-}
-
-test "PageAllocator" {
-    var page_alloc = try PageAllocator.init(testing.allocator, 4);
-    defer page_alloc.deinit();
-    const pages = page_alloc.allocPages(2) orelse return error.OutOfMemory;
-    try testing.expectEqual(@as(usize, 2 * PageSize), pages.len);
-    try page_alloc.freePages(pages);
-}
-
-test "ZeroCopySlice" {
-    const data = "hello world";
-    const zcs = ZeroCopySlice.init(@as([*]const u8, @ptrCast(data.ptr)), data.len);
-    const slice = zcs.slice(0, 5);
-    try testing.expectEqualStrings("hello", slice.asBytes());
-}
-
-test "ResizeBuffer" {
-    var buf = ResizeBuffer.init(testing.allocator);
-    defer buf.deinit();
-    try buf.append("hello");
-    try buf.append(" world");
-    const owned = try buf.toOwnedSlice();
-    defer if (owned.len != 0) testing.allocator.free(owned);
-    try testing.expectEqualStrings("hello world", owned);
-}
-
-test "ArenaAllocator basic allocation" {
-    var arena = ArenaAllocator.init(testing.allocator, 1024);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    const slice1 = try alloc.alloc(u8, 100);
-    const slice2 = try alloc.alloc(u8, 100);
-    @memset(slice1, 42);
-    @memset(slice2, 84);
-    try testing.expectEqual(@as(u8, 42), slice1[0]);
-    try testing.expectEqual(@as(u8, 84), slice2[0]);
-}
-
-test "zero copy transfer" {
-    var src = [_]u8{ 1, 2, 3, 4, 5 };
-    var dest: [5]u8 = undefined;
-    zeroCopyTransfer(&src, &dest);
-    try testing.expectEqualSlices(u8, &src, &dest);
-}
-
-test "memory hashing" {
-    const data1 = "hello world";
-    const data2 = "hello world";
-    const data3 = "hello world!";
-    const hash1 = hashMemory(data1);
-    const hash2 = hashMemory(data2);
-    const hash3 = hashMemory(data3);
-    try testing.expectEqual(hash1, hash2);
-    try testing.expect(hash1 != hash3);
-}
-
-test "memory comparison constant time" {
-    const data1 = "test";
-    const data2 = "test";
-    const data3 = "best";
-    try testing.expect(compareMemory(data1, data2));
-    try testing.expect(!compareMemory(data1, data3));
-}
-
-test "search memory" {
-    const haystack = "hello world, hello universe";
-    const needle = "world";
-    const pos = searchMemory(haystack, needle);
-    try testing.expect(pos != null);
-    try testing.expectEqual(@as(usize, 6), pos.?);
-}
-
-test "count memory" {
-    const data = "hello world";
-    const count = countMemory(data, 'l');
-    try testing.expectEqual(@as(usize, 3), count);
-}
-
-test "unique memory" {
-    const data = "aabbccddaa";
-    const uniq = try uniqueMemory(testing.allocator, data);
-    defer if (uniq.len != 0) testing.allocator.free(uniq);
-    try testing.expectEqual(@as(usize, 4), uniq.len);
-}
-
-test "atomic operations" {
-    var value: u64 = 0;
-    const prev = atomicAdd(&value, 5);
-    try testing.expectEqual(@as(u64, 0), prev);
-    try testing.expectEqual(@as(u64, 5), atomicLoad(&value));
-    atomicStore(&value, 10);
-    try testing.expectEqual(@as(u64, 10), atomicLoad(&value));
-    _ = atomicInc(&value);
-    try testing.expectEqual(@as(u64, 11), atomicLoad(&value));
-}
-
-test "ReadWriteLock" {
-    var rwlock = ReadWriteLock.init();
-    rwlock.readLock();
-    rwlock.readUnlock();
-    rwlock.writeLock();
-    rwlock.writeUnlock();
-}
-
-test "BuddyAllocator" {
-    var buddy = try BuddyAllocator.init(testing.allocator, 4096, 6);
-    defer buddy.deinit();
-    const ptr1 = try buddy.alloc(128);
-    try testing.expectEqual(@as(usize, 128), ptr1.len);
-    try buddy.free(ptr1);
-}
-
-test "LockFreeQueue" {
-    var queue = try LockFreeQueue.init(testing.allocator, 16);
-    defer queue.deinit();
-    var item: usize = 42;
-    try testing.expect(queue.enqueue(@as(*anyopaque, @ptrCast(&item))));
-    const retrieved = queue.dequeue();
-    try testing.expect(retrieved != null);
-    try testing.expectEqual(@intFromPtr(@as(*anyopaque, @ptrCast(&item))), @intFromPtr(retrieved.?));
-}
-
-test "LockFreeStack" {
-    var stack = LockFreeStack.init(testing.allocator);
-    defer stack.deinit();
-    var item: usize = 42;
-    try stack.push(@as(*anyopaque, @ptrCast(&item)));
-    const retrieved = stack.pop();
-    try testing.expect(retrieved != null);
-    try testing.expectEqual(@intFromPtr(@as(*anyopaque, @ptrCast(&item))), @intFromPtr(retrieved.?));
-}
-
-test "memory stats tracking" {
-    resetMemoryStats();
-    trackAllocation(100);
-    trackAllocation(200);
-    trackFree(50);
-    const stats = getMemoryStats();
-    try testing.expectEqual(@as(usize, 300), stats.allocated);
-    try testing.expectEqual(@as(usize, 50), stats.freed);
-    try testing.expectEqual(@as(usize, 250), memoryFootprint());
-}

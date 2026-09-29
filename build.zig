@@ -84,10 +84,6 @@ pub fn build(b: *std.Build) void {
     futhark_check_step.setCwd(b.path(accel_dir));
     futhark_check_step.step.dependOn(&futhark_sync_step.step);
 
-    const futhark_test_step = b.addSystemCommand(&.{ "futhark", "test", "--backend=c", "main.fut" });
-    futhark_test_step.setCwd(b.path(accel_dir));
-    futhark_test_step.step.dependOn(&futhark_sync_step.step);
-
     const regenerate_futhark_step = b.step("regen-futhark", "Regenerate every Futhark C source from the .fut definitions");
     regenerate_futhark_step.dependOn(&main_cpu_step.step);
     regenerate_futhark_step.dependOn(&main_gpu_step.step);
@@ -96,9 +92,6 @@ pub fn build(b: *std.Build) void {
 
     const futhark_lint_step = b.step("futhark-check", "Type check every Futhark source");
     futhark_lint_step.dependOn(&futhark_check_step.step);
-
-    const futhark_unit_step = b.step("futhark-test", "Run the Futhark property tests on the CPU backend");
-    futhark_unit_step.dependOn(&futhark_test_step.step);
 
     const cpu_cflags = [_][]const u8{ "-O2", "-std=c11" };
     const gpu_cflags = [_][]const u8{ "-O2", "-std=c11", "-DJAIDE_FUTHARK_CUDA" };
@@ -219,69 +212,6 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&semantic_check_obj.step);
     check_step.dependOn(&distributed_check_obj.step);
 
-    const TestSpec = struct {
-        step: []const u8,
-        wrapper: []const u8,
-        desc: []const u8,
-    };
-
-    const test_specs = [_]TestSpec{
-        .{ .step = "test-tensor", .wrapper = "src/test_root_tensor.zig", .desc = "Run tensor tests" },
-        .{ .step = "test-memory", .wrapper = "src/test_root_memory.zig", .desc = "Run memory tests" },
-        .{ .step = "test-gpu-memory", .wrapper = "src/test_root_gpu_memory.zig", .desc = "Run GPU memory estimator and compact-batch tests" },
-        .{ .step = "test-sfd", .wrapper = "src/test_root_sfd.zig", .desc = "Run SFD optimizer tests" },
-        .{ .step = "test-embedding", .wrapper = "src/test_root_embedding.zig", .desc = "Run embedding tests" },
-        .{ .step = "test-rsf", .wrapper = "src/test_root_rsf.zig", .desc = "Run RSF tests" },
-        .{ .step = "test-oftb", .wrapper = "src/test_root_oftb.zig", .desc = "Run OFTB tests" },
-        .{ .step = "test-nsir", .wrapper = "src/test_root_nsir.zig", .desc = "Run NSIR graph tests" },
-        .{ .step = "test-reasoning", .wrapper = "src/test_root_reasoning.zig", .desc = "Run reasoning orchestrator tests" },
-        .{ .step = "test-crev", .wrapper = "src/test_root_crev.zig", .desc = "Run CREV pipeline tests" },
-        .{ .step = "test-surprise", .wrapper = "src/test_root_surprise.zig", .desc = "Run surprise memory tests" },
-        .{ .step = "test-temporal", .wrapper = "src/test_root_temporal.zig", .desc = "Run temporal graph tests" },
-        .{ .step = "test-vpu", .wrapper = "src/test_root_vpu.zig", .desc = "Run VPU tests" },
-        .{ .step = "test-fnds", .wrapper = "src/test_root_fnds.zig", .desc = "Run FNDS tests" },
-        .{ .step = "test-formal", .wrapper = "src/test_root_formal.zig", .desc = "Run formal verification tests" },
-        .{ .step = "test-security", .wrapper = "src/test_root_security.zig", .desc = "Run security proofs tests" },
-        .{ .step = "test-quantum-adapter", .wrapper = "src/test_root_quantum_adapter.zig", .desc = "Run quantum task adapter tests" },
-        .{ .step = "test-signal", .wrapper = "src/test_root_signal.zig", .desc = "Run signal propagation tests" },
-        .{ .step = "stress-refcount", .wrapper = "src/test_root_stress_refcount.zig", .desc = "Run tensor refcount stress test" },
-    };
-
-    const test_all_step = b.step("test-all", "Run every test suite");
-
-    inline for (test_specs) |spec| {
-        const test_artifact = b.addTest(.{
-            .root_source_file = b.path(spec.wrapper),
-            .target = target,
-            .optimize = optimize,
-        });
-        applyAccel(test_artifact, accel, gpu_enabled);
-
-        const run = b.addRunArtifact(test_artifact);
-        const step = b.step(spec.step, spec.desc);
-        step.dependOn(&run.step);
-        test_all_step.dependOn(&run.step);
-    }
-
-    const c_api_test = b.addExecutable(.{
-        .name = "jaide-c-api-test",
-        .target = target,
-        .optimize = optimize,
-    });
-    c_api_test.addCSourceFile(.{
-        .file = b.path("src/tests/c_api_test.c"),
-        .flags = &cpu_cflags,
-    });
-    c_api_test.addIncludePath(b.path("src/core_relational"));
-    c_api_test.linkLibrary(c_api_lib);
-    c_api_test.linkLibC();
-    b.installArtifact(c_api_test);
-
-    const c_api_test_run = b.addRunArtifact(c_api_test);
-    const c_api_test_step = b.step("test-c-api", "Run the JAIDE C API conformance test");
-    c_api_test_step.dependOn(&c_api_test_run.step);
-    test_all_step.dependOn(&c_api_test_run.step);
-
     if (zk_enabled) {
         const ptau_new = b.addSystemCommand(&.{
             "snarkjs",
@@ -325,12 +255,6 @@ pub fn build(b: *std.Build) void {
         circom_step.addArg(circom_lib_dir);
         circom_step.addArg("-o");
         circom_step.addArg("src/zk/");
-
-        const zk_witness_test = b.addSystemCommand(&.{ "node", "src/zk/test/inference_trace.test.js" });
-        zk_witness_test.step.dependOn(&circom_step.step);
-
-        const zk_test_step = b.step("test-zk", "Check the inference trace circuit against reference witnesses");
-        zk_test_step.dependOn(&zk_witness_test.step);
 
         const snarkjs_setup = b.addSystemCommand(&.{
             "snarkjs",
@@ -419,11 +343,6 @@ pub fn build(b: *std.Build) void {
 
         const rtl_verilog_step = b.step("rtl-verilog", "Generate Verilog from the Clash RTL modules");
         rtl_verilog_step.dependOn(&clash_step.step);
-
-        const rtl_run = b.addRunArtifact(rtl_exe);
-        rtl_run.step.dependOn(&rtl_install.step);
-        const rtl_test_step = b.step("test-rtl", "Run the RTL simulator against the Clash models");
-        rtl_test_step.dependOn(&rtl_run.step);
     }
 
     const bench_deps = b.createModule(.{

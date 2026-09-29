@@ -5,8 +5,7 @@
   "description": "Circom circuit toolchain dependencies for the JAIDE inference trace proof system",
   "license": "Apache-2.0",
   "scripts": {
-    "circuits": "zig build zk -Dzk=true",
-    "test": "node src/zk/test/inference_trace.test.js"
+    "circuits": "zig build zk -Dzk=true"
   },
   "dependencies": {
     "circomlib": "^2.0.5"

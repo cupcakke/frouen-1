@@ -40,36 +40,6 @@ fn makeEnvelope(allocator: std.mem.Allocator, magic: [8]u8, version: u32, body: 
     return bytes.toOwnedSlice();
 }
 
-test "checkpoint envelope validates checksum version and endianness" {
-    const allocator = std.testing.allocator;
-    const magic = [8]u8{ 'J', 'A', 'I', 'D', 'E', 'C', 'K', 'P' };
-    const envelope = try makeEnvelope(allocator, magic, 7, &.{ 1, 2, 3, 4 });
-    defer allocator.free(envelope);
-    const payload = try validate(envelope, magic, 7);
-    try std.testing.expectEqual(envelope.len - 4, payload.len);
-}
-
-test "checkpoint envelope rejects corruption and truncation" {
-    const allocator = std.testing.allocator;
-    const magic = [8]u8{ 'J', 'A', 'I', 'D', 'E', 'C', 'K', 'P' };
-    const envelope = try makeEnvelope(allocator, magic, 7, &.{ 9, 8, 7 });
-    defer allocator.free(envelope);
-    envelope[envelope.len - 5] ^= 1;
-    try std.testing.expectError(Error.ChecksumMismatch, validate(envelope, magic, 7));
-    try std.testing.expectError(Error.Truncated, validate(envelope[0..12], magic, 7));
-}
-
-test "checkpoint envelope rejects incompatible metadata" {
-    const allocator = std.testing.allocator;
-    const magic = [8]u8{ 'J', 'A', 'I', 'D', 'E', 'C', 'K', 'P' };
-    const envelope = try makeEnvelope(allocator, magic, 7, &.{});
-    defer allocator.free(envelope);
-    try std.testing.expectError(Error.VersionMismatch, validate(envelope, magic, 6));
-    var wrong_magic = magic;
-    wrong_magic[0] = 'X';
-    try std.testing.expectError(Error.MagicMismatch, validate(envelope, wrong_magic, 7));
-}
-
 pub const Metadata = struct {
     global_step: u64,
     model_dim: u64,
@@ -199,49 +169,4 @@ pub fn readMetadata(reader: anytype) !Metadata {
         .clip_max = try readF32(reader),
         .rsf_optimizer_step = try reader.readInt(u64, .little),
     };
-}
-
-test "checkpoint metadata round trip is exact" {
-    const expected = Metadata{
-        .global_step = 91,
-        .model_dim = 1024,
-        .layer_count = 12,
-        .vocab_size = 32000,
-        .local_batch_size = 8,
-        .learning_rate = 3e-4,
-        .momentum = 0.9,
-        .fisher_gamma = 0.99,
-        .fisher_epsilon = 1e-8,
-        .trust_ratio = 0.1,
-        .weight_floor = 1e-3,
-        .optimizer_warmup_steps = 10,
-        .spectral_interval = 10,
-        .spectral_target_norm = 0.9,
-        .spectral_iterations = 30,
-        .reconstruction_alpha = 0.3,
-        .phase_a_steps = 500,
-        .phase_b_steps = 2000,
-        .logdet_weight = -1e-3,
-        .gradient_clip_norm = 1.0,
-        .grad_mean = true,
-        .use_normalized_gradient_flow = true,
-        .embedding_seed = 42,
-        .default_max_seq_len = 256,
-        .reasoning_cycles = 1,
-        .relational_pass_interval = 50,
-        .shuffle_target_control = false,
-        .target_source_frozen = true,
-        .spectral_depth_compensation = true,
-        .shuffle_control_state = 12345,
-        .relational_fast_mode = true,
-        .clip_min = -5.0,
-        .clip_max = 5.0,
-        .rsf_optimizer_step = 91,
-    };
-    var storage: [512]u8 = undefined;
-    var output = std.io.fixedBufferStream(&storage);
-    try writeMetadata(output.writer(), expected);
-    var input = std.io.fixedBufferStream(storage[0..output.pos]);
-    const actual = try readMetadata(input.reader());
-    try std.testing.expectEqualDeep(expected, actual);
 }

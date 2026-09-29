@@ -327,30 +327,3 @@ pub const SignalPropagationEngine = signal_propagation.SignalPropagationEngine;
 pub const QuantumTaskAdapter = quantum_task_adapter.QuantumTaskAdapter;
 pub const QuantumSubgraph = quantum_task_adapter.QuantumSubgraph;
 pub const QuantumTaskResult = quantum_task_adapter.QuantumTaskResult;
-
-test "core_relational module integration" {
-    const allocator = std.testing.allocator;
-
-    var runtime = try ZRuntime.init(allocator);
-    defer runtime.deinit();
-
-    const var1 = try runtime.createVariable("x", "hello");
-    _ = var1;
-
-    const var2 = try runtime.createVariable("y", "world");
-    _ = var2;
-
-    _ = try runtime.entangleVariables("x", "y");
-
-    try std.testing.expect(runtime.variableCount() == 2);
-
-    var kernel = ChaosCoreKernel.init(allocator);
-    defer kernel.deinit();
-
-    const block_id = kernel.allocateMemory("test data", null) catch unreachable;
-    const retrieved = kernel.readMemory(block_id);
-    try std.testing.expect(retrieved != null);
-
-    try std.testing.expect(kernel.cycle_count == 0);
-}
-

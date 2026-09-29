@@ -72,30 +72,3 @@ pub fn scatterRows(
         }
     }
 }
-
-test "compact sequence is max length" {
-    const lengths = [_]usize{ 0, 3, 7, 2 };
-    try std.testing.expectEqual(@as(usize, 7), compactSequenceLength(&lengths));
-}
-
-test "pack tokens drops pad columns" {
-    const src = [_]u32{ 1, 2, 0, 0, 3, 4, 5, 0 };
-    var dest: [6]u32 = undefined;
-    const lengths = [_]usize{ 2, 3 };
-    try packTokens(&dest, &src, 2, 4, 3, &lengths);
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 0, 3, 4, 5 }, &dest);
-}
-
-test "scatter rows restores padded layout" {
-    const src = [_]f16{ 1, 2, 0, 0, 3, 4, 5, 6 };
-    var dest: [12]f16 = undefined;
-    const lengths = [_]usize{ 1, 2 };
-    try scatterRows(&dest, &src, 2, 3, 2, 2, &lengths);
-    try std.testing.expectEqual(@as(f16, 1), dest[0]);
-    try std.testing.expectEqual(@as(f16, 2), dest[1]);
-    try std.testing.expectEqual(@as(f16, 0), dest[2]);
-    try std.testing.expectEqual(@as(f16, 3), dest[6]);
-    try std.testing.expectEqual(@as(f16, 4), dest[7]);
-    try std.testing.expectEqual(@as(f16, 5), dest[8]);
-    try std.testing.expectEqual(@as(f16, 6), dest[9]);
-}

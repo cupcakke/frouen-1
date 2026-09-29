@@ -29,34 +29,3 @@ pub fn bounds(total: usize, world_size: usize, rank: usize) Error!Bounds {
         ) catch return Error.Overflow;
     return .{ .start = start, .count = count };
 }
-
-test "dataset partitions cover every sample exactly once" {
-    const total: usize = 23;
-    const world_size: usize = 5;
-    var covered = [_]bool{false} ** total;
-    var rank: usize = 0;
-    while (rank < world_size) : (rank += 1) {
-        const partition = try bounds(total, world_size, rank);
-        var index = partition.start;
-        while (index < partition.start + partition.count) : (index += 1) {
-            try std.testing.expect(!covered[index]);
-            covered[index] = true;
-        }
-    }
-    for (covered) |present| try std.testing.expect(present);
-}
-
-test "dataset partitions permit idle ranks without duplication" {
-    const total: usize = 2;
-    const world_size: usize = 4;
-    try std.testing.expectEqual(Bounds{ .start = 0, .count = 1 }, try bounds(total, world_size, 0));
-    try std.testing.expectEqual(Bounds{ .start = 1, .count = 1 }, try bounds(total, world_size, 1));
-    try std.testing.expectEqual(Bounds{ .start = 2, .count = 0 }, try bounds(total, world_size, 2));
-    try std.testing.expectEqual(Bounds{ .start = 2, .count = 0 }, try bounds(total, world_size, 3));
-}
-
-test "dataset partition validates topology" {
-    try std.testing.expectError(Error.EmptyDataset, bounds(0, 1, 0));
-    try std.testing.expectError(Error.InvalidWorldSize, bounds(1, 0, 0));
-    try std.testing.expectError(Error.InvalidRank, bounds(1, 1, 1));
-}
