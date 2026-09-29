@@ -3599,24 +3599,3 @@ fn writeSnapshotToPath(snapshot: *const SavedModelSnapshot, path: []const u8, al
     tmp_exists = false;
     try syncDirectory(parent_dir);
 }
-
-fn lossSensitivity(weight: *Tensor, index: usize, h: f32, model: *RSF, input: *const Tensor, seeds: *const Tensor, allocator: Allocator) !f32 {
-    const original = weight.data[index];
-    defer weight.data[index] = original;
-    weight.data[index] = original + h;
-    var plus = try tensorClone(allocator, input);
-    defer plus.deinit();
-    try model.forwardCPU(&plus);
-    weight.data[index] = original - h;
-    var minus = try tensorClone(allocator, input);
-    defer minus.deinit();
-    try model.forwardCPU(&minus);
-    var loss_plus: f32 = 0.0;
-    var loss_minus: f32 = 0.0;
-    var j: usize = 0;
-    while (j < seeds.data.len) : (j += 1) {
-        loss_plus += seeds.data[j] * plus.data[j];
-        loss_minus += seeds.data[j] * minus.data[j];
-    }
-    return (loss_plus - loss_minus) / (2.0 * h);
-}

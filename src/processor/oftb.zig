@@ -295,21 +295,3 @@ pub fn mixInverse(oftb: OFTB, x: *Tensor) !void {
 comptime {
     _ = OFTB;
 }
-
-fn oftbNormL2(values: []const f32) f64 {
-    var acc: f64 = 0.0;
-    for (values) |v| {
-        const x: f64 = @floatCast(v);
-        acc += x * x;
-    }
-    return @sqrt(acc);
-}
-
-fn oftbMaxAbsDiff(a: []const f32, b: []const f32) f32 {
-    var worst: f32 = 0.0;
-    for (a, b) |x, y| {
-        const diff = @abs(x - y);
-        if (diff > worst) worst = diff;
-    }
-    return worst;
-}

@@ -253,11 +253,3 @@ pub fn admit(config: EstimateConfig, device: DeviceMemory) MemoryError!Admission
         .largest_bytes = largest,
     };
 }
-
-pub fn denseBaselineElements() MemoryError!u64 {
-    return stackElements(16384, 11, .dense_affine);
-}
-
-pub fn denseBaselineStackBytesF32() MemoryError!u64 {
-    return bytesOf(try denseBaselineElements(), 4);
-}

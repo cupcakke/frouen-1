@@ -1058,39 +1058,3 @@ pub fn loadFromFP16(src: []const f16, params: *Tensor) !void {
     if (src.len != params.data.len) return error.ShapeMismatch;
     for (src, params.data) |value, *target| target.* = @floatCast(value);
 }
-
-fn mseBlocked(a: []const f32, b: []const f32) f32 {
-    var acc: f64 = 0.0;
-    const n = @min(a.len, b.len);
-    if (n == 0) return 0.0;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const d = @as(f64, a[i]) - @as(f64, b[i]);
-        acc += d * d;
-    }
-    return @floatCast(acc / @as(f64, @floatFromInt(n)));
-}
-
-fn writeLegacyV1(path: []const u8, param_size: usize, fisher: []const f32, momentum: []const f32, step: u64) !void {
-    var file = try core_io.createFilePath(path, .{ .mode = 0o600 });
-    defer file.close();
-    var buffered = std.io.bufferedWriter(file.writer());
-    const writer = buffered.writer();
-    try writer.writeInt(u32, SFD3_MAGIC, .little);
-    try writer.writeInt(u32, @bitCast(@as(f32, 0.9)), .little);
-    try writer.writeInt(u32, @bitCast(@as(f32, 0.999)), .little);
-    try writer.writeInt(u32, @bitCast(@as(f32, 1.0e-8)), .little);
-    try writer.writeInt(u32, @bitCast(@as(f32, 0.1)), .little);
-    try writer.writeInt(u32, @bitCast(@as(f32, 1.0e-3)), .little);
-    try writer.writeInt(u32, @bitCast(@as(f32, 1.0e6)), .little);
-    try writer.writeInt(u64, 10, .little);
-    try writer.writeInt(u64, @intCast(param_size), .little);
-    try writer.writeInt(u64, step, .little);
-    try writer.writeInt(u64, 1, .little);
-    try writer.writeInt(u64, @intCast(param_size), .little);
-    for (fisher) |v| try writer.writeInt(u32, @bitCast(v), .little);
-    try writer.writeInt(u64, 1, .little);
-    try writer.writeInt(u64, @intCast(param_size), .little);
-    for (momentum) |v| try writer.writeInt(u32, @bitCast(v), .little);
-    try buffered.flush();
-}

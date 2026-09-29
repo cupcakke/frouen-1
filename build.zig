@@ -360,10 +360,10 @@ pub fn build(b: *std.Build) void {
         name: []const u8,
         path: []const u8,
     }{
-        .{ .name = "bench-rsf", .path = "src/tests/bench_rsf.zig" },
-        .{ .name = "bench-matmul", .path = "src/tests/bench_matmul.zig" },
-        .{ .name = "bench-tensor-ops", .path = "src/tests/bench_tensor_ops.zig" },
-        .{ .name = "bench-sfd", .path = "src/tests/bench_sfd.zig" },
+        .{ .name = "bench-rsf", .path = "src/bench/bench_rsf.zig" },
+        .{ .name = "bench-matmul", .path = "src/bench/bench_matmul.zig" },
+        .{ .name = "bench-tensor-ops", .path = "src/bench/bench_tensor_ops.zig" },
+        .{ .name = "bench-sfd", .path = "src/bench/bench_sfd.zig" },
     };
 
     inline for (bench_sources) |source| {
