@@ -339,6 +339,9 @@ pub const RankedSegment = struct {
     score: f32,
     position: u64,
     anchor: bool,
+    latent_similarity: f32 = 0,
+    reconstruction_confidence: f32 = 0,
+    volume_surprise: f32 = 0,
 
     pub fn init(allocator: Allocator, tokens: []u32, score: f32, position: u64, anchor: bool) !RankedSegment {
         return .{
@@ -346,6 +349,9 @@ pub const RankedSegment = struct {
             .score = score,
             .position = position,
             .anchor = anchor,
+            .latent_similarity = 0,
+            .reconstruction_confidence = 0,
+            .volume_surprise = 0,
         };
     }
 
@@ -357,6 +363,32 @@ pub const RankedSegment = struct {
         return if (self.score > other.score) -1 else if (self.score < other.score) 1 else 0;
     }
 };
+
+fn rsfSplitmix64(x: u64) u64 {
+    var z = x +% 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
+
+pub fn rsfLatentSimHash(latent: []const f32) u64 {
+    var signature: u64 = 0;
+    var bit: u64 = 0;
+    while (bit < 64) : (bit += 1) {
+        var acc: f64 = 0;
+        var j: usize = 0;
+        while (j < latent.len) : (j += 1) {
+            const seed = @as(u64, 0x51DE0BAA) ^ (bit *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(j));
+            const rnd = rsfSplitmix64(seed);
+            const sign: f64 = if ((rnd & 1) == 1) 1.0 else -1.0;
+            acc += sign * @as(f64, latent[j]);
+        }
+        if (acc >= 0.0) {
+            signature |= @as(u64, 1) << @intCast(bit);
+        }
+    }
+    return signature;
+}
 
 pub const BitSet = struct {
     bits: []u64,

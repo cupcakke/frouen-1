@@ -5,16 +5,29 @@ const types = @import("../core/types.zig");
 const Tensor = @import("../core/tensor.zig").Tensor;
 const Error = types.Error;
 
+pub const SSIScoringConfig = struct {
+    pub const cosine_weight: f32 = 0.7;
+    pub const volume_weight: f32 = 0.3;
+    pub const volume_kappa: f32 = 1.0;
+    pub const cosine_eps: f32 = 1.0e-12;
+};
+
 pub const SSI = struct {
     root: ?*Node,
     allocator: Allocator,
     height: usize = 0,
     size: usize = 0,
     max_height: usize = 6,
+    dim: usize = 0,
+    model_id: u64 = 0,
+    global_diffusion: bool = false,
+    identity_set: bool = false,
 
     pub const bucket_width: usize = 6;
     pub const bucket_count: usize = 1 << bucket_width;
     const tensor_width: usize = 134;
+    const format_magic: u32 = 0x32535349;
+    const format_version: u32 = 2;
 
     const Segment = struct {
         tokens: []u32,
@@ -22,20 +35,46 @@ pub const SSI = struct {
         score: f32,
         anchor_hash: u64,
         signature: u64,
+        latent: []f32,
+        log_det: f32,
+        latent_version: u32,
 
-        pub fn init(allocator: Allocator, tokens: []const u32, position: u64, score: f32, anchor_hash: u64) !Segment {
+        pub fn init(
+            allocator: Allocator,
+            tokens: []const u32,
+            position: u64,
+            score: f32,
+            anchor_hash: u64,
+            latent: []const f32,
+            log_det: f32,
+            latent_version: u32,
+        ) !Segment {
+            const token_copy = try allocator.dupe(u32, tokens);
+            errdefer allocator.free(token_copy);
+            const latent_copy = try allocator.dupe(f32, latent);
+            errdefer allocator.free(latent_copy);
+            const token_sig = computeMinHashSignature(tokens);
+            const latent_sig = if (latent_version == 1) types.rsfLatentSimHash(latent_copy) else 0;
+            const signature = if (latent_version == 1) mixHash(token_sig, latent_sig) else token_sig;
             return .{
-                .tokens = try allocator.dupe(u32, tokens),
+                .tokens = token_copy,
                 .position = position,
                 .score = score,
                 .anchor_hash = anchor_hash,
-                .signature = computeMinHashSignature(tokens),
+                .signature = signature,
+                .latent = latent_copy,
+                .log_det = log_det,
+                .latent_version = latent_version,
             };
         }
 
         pub fn deinit(self: *Segment, allocator: Allocator) void {
             allocator.free(self.tokens);
             self.tokens = &.{};
+            if (self.latent.len > 0) {
+                allocator.free(self.latent);
+            }
+            self.latent = &.{};
         }
 
         pub fn tokenHash(self: *const Segment) u64 {
@@ -51,6 +90,12 @@ pub const SSI = struct {
             state = mixHash(state, @as(u64, @intCast(self.tokens.len)));
             for (self.tokens) |tok| {
                 state = mixHash(state, tok);
+            }
+            state = mixHash(state, self.latent_version);
+            state = mixHash(state, @as(u64, scoreBits(self.log_det)));
+            state = mixHash(state, @as(u64, @intCast(self.latent.len)));
+            for (self.latent) |value| {
+                state = mixHash(state, @as(u64, scoreBits(value)));
             }
             return state;
         }
@@ -113,6 +158,10 @@ pub const SSI = struct {
             .height = 0,
             .size = 0,
             .max_height = bucket_width,
+            .dim = 0,
+            .model_id = 0,
+            .global_diffusion = false,
+            .identity_set = false,
         };
     }
 
@@ -180,6 +229,10 @@ pub const SSI = struct {
             }
         }
         return signature;
+    }
+
+    pub fn latentSimHash(latent: []const f32) u64 {
+        return types.rsfLatentSimHash(latent);
     }
 
     pub fn signatureSimilarity(query_signature: u64, segment_signature: u64) f32 {
@@ -252,6 +305,10 @@ pub const SSI = struct {
         self.root = null;
         self.height = 0;
         self.size = 0;
+        self.dim = 0;
+        self.model_id = 0;
+        self.global_diffusion = false;
+        self.identity_set = false;
     }
 
     fn computeLeafHash(node: *const Node) u64 {
@@ -296,19 +353,47 @@ pub const SSI = struct {
         return self.root.?;
     }
 
-    fn insertIntoLeaf(self: *SSI, leaf: *Node, tokens: []const u32, position: u64, score: f32, anchor_hash: u64) !bool {
+    fn adoptIdentity(self: *SSI, dim: usize, model_id: u64, global_diffusion: bool) !void {
+        if (self.identity_set) {
+            if (self.dim != dim or self.model_id != model_id or self.global_diffusion != global_diffusion) {
+                return Error.RSFModelMismatch;
+            }
+            return;
+        }
+        self.dim = dim;
+        self.model_id = model_id;
+        self.global_diffusion = global_diffusion;
+        self.identity_set = true;
+    }
+
+    fn copyIdentityInto(self: *const SSI, target: *SSI) !void {
+        if (!self.identity_set) return;
+        try target.adoptIdentity(self.dim, self.model_id, self.global_diffusion);
+    }
+
+    fn insertIntoLeaf(
+        self: *SSI,
+        leaf: *Node,
+        tokens: []const u32,
+        position: u64,
+        score: f32,
+        anchor_hash: u64,
+        latent: []const f32,
+        log_det: f32,
+        latent_version: u32,
+    ) !bool {
         if (!leaf.is_leaf or leaf.height != 0) {
             return error.InvalidNodeState;
         }
         if (leaf.segment == null) {
-            leaf.segment = try Segment.init(self.allocator, tokens, position, score, anchor_hash);
+            leaf.segment = try Segment.init(self.allocator, tokens, position, score, anchor_hash, latent, log_det, latent_version);
             refreshHash(leaf);
             return true;
         }
         if (leaf.segment.?.position == position) {
             var old = leaf.segment.?;
             old.deinit(self.allocator);
-            leaf.segment = try Segment.init(self.allocator, tokens, position, score, anchor_hash);
+            leaf.segment = try Segment.init(self.allocator, tokens, position, score, anchor_hash, latent, log_det, latent_version);
             refreshHash(leaf);
             return false;
         }
@@ -316,7 +401,7 @@ pub const SSI = struct {
         while (chain) |c| {
             if (c.seg.position == position) {
                 c.seg.deinit(self.allocator);
-                c.seg = try Segment.init(self.allocator, tokens, position, score, anchor_hash);
+                c.seg = try Segment.init(self.allocator, tokens, position, score, anchor_hash, latent, log_det, latent_version);
                 refreshHash(leaf);
                 return false;
             }
@@ -324,7 +409,7 @@ pub const SSI = struct {
         }
         const collision = try self.allocator.create(CollisionNode);
         collision.* = .{
-            .seg = try Segment.init(self.allocator, tokens, position, score, anchor_hash),
+            .seg = try Segment.init(self.allocator, tokens, position, score, anchor_hash, latent, log_det, latent_version),
             .next = leaf.collision_chain,
         };
         leaf.collision_chain = collision;
@@ -332,7 +417,16 @@ pub const SSI = struct {
         return true;
     }
 
-    fn addSequenceWithMetadata(self: *SSI, tokens: []const u32, position: u64, score: f32, anchor_hash: u64) !void {
+    fn addSequenceWithMetadata(
+        self: *SSI,
+        tokens: []const u32,
+        position: u64,
+        score: f32,
+        anchor_hash: u64,
+        latent: []const f32,
+        log_det: f32,
+        latent_version: u32,
+    ) !void {
         const root = try self.ensureRoot();
         const idx = bucketIndex(position);
         if (root.children.?[idx] == null) {
@@ -341,7 +435,7 @@ pub const SSI = struct {
             root.children.?[idx] = leaf;
         }
         const leaf = root.children.?[idx].?;
-        const inserted_new = try self.insertIntoLeaf(leaf, tokens, position, score, anchor_hash);
+        const inserted_new = try self.insertIntoLeaf(leaf, tokens, position, score, anchor_hash, latent, log_det, latent_version);
         refreshHash(root);
         if (inserted_new) {
             self.size += 1;
@@ -349,6 +443,7 @@ pub const SSI = struct {
     }
 
     fn copyInto(self: *const SSI, target: *SSI) !void {
+        try self.copyIdentityInto(target);
         if (self.root == null) {
             return;
         }
@@ -357,11 +452,11 @@ pub const SSI = struct {
             for (children) |maybe_child| {
                 if (maybe_child) |leaf| {
                     if (leaf.segment) |seg| {
-                        try target.addSequenceWithMetadata(seg.tokens, seg.position, seg.score, seg.anchor_hash);
+                        try target.addSequenceWithMetadata(seg.tokens, seg.position, seg.score, seg.anchor_hash, seg.latent, seg.log_det, seg.latent_version);
                     }
                     var chain = leaf.collision_chain;
                     while (chain) |c| {
-                        try target.addSequenceWithMetadata(c.seg.tokens, c.seg.position, c.seg.score, c.seg.anchor_hash);
+                        try target.addSequenceWithMetadata(c.seg.tokens, c.seg.position, c.seg.score, c.seg.anchor_hash, c.seg.latent, c.seg.log_det, c.seg.latent_version);
                         chain = c.next;
                     }
                 }
@@ -371,13 +466,82 @@ pub const SSI = struct {
 
     pub fn addSequence(self: *SSI, tokens: []const u32, position: u64, is_anchor: bool) !void {
         const anchor_hash = if (is_anchor) computeAnchorHash(tokens, position) else 0;
-        try self.addSequenceWithMetadata(tokens, position, 0.0, anchor_hash);
+        try self.addSequenceWithMetadata(tokens, position, 0.0, anchor_hash, &.{}, 0.0, 0);
         if (self.size > 0) {
             const load_factor = @as(f64, @floatFromInt(self.size)) / @as(f64, @floatFromInt(bucket_count));
             if (load_factor > 8.0) {
                 try self.compact();
             }
         }
+    }
+
+    pub fn addSequenceWithLatent(self: *SSI, tokens: []const u32, position: u64, is_anchor: bool, latent: []const f32, log_det: f32) !void {
+        if (latent.len < 2 or latent.len % 2 != 0) return Error.InvalidShape;
+        const dim = latent.len / 2;
+        try self.adoptIdentity(dim, self.model_id, self.global_diffusion);
+        if (self.dim != dim) return Error.RSFModelMismatch;
+        const anchor_hash = if (is_anchor) computeAnchorHash(tokens, position) else 0;
+        try self.addSequenceWithMetadata(tokens, position, 0.0, anchor_hash, latent, log_det, 1);
+        if (self.size > 0) {
+            const load_factor = @as(f64, @floatFromInt(self.size)) / @as(f64, @floatFromInt(bucket_count));
+            if (load_factor > 8.0) {
+                try self.compact();
+            }
+        }
+    }
+
+    pub fn addLatent(self: *SSI, model: anytype, state: anytype, tokens: []const u32, position: u64, is_anchor: bool) !void {
+        const dim = try model.dim();
+        const gd = try model.globalDiffusionEnabled();
+        const binding = try model.latentBinding();
+        try state.binding.requireModel(binding.model_id);
+        try state.binding.requireSpace(.latent_state);
+        if (state.binding.dim != dim) return Error.RSFDimMismatch;
+        if (state.data.shape.dims.len != 3) return Error.InvalidShape;
+        if (state.data.shape.dims[1] != dim or state.data.shape.dims[2] != 2) return Error.ShapeMismatch;
+        if (state.data.shape.dims[0] == 0) return Error.EmptyInput;
+        const packed_len = dim * 2;
+        const latent = try self.allocator.alloc(f32, packed_len);
+        defer self.allocator.free(latent);
+        var d: usize = 0;
+        while (d < dim) : (d += 1) {
+            latent[d] = state.data.data[d * 2];
+            latent[dim + d] = state.data.data[d * 2 + 1];
+        }
+        try self.adoptIdentity(dim, binding.model_id, gd);
+        try self.addSequenceWithLatent(tokens, position, is_anchor, latent, state.log_det);
+    }
+
+    fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
+        if (a.len == 0 or b.len == 0 or a.len != b.len) return 0.0;
+        var dot: f64 = 0.0;
+        var na: f64 = 0.0;
+        var nb: f64 = 0.0;
+        var i: usize = 0;
+        while (i < a.len) : (i += 1) {
+            const x: f64 = a[i];
+            const y: f64 = b[i];
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+        const denom = @sqrt(na) * @sqrt(nb) + @as(f64, SSIScoringConfig.cosine_eps);
+        return @floatCast(dot / denom);
+    }
+
+    fn volumeScore(segment_log_det: f32, query_log_det: f32) f32 {
+        const delta = @abs(segment_log_det - query_log_det) / SSIScoringConfig.volume_kappa;
+        return @floatCast(@exp(@as(f64, -delta)));
+    }
+
+    fn latentScore(seg: Segment, query_latent: []const f32, query_log_det: f32, query_hash: u64, query_signature: u64) f32 {
+        if (seg.latent_version == 0 or seg.latent.len == 0) {
+            return signatureSimilarity(query_signature, seg.signature);
+        }
+        const cos = cosineSimilarity(query_latent, seg.latent);
+        const vol = volumeScore(seg.log_det, query_log_det);
+        _ = query_hash;
+        return SSIScoringConfig.cosine_weight * cos + SSIScoringConfig.volume_weight * vol;
     }
 
     pub fn retrieveTopK(self: *const SSI, query_tokens: []const u32, k: usize, allocator: Allocator) ![]types.RankedSegment {
@@ -400,6 +564,38 @@ pub const SSI = struct {
         const query_hash = hashTokens(query_tokens);
         const query_signature = computeMinHashSignature(query_tokens);
         try self.traverse(self.root, query_hash, query_signature, &heap, k, allocator);
+        const result_len = @min(k, heap.count());
+        var top_n = try allocator.alloc(types.RankedSegment, result_len);
+        var index = result_len;
+        while (heap.removeOrNull()) |item| {
+            index -= 1;
+            top_n[index] = item;
+        }
+        return top_n;
+    }
+
+    pub fn retrieveTopKLatent(self: *const SSI, query_latent: []const f32, query_log_det: f32, k: usize, allocator: Allocator) ![]types.RankedSegment {
+        if (k == 0) {
+            return allocator.alloc(types.RankedSegment, 0);
+        }
+        if (self.identity_set and query_latent.len != self.dim * 2) {
+            return Error.RSFModelMismatch;
+        }
+        var heap = std.PriorityQueue(types.RankedSegment, void, struct {
+            pub fn lessThan(_: void, a: types.RankedSegment, b: types.RankedSegment) std.math.Order {
+                return std.math.order(a.score, b.score);
+            }
+        }.lessThan).init(allocator, {});
+        errdefer {
+            while (heap.removeOrNull()) |item| {
+                var mut = item;
+                mut.deinit(allocator);
+            }
+            heap.deinit();
+        }
+        defer heap.deinit();
+        const query_signature = mixHash(0, types.rsfLatentSimHash(query_latent));
+        try self.traverseLatent(self.root, query_latent, query_log_det, query_signature, &heap, k, allocator);
         const result_len = @min(k, heap.count());
         var top_n = try allocator.alloc(types.RankedSegment, result_len);
         var index = result_len;
@@ -435,6 +631,31 @@ pub const SSI = struct {
         }
     }
 
+    fn traverseLatent(self: *const SSI, node: ?*Node, query_latent: []const f32, query_log_det: f32, query_signature: u64, heap: anytype, k: usize, allocator: Allocator) !void {
+        if (node == null) {
+            return;
+        }
+        const current = node.?;
+        if (current.is_leaf) {
+            if (current.segment) |seg| {
+                try addLatentSegmentToHeap(seg, query_latent, query_log_det, query_signature, heap, k, allocator);
+            }
+            var chain = current.collision_chain;
+            while (chain) |c| {
+                try addLatentSegmentToHeap(c.seg, query_latent, query_log_det, query_signature, heap, k, allocator);
+                chain = c.next;
+            }
+            return;
+        }
+        if (current.children) |children| {
+            for (children) |maybe_child| {
+                if (maybe_child) |child| {
+                    try traverseLatent(self, child, query_latent, query_log_det, query_signature, heap, k, allocator);
+                }
+            }
+        }
+    }
+
     fn addSegmentToHeap(seg: Segment, query_hash: u64, query_signature: u64, heap: anytype, k: usize, allocator: Allocator) !void {
         const similarity = computeFusedSimilarity(query_hash, query_signature, seg.tokenHash(), seg.signature);
         if (heap.count() >= k) {
@@ -449,6 +670,38 @@ pub const SSI = struct {
             .score = similarity,
             .position = seg.position,
             .anchor = seg.anchor_hash != 0,
+            .latent_similarity = 0,
+            .reconstruction_confidence = 0,
+            .volume_surprise = 0,
+        };
+        errdefer allocator.free(ranked.tokens);
+        if (heap.count() < k) {
+            try heap.add(ranked);
+            return;
+        }
+        try heap.add(ranked);
+        var removed = heap.remove();
+        removed.deinit(allocator);
+    }
+
+    fn addLatentSegmentToHeap(seg: Segment, query_latent: []const f32, query_log_det: f32, query_signature: u64, heap: anytype, k: usize, allocator: Allocator) !void {
+        const query_hash = hashTokens(seg.tokens);
+        const similarity = latentScore(seg, query_latent, query_log_det, query_hash, query_signature);
+        if (heap.count() >= k) {
+            if (heap.peek()) |top| {
+                if (similarity <= top.score) {
+                    return;
+                }
+            }
+        }
+        const ranked = types.RankedSegment{
+            .tokens = try allocator.dupe(u32, seg.tokens),
+            .score = similarity,
+            .position = seg.position,
+            .anchor = seg.anchor_hash != 0,
+            .latent_similarity = cosineSimilarity(query_latent, seg.latent),
+            .reconstruction_confidence = 0,
+            .volume_surprise = volumeScore(seg.log_det, query_log_det),
         };
         errdefer allocator.free(ranked.tokens);
         if (heap.count() < k) {
@@ -567,9 +820,15 @@ pub const SSI = struct {
         for (seg.tokens) |tok| {
             try writer.writeInt(u32, tok, .little);
         }
+        try writer.writeInt(u32, seg.latent_version, .little);
+        try writer.writeInt(u32, floatToBits(seg.log_det), .little);
+        try writer.writeInt(u64, @as(u64, seg.latent.len), .little);
+        for (seg.latent) |value| {
+            try writer.writeInt(u32, floatToBits(value), .little);
+        }
     }
 
-    fn readSegment(allocator: Allocator, reader: anytype) !Segment {
+    fn readSegment(allocator: Allocator, reader: anytype, version: u32) !Segment {
         const position = try reader.readInt(u64, .little);
         const score = bitsToFloat(try reader.readInt(u32, .little));
         const anchor_hash = try reader.readInt(u64, .little);
@@ -582,14 +841,33 @@ pub const SSI = struct {
         for (tokens) |*tok| {
             tok.* = try reader.readInt(u32, .little);
         }
-        const signature = computeMinHashSignature(tokens);
-        if (signature != stored_signature) return error.InvalidData;
+        var latent_version: u32 = 0;
+        var log_det: f32 = 0.0;
+        var latent: []f32 = &.{};
+        if (version >= format_version) {
+            latent_version = try reader.readInt(u32, .little);
+            log_det = bitsToFloat(try reader.readInt(u32, .little));
+            const latent_len_raw = try reader.readInt(u64, .little);
+            if (latent_len_raw > std.math.maxInt(usize)) return error.InvalidData;
+            const latent_len: usize = @intCast(latent_len_raw);
+            latent = try allocator.alloc(f32, latent_len);
+            errdefer allocator.free(latent);
+            for (latent) |*value| {
+                value.* = bitsToFloat(try reader.readInt(u32, .little));
+            }
+        }
+        const token_sig = computeMinHashSignature(tokens);
+        const expected = if (latent_version == 1) mixHash(token_sig, types.rsfLatentSimHash(latent)) else token_sig;
+        if (expected != stored_signature) return error.InvalidData;
         return .{
             .tokens = tokens,
             .position = position,
             .score = score,
             .anchor_hash = anchor_hash,
-            .signature = signature,
+            .signature = stored_signature,
+            .latent = latent,
+            .log_det = log_det,
+            .latent_version = latent_version,
         };
     }
 
@@ -626,7 +904,7 @@ pub const SSI = struct {
         }
     }
 
-    fn deserializeNode(allocator: Allocator, reader: anytype) !*Node {
+    fn deserializeNode(allocator: Allocator, reader: anytype, version: u32) !*Node {
         const is_leaf = try readBoolFlag(reader);
         const height_raw = try reader.readInt(u64, .little);
         if (height_raw > std.math.maxInt(usize)) return error.InvalidData;
@@ -646,7 +924,7 @@ pub const SSI = struct {
         if (is_leaf) {
             const has_segment = try readBoolFlag(reader);
             if (has_segment) {
-                node.segment = try readSegment(allocator, reader);
+                node.segment = try readSegment(allocator, reader, version);
             }
             const chain_len_raw = try reader.readInt(u64, .little);
             if (chain_len_raw > std.math.maxInt(usize)) return error.InvalidData;
@@ -657,7 +935,7 @@ pub const SSI = struct {
             while (index < chain_len) : (index += 1) {
                 const collision = try allocator.create(CollisionNode);
                 collision.* = .{
-                    .seg = try readSegment(allocator, reader),
+                    .seg = try readSegment(allocator, reader, version),
                     .next = null,
                 };
                 if (head == null) {
@@ -679,7 +957,7 @@ pub const SSI = struct {
             for (0..children_len) |i| {
                 const has_child = try readBoolFlag(reader);
                 if (has_child) {
-                    node.children.?[i] = try deserializeNode(allocator, reader);
+                    node.children.?[i] = try deserializeNode(allocator, reader, version);
                 }
             }
         }
@@ -692,6 +970,12 @@ pub const SSI = struct {
     }
 
     pub fn serialize(self: *SSI, writer: anytype) !void {
+        const header = (@as(u64, format_version) << 32) | @as(u64, format_magic);
+        try writer.writeInt(u64, header, .little);
+        try writer.writeInt(u64, @as(u64, self.dim), .little);
+        try writer.writeInt(u64, self.model_id, .little);
+        try writeBoolFlag(writer, self.global_diffusion);
+        try writeBoolFlag(writer, self.identity_set);
         try writer.writeInt(u64, @as(u64, self.max_height), .little);
         try writer.writeInt(u64, @as(u64, self.height), .little);
         try writer.writeInt(u64, @as(u64, self.size), .little);
@@ -703,21 +987,45 @@ pub const SSI = struct {
 
     pub fn deserialize(allocator: Allocator, reader: anytype) !SSI {
         var ssi = SSI.init(allocator);
-        const max_height_raw = try reader.readInt(u64, .little);
-        const height_raw = try reader.readInt(u64, .little);
-        const size_raw = try reader.readInt(u64, .little);
-        if (max_height_raw > std.math.maxInt(usize) or height_raw > std.math.maxInt(usize) or size_raw > std.math.maxInt(usize)) {
-            return error.InvalidData;
+        errdefer ssi.deinit();
+        const first = try reader.readInt(u64, .little);
+        const magic: u32 = @truncate(first);
+        var version: u32 = 1;
+        if (magic == format_magic) {
+            version = @intCast(first >> 32);
+            const dim_raw = try reader.readInt(u64, .little);
+            if (dim_raw > std.math.maxInt(usize)) return error.InvalidData;
+            ssi.dim = @intCast(dim_raw);
+            ssi.model_id = try reader.readInt(u64, .little);
+            ssi.global_diffusion = try readBoolFlag(reader);
+            ssi.identity_set = try readBoolFlag(reader);
+        } else {
+            ssi.max_height = @intCast(first);
         }
-        ssi.max_height = @intCast(max_height_raw);
-        ssi.height = @intCast(height_raw);
-        ssi.size = @intCast(size_raw);
+        if (magic == format_magic) {
+            const max_height_raw = try reader.readInt(u64, .little);
+            const height_raw = try reader.readInt(u64, .little);
+            const size_raw = try reader.readInt(u64, .little);
+            if (max_height_raw > std.math.maxInt(usize) or height_raw > std.math.maxInt(usize) or size_raw > std.math.maxInt(usize)) {
+                return error.InvalidData;
+            }
+            ssi.max_height = @intCast(max_height_raw);
+            ssi.height = @intCast(height_raw);
+            ssi.size = @intCast(size_raw);
+        } else {
+            const height_raw = try reader.readInt(u64, .little);
+            const size_raw = try reader.readInt(u64, .little);
+            if (height_raw > std.math.maxInt(usize) or size_raw > std.math.maxInt(usize)) {
+                return error.InvalidData;
+            }
+            ssi.height = @intCast(height_raw);
+            ssi.size = @intCast(size_raw);
+        }
         const has_root = try readBoolFlag(reader);
         if (has_root) {
-            ssi.root = try deserializeNode(allocator, reader);
+            ssi.root = try deserializeNode(allocator, reader, version);
         }
         if (ssi.countSegments() != ssi.size) {
-            ssi.deinit();
             return error.InvalidData;
         }
         return ssi;
@@ -725,8 +1033,10 @@ pub const SSI = struct {
 
     pub fn exportToTensor(self: *SSI, allocator: Allocator) !Tensor {
         const segment_count = self.countSegments();
+        const dim = if (self.dim == 0) @as(usize, 0) else self.dim;
+        const cols = if (dim == 0) tensor_width else dim * 2 + 4;
         const rows = if (segment_count == 0) 1 else segment_count;
-        var tensor = try Tensor.init(allocator, &.{ rows, tensor_width });
+        var tensor = try Tensor.init(allocator, &.{ rows, cols });
         @memset(tensor.data, 0);
         const root = self.root orelse return tensor;
         var row: usize = 0;
@@ -734,12 +1044,12 @@ pub const SSI = struct {
             for (children) |maybe_child| {
                 if (maybe_child) |leaf| {
                     if (leaf.segment) |seg| {
-                        encodeSegmentRow(&tensor, row, seg);
+                        encodeSegmentRow(&tensor, row, seg, dim, cols);
                         row += 1;
                     }
                     var chain = leaf.collision_chain;
                     while (chain) |c| {
-                        encodeSegmentRow(&tensor, row, c.seg);
+                        encodeSegmentRow(&tensor, row, c.seg, dim, cols);
                         row += 1;
                         chain = c.next;
                     }
@@ -749,60 +1059,114 @@ pub const SSI = struct {
         return tensor;
     }
 
-    fn encodeSegmentRow(tensor: *Tensor, row: usize, seg: Segment) void {
-        const offset = row * tensor_width;
-        tensor.data[offset + 0] = safeFloat(@as(f32, @floatFromInt(seg.tokens.len)));
-        tensor.data[offset + 1] = safeFloat(bitsToFloat(low32(seg.position)));
-        tensor.data[offset + 2] = safeFloat(bitsToFloat(high32(seg.position)));
-        tensor.data[offset + 3] = safeFloat(seg.score);
-        tensor.data[offset + 4] = safeFloat(bitsToFloat(low32(seg.anchor_hash)));
-        tensor.data[offset + 5] = safeFloat(bitsToFloat(high32(seg.anchor_hash)));
-        var i: usize = 0;
-        while (i < seg.tokens.len and i < 128) : (i += 1) {
-            tensor.data[offset + 6 + i] = safeFloat(std.math.clamp(bitsToFloat(seg.tokens[i]), -3.4e38, 3.4e38));
+    fn encodeSegmentRow(tensor: *Tensor, row: usize, seg: Segment, dim: usize, cols: usize) void {
+        const offset = row * cols;
+        if (dim == 0) {
+            tensor.data[offset + 0] = safeFloat(@as(f32, @floatFromInt(seg.tokens.len)));
+            tensor.data[offset + 1] = safeFloat(bitsToFloat(low32(seg.position)));
+            tensor.data[offset + 2] = safeFloat(bitsToFloat(high32(seg.position)));
+            tensor.data[offset + 3] = safeFloat(seg.score);
+            tensor.data[offset + 4] = safeFloat(bitsToFloat(low32(seg.anchor_hash)));
+            tensor.data[offset + 5] = safeFloat(bitsToFloat(high32(seg.anchor_hash)));
+            var i: usize = 0;
+            while (i < seg.tokens.len and i < 128) : (i += 1) {
+                tensor.data[offset + 6 + i] = safeFloat(std.math.clamp(bitsToFloat(seg.tokens[i]), -3.4e38, 3.4e38));
+            }
+            return;
         }
+        const latent_len = dim * 2;
+        var i: usize = 0;
+        while (i < latent_len) : (i += 1) {
+            const value: f32 = if (i < seg.latent.len) seg.latent[i] else 0.0;
+            tensor.data[offset + i] = safeFloat(value);
+        }
+        tensor.data[offset + latent_len + 0] = safeFloat(seg.score);
+        tensor.data[offset + latent_len + 1] = safeFloat(seg.log_det);
+        tensor.data[offset + latent_len + 2] = safeFloat(bitsToFloat(low32(seg.position)));
+        tensor.data[offset + latent_len + 3] = safeFloat(bitsToFloat(high32(seg.position)));
     }
 
     pub fn importFromTensor(self: *SSI, tensor: *const Tensor) !void {
+        const saved_dim = self.dim;
+        const saved_model = self.model_id;
+        const saved_gd = self.global_diffusion;
+        const saved_id = self.identity_set;
         self.deinit();
+        self.dim = saved_dim;
+        self.model_id = saved_model;
+        self.global_diffusion = saved_gd;
+        self.identity_set = saved_id;
         if (tensor.shape.dims.len < 2) {
             return;
         }
-        if (tensor.shape.dims[1] < tensor_width) {
-            return error.InvalidData;
-        }
+        const cols = tensor.shape.dims[1];
         const rows = tensor.shape.dims[0];
-        var tokens_buffer: [128]u32 = undefined;
+        if (cols == tensor_width) {
+            var tokens_buffer: [128]u32 = undefined;
+            var row: usize = 0;
+            while (row < rows) : (row += 1) {
+                const offset = row * tensor_width;
+                if (offset + tensor_width > tensor.data.len) {
+                    break;
+                }
+                const token_len_float = tensor.data[offset + 0];
+                if (!(token_len_float >= 0) or std.math.isInf(token_len_float)) {
+                    continue;
+                }
+                const token_len_raw: usize = @intFromFloat(token_len_float);
+                const token_len = @min(token_len_raw, 128);
+                const position = joinU64(floatToBits(tensor.data[offset + 1]), floatToBits(tensor.data[offset + 2]));
+                const score = tensor.data[offset + 3];
+                const anchor_hash = joinU64(floatToBits(tensor.data[offset + 4]), floatToBits(tensor.data[offset + 5]));
+                var i: usize = 0;
+                while (i < token_len) : (i += 1) {
+                    tokens_buffer[i] = floatToBits(tensor.data[offset + 6 + i]);
+                }
+                try self.addSequenceWithMetadata(tokens_buffer[0..token_len], position, score, anchor_hash, &.{}, 0.0, 0);
+            }
+            return;
+        }
+        if (cols < 4) return error.InvalidData;
+        const latent_len = cols - 4;
+        if (latent_len % 2 != 0) return error.InvalidData;
+        const dim = latent_len / 2;
+        if (self.identity_set and self.dim != dim) return Error.RSFModelMismatch;
+        if (!self.identity_set and dim > 0) {
+            try self.adoptIdentity(dim, self.model_id, self.global_diffusion);
+        }
         var row: usize = 0;
         while (row < rows) : (row += 1) {
-            const offset = row * tensor_width;
-            if (offset + tensor_width > tensor.data.len) {
-                break;
+            const offset = row * cols;
+            if (offset + cols > tensor.data.len) break;
+            const latent = tensor.data[offset .. offset + latent_len];
+            const score = tensor.data[offset + latent_len + 0];
+            const log_det = tensor.data[offset + latent_len + 1];
+            const position = joinU64(floatToBits(tensor.data[offset + latent_len + 2]), floatToBits(tensor.data[offset + latent_len + 3]));
+            var all_zero = true;
+            for (latent) |v| {
+                if (v != 0.0) {
+                    all_zero = false;
+                    break;
+                }
             }
-            const token_len_float = tensor.data[offset + 0];
-            if (!(token_len_float >= 0) or std.math.isInf(token_len_float)) {
-                continue;
-            }
-            const token_len_raw: usize = @intFromFloat(token_len_float);
-            const token_len = @min(token_len_raw, 128);
-            const position = joinU64(floatToBits(tensor.data[offset + 1]), floatToBits(tensor.data[offset + 2]));
-            const score = tensor.data[offset + 3];
-            const anchor_hash = joinU64(floatToBits(tensor.data[offset + 4]), floatToBits(tensor.data[offset + 5]));
-            var i: usize = 0;
-            while (i < token_len) : (i += 1) {
-                tokens_buffer[i] = floatToBits(tensor.data[offset + 6 + i]);
-            }
-            try self.addSequenceWithMetadata(tokens_buffer[0..token_len], position, score, anchor_hash);
+            if (all_zero and score == 0.0 and log_det == 0.0 and position == 0) continue;
+            try self.addSequenceWithMetadata(&.{}, position, score, 0, latent, log_det, 1);
         }
     }
 
     pub fn merge(self: *SSI, other: *const SSI) !void {
+        if (self.identity_set and other.identity_set) {
+            if (self.dim != other.dim or self.model_id != other.model_id or self.global_diffusion != other.global_diffusion) {
+                return Error.RSFModelMismatch;
+            }
+        }
         try other.copyInto(self);
     }
 
     pub fn split(self: *SSI, threshold: f32) !SSI {
         var result = SSI.init(self.allocator);
         result.max_height = self.max_height;
+        try self.copyIdentityInto(&result);
         if (self.root == null) {
             return result;
         }
@@ -812,13 +1176,13 @@ pub const SSI = struct {
                 if (maybe_child) |leaf| {
                     if (leaf.segment) |seg| {
                         if (seg.score > threshold) {
-                            try result.addSequenceWithMetadata(seg.tokens, seg.position, seg.score, seg.anchor_hash);
+                            try result.addSequenceWithMetadata(seg.tokens, seg.position, seg.score, seg.anchor_hash, seg.latent, seg.log_det, seg.latent_version);
                         }
                     }
                     var chain = leaf.collision_chain;
                     while (chain) |c| {
                         if (c.seg.score > threshold) {
-                            try result.addSequenceWithMetadata(c.seg.tokens, c.seg.position, c.seg.score, c.seg.anchor_hash);
+                            try result.addSequenceWithMetadata(c.seg.tokens, c.seg.position, c.seg.score, c.seg.anchor_hash, c.seg.latent, c.seg.log_det, c.seg.latent_version);
                         }
                         chain = c.next;
                     }
@@ -845,12 +1209,24 @@ pub const SSI = struct {
         const old_root = self.root;
         const old_height = self.height;
         const old_size = self.size;
+        const old_dim = self.dim;
+        const old_model = self.model_id;
+        const old_gd = self.global_diffusion;
+        const old_id = self.identity_set;
         self.root = rebuilt.root;
         self.height = rebuilt.height;
         self.size = rebuilt.size;
+        self.dim = rebuilt.dim;
+        self.model_id = rebuilt.model_id;
+        self.global_diffusion = rebuilt.global_diffusion;
+        self.identity_set = rebuilt.identity_set;
         rebuilt.root = old_root;
         rebuilt.height = old_height;
         rebuilt.size = old_size;
+        rebuilt.dim = old_dim;
+        rebuilt.model_id = old_model;
+        rebuilt.global_diffusion = old_gd;
+        rebuilt.identity_set = old_id;
         rebuilt.deinit();
     }
 
@@ -949,3 +1325,114 @@ pub const SSI = struct {
         return true;
     }
 };
+
+test "ssi latent insert retrieve nearest" {
+    const allocator = std.testing.allocator;
+    var index = SSI.init(allocator);
+    defer index.deinit();
+    var prng = types.PRNG.init(0x51DE0BAA);
+    const dim: usize = 8;
+    var stored: [12][16]f32 = undefined;
+    var q: usize = 0;
+    while (q < 12) : (q += 1) {
+        var d: usize = 0;
+        while (d < dim * 2) : (d += 1) {
+            stored[q][d] = prng.float() * 2.0 - 1.0;
+        }
+        const tokens = [_]u32{ @intCast(q + 1), @intCast(q + 2) };
+        try index.addSequenceWithLatent(&tokens, q, false, stored[q][0..], @as(f32, @floatFromInt(q)) * 0.01);
+    }
+    try std.testing.expect(index.validate());
+    var hits: usize = 0;
+    var query_i: usize = 0;
+    while (query_i < 10) : (query_i += 1) {
+        var query: [16]f32 = stored[query_i];
+        query[0] += 0.01;
+        const ranked = try index.retrieveTopKLatent(query[0..], @as(f32, @floatFromInt(query_i)) * 0.01, 3, allocator);
+        defer {
+            for (ranked) |*seg| seg.deinit(allocator);
+            allocator.free(ranked);
+        }
+        var found = false;
+        for (ranked) |seg| {
+            if (seg.position == query_i) found = true;
+        }
+        if (found) hits += 1;
+    }
+    try std.testing.expect(hits >= 9);
+}
+
+test "ssi model mismatch on diffusion identity" {
+    const allocator = std.testing.allocator;
+    var index = SSI.init(allocator);
+    defer index.deinit();
+    const latent = [_]f32{ 0.1, -0.2, 0.3, -0.4 };
+    try index.addSequenceWithLatent(&.{ 1, 2 }, 0, false, &latent, 0.0);
+    index.global_diffusion = true;
+    var other = SSI.init(allocator);
+    defer other.deinit();
+    try other.addSequenceWithLatent(&.{ 3, 4 }, 1, false, &latent, 0.0);
+    try std.testing.expectError(Error.RSFModelMismatch, index.merge(&other));
+}
+
+test "ssi serialize roundtrip latent" {
+    const allocator = std.testing.allocator;
+    var index = SSI.init(allocator);
+    defer index.deinit();
+    const latent = [_]f32{ 0.5, -0.25, 0.125, -0.0625 };
+    try index.addSequenceWithLatent(&.{ 9, 8, 7 }, 42, true, &latent, 0.3);
+    var buffer: [4096]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+    try index.serialize(stream.writer());
+    var reader_stream = std.io.fixedBufferStream(stream.getWritten());
+    var loaded = try SSI.deserialize(allocator, reader_stream.reader());
+    defer loaded.deinit();
+    try std.testing.expect(loaded.validate());
+    try std.testing.expectEqual(index.size, loaded.size);
+    try std.testing.expectEqual(index.dim, loaded.dim);
+    const seg = loaded.getSegment(42) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f32, 0.3), seg.log_det);
+    try std.testing.expectEqual(@as(u32, 1), seg.latent_version);
+    try std.testing.expectEqual(@as(usize, 4), seg.latent.len);
+    try std.testing.expectEqual(@as(f32, 0.5), seg.latent[0]);
+}
+
+test "ssi export import latent tensor" {
+    const allocator = std.testing.allocator;
+    var index = SSI.init(allocator);
+    defer index.deinit();
+    const latent = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
+    try index.addSequenceWithLatent(&.{1}, 7, false, &latent, -0.2);
+    var tensor = try index.exportToTensor(allocator);
+    defer tensor.deinit();
+    var restored = SSI.init(allocator);
+    defer restored.deinit();
+    try restored.importFromTensor(&tensor);
+    try std.testing.expectEqual(@as(usize, 2), restored.dim);
+    const seg = restored.getSegment(7) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f32, -0.2), seg.log_det);
+}
+
+test "ssi split merge compact with latents" {
+    const allocator = std.testing.allocator;
+    var index = SSI.init(allocator);
+    defer index.deinit();
+    const a = [_]f32{ 0.2, 0.1, -0.1, 0.3 };
+    const b = [_]f32{ -0.4, 0.5, 0.1, 0.0 };
+    try index.addSequenceWithLatent(&.{1}, 1, false, &a, 0.0);
+    try index.addSequenceWithLatent(&.{2}, 2, false, &b, 0.1);
+    try index.updateScore(1, 0.9);
+    try index.updateScore(2, 0.1);
+    var high = try index.split(0.5);
+    defer high.deinit();
+    try std.testing.expectEqual(@as(usize, 1), high.size);
+    var merged = SSI.init(allocator);
+    defer merged.deinit();
+    try merged.merge(&index);
+    try std.testing.expect(merged.validate());
+}
+
+test "ssi rsfLatentSimHash shared" {
+    const latent = [_]f32{ 0.25, -0.5, 0.75, -0.125 };
+    try std.testing.expectEqual(types.rsfLatentSimHash(&latent), SSI.latentSimHash(&latent));
+}
